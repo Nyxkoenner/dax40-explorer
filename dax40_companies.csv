@@ -1,0 +1,41 @@
+name,ticker_yahoo,isin,sector
+Adidas AG,ADS.DE,DE000A1EWWW0,Consumer Discretionary
+Allianz SE,ALV.DE,DE0008404005,Financials
+BASF SE,BAS.DE,DE000BASF111,Materials
+Bayer AG,BAYN.DE,DE000BAY0017,Health Care
+BMW AG,BMW.DE,DE0005190003,Consumer Discretionary
+Deutsche Bank AG,DBK.DE,DE0005140008,Financials
+Deutsche Telekom AG,DTE.DE,DE0005557508,Communication Services
+Siemens AG,SIE.DE,DE0007236101,Industrials
+Volkswagen AG VZ,VOW3.DE,DE0007664039,Consumer Discretionary
+Airbus SE,AIR.DE,NL0000235190,Industrials
+Beiersdorf AG,BEI.DE,DE0005200000,Consumer Staples
+Brenntag SE,BNR.DE,DE000A1DAHH0,Industrials
+Commerzbank AG,CBK.DE,DE000CBK1001,Financials
+Continental AG,CON.DE,DE0005439004,Consumer Discretionary
+Deutsche Boerse AG,DB1.DE,DE0005810055,Financials
+DHL Group,DHL.DE,DE0005552004,Industrials
+Daimler Truck Holding AG,DTG.DE,DE000DTR0CK8,Industrials
+Siemens Energy AG,ENR.DE,DE000ENER6Y0,Industrials
+E.ON SE,EOAN.DE,DE000ENAG999,Utilities
+Fresenius Medical Care AG,FME.DE,DE0005785802,Health Care
+Fresenius SE & Co KGaA,FRE.DE,DE0005785604,Health Care
+GEA Group AG,G1A.DE,DE0006602006,Industrials
+Scout24 SE,G24.DE,DE000A12DM80,Communication Services
+Heidelberg Materials AG,HEI.DE,DE0006047004,Materials
+Henkel AG & Co. KGaA VZ,HEN3.DE,DE0006048432,Consumer Staples
+Hannover Rueck SE,HNR1.DE,DE0008402215,Financials
+Infineon Technologies AG,IFX.DE,DE0006231004,Information Technology
+Mercedes-Benz Group AG,MBG.DE,DE0007100000,Consumer Discretionary
+Merck KGaA,MRK.DE,DE0006599905,Health Care
+MTU Aero Engines AG,MTX.DE,DE000A0D9PT0,Industrials
+Muenchener Rueckversicherungs-Gesellschaft AG,MUV2.DE,DE0008430026,Financials
+Porsche Automobil Holding SE VZ,PAH3.DE,DE000PAH0038,Consumer Discretionary
+Qiagen N.V.,QIA.DE,NL0015001WM6,Health Care
+Rheinmetall AG,RHM.DE,DE0007030009,Industrials
+RWE AG,RWE.DE,DE0007037129,Utilities
+SAP SE,SAP.DE,DE0007164600,Information Technology
+Siemens Healthineers AG,SHL.DE,DE000SHL1006,Health Care
+Symrise AG,SY1.DE,DE000SYM9999,Materials
+Vonovia SE,VNA.DE,DE000A1ML7J1,Real Estate
+Zalando SE,ZAL.DE,DE000ZAL1111,Consumer Discretionary
