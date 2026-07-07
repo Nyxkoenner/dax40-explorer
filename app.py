@@ -38,7 +38,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -2517,43 +2517,85 @@ def make_price_chart(
             )
 
     if events is not None and not events.empty and "date" in events.columns:
+        # `merge_asof` verlangt auf beiden Seiten exakt denselben Datetime-Datentyp.
+        # Ereignisse aus CSV/RSS können unter Windows/Pandas als datetime64[us]
+        # ankommen, während Yahoo-Kurse datetime64[ns] verwenden. Deshalb werden
+        # beide Seiten explizit nach UTC konvertiert, zeitzonenfrei gemacht,
+        # auf Tagesebene normalisiert und als datetime64[ns] gespeichert.
+        def normalize_chart_dates(values: pd.Series) -> pd.Series:
+            normalized = pd.to_datetime(values, errors="coerce", utc=True)
+            normalized = normalized.dt.tz_convert(None).dt.normalize()
+            return normalized.astype("datetime64[ns]")
+
+        visible["Datum"] = normalize_chart_dates(visible["Datum"])
+        visible = visible.dropna(subset=["Datum"]).sort_values("Datum").reset_index(drop=True)
+
         event_frame = events.copy()
-        event_frame["Datum"] = pd.to_datetime(event_frame["date"], errors="coerce").dt.normalize()
+        event_frame["Datum"] = normalize_chart_dates(event_frame["date"])
         event_frame = event_frame.dropna(subset=["Datum"])
-        event_frame = event_frame[event_frame["Datum"].between(visible["Datum"].min(), visible["Datum"].max())]
-        if not event_frame.empty:
+        event_frame = event_frame[
+            event_frame["Datum"].between(visible["Datum"].min(), visible["Datum"].max())
+        ]
+
+        if not event_frame.empty and not visible.empty:
             event_frame["event_type"] = event_frame["event_type"].fillna("news")
             event_frame["sentiment_label"] = event_frame["sentiment_label"].fillna("neutral")
-            price_lookup = visible[["Datum", "Kurs"]].sort_values("Datum")
-            event_frame = pd.merge_asof(
-                event_frame.sort_values("Datum"), price_lookup, on="Datum", direction="nearest"
+            price_lookup = (
+                visible[["Datum", "Kurs"]]
+                .dropna(subset=["Datum", "Kurs"])
+                .drop_duplicates(subset=["Datum"], keep="last")
+                .sort_values("Datum")
+                .astype({"Datum": "datetime64[ns]"})
             )
-            layers.append(
-                alt.Chart(event_frame).mark_point(filled=True, size=85, opacity=0.9).encode(
-                    x="Datum:T",
-                    y=alt.Y("Kurs:Q", scale=alt.Scale(zero=False)),
-                    shape=alt.Shape(
-                        "event_type:N",
-                        scale=alt.Scale(
-                            domain=list(EVENT_META),
-                            range=[EVENT_META[item]["shape"] for item in EVENT_META],
-                        ),
-                        legend=alt.Legend(title="Ereignistyp", orient="bottom"),
-                    ),
-                    color=alt.Color(
-                        "sentiment_label:N",
-                        scale=alt.Scale(
-                            domain=["positiv", "neutral", "negativ"],
-                            range=["#16a34a", "#64748b", "#dc2626"],
-                        ),
-                        legend=alt.Legend(title="News-Sentiment", orient="bottom"),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("Datum:T", format="%d.%m.%Y"),
-                        "event_type:N", "title:N", "source:N", "sentiment_label:N", "link:N",
-                    ],
+            event_frame = (
+                event_frame.sort_values("Datum")
+                .reset_index(drop=True)
+                .astype({"Datum": "datetime64[ns]"})
+            )
+
+            try:
+                event_frame = pd.merge_asof(
+                    event_frame,
+                    price_lookup,
+                    on="Datum",
+                    direction="nearest",
                 )
-            )
+            except (TypeError, ValueError, pd.errors.MergeError):
+                # Fallback: Ein Chart bleibt auch dann funktionsfähig, wenn
+                # eine externe Quelle ungewöhnliche Datumswerte liefert.
+                price_series = price_lookup.set_index("Datum")["Kurs"]
+                event_frame["Kurs"] = price_series.reindex(
+                    event_frame["Datum"], method="nearest"
+                ).to_numpy()
+
+            event_frame = event_frame.dropna(subset=["Kurs"])
+            if not event_frame.empty:
+                layers.append(
+                    alt.Chart(event_frame).mark_point(filled=True, size=85, opacity=0.9).encode(
+                        x="Datum:T",
+                        y=alt.Y("Kurs:Q", scale=alt.Scale(zero=False)),
+                        shape=alt.Shape(
+                            "event_type:N",
+                            scale=alt.Scale(
+                                domain=list(EVENT_META),
+                                range=[EVENT_META[item]["shape"] for item in EVENT_META],
+                            ),
+                            legend=alt.Legend(title="Ereignistyp", orient="bottom"),
+                        ),
+                        color=alt.Color(
+                            "sentiment_label:N",
+                            scale=alt.Scale(
+                                domain=["positiv", "neutral", "negativ"],
+                                range=["#16a34a", "#64748b", "#dc2626"],
+                            ),
+                            legend=alt.Legend(title="News-Sentiment", orient="bottom"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("Datum:T", format="%d.%m.%Y"),
+                            "event_type:N", "title:N", "source:N", "sentiment_label:N", "link:N",
+                        ],
+                    )
+                )
 
     return alt.layer(*layers).resolve_scale(y="shared").properties(height=380)
 
