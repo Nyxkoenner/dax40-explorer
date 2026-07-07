@@ -1,10 +1,10 @@
 streamlit
 pandas
 yfinance
-matplotlib
+requests
 networkx
+matplotlib
 feedparser
-transformers
-torch
-scikit-learn
-numpy
+python-dateutil
+altair
+lxml
