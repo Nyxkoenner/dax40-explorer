@@ -15,7 +15,9 @@ Hinweise:
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -36,7 +38,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.1"
+APP_VERSION = "3.3"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -1257,6 +1259,36 @@ KNOWN_ALIASES: dict[str, list[str]] = {
     "ALV.DE": ["Allianz"],
 }
 
+# Mehrdeutige Ticker brauchen belastbare Firmenbegriffe. Ein bloßer Ticker wie
+# MMM, T oder F ist als News-Suche zu unscharf und wird deshalb nicht als
+# primärer Google-News-Suchbegriff verwendet.
+KNOWN_ALIASES.update({
+    "MMM": ["3M Company", "3M Co.", "3M Aktie", "3M"],
+    "T": ["AT&T", "AT&T Inc.", "AT&T Aktie"],
+    "F": ["Ford Motor", "Ford Motor Company", "Ford Aktie"],
+    "A": ["Agilent Technologies", "Agilent"],
+    "CAT": ["Caterpillar", "Caterpillar Inc."],
+    "IT": ["Gartner", "Gartner Inc."],
+})
+
+# Begriffe, die auf den Firmenkontext hindeuten. Sie dienen nur als
+# Relevanzhilfe und sind ausdrücklich kein Kauf-/Verkaufssignal.
+NEWS_FINANCE_CONTEXT_TERMS = {
+    "aktie", "aktien", "boerse", "börse", "kurs", "kursziel", "stock", "stocks",
+    "share", "shares", "shareholder", "earnings", "results", "quarterly",
+    "quartalszahlen", "quartalsbericht", "geschaeftszahlen", "geschäftszahlen",
+    "jahreszahlen", "guidance", "prognose", "umsatz", "revenue", "gewinn",
+    "profit", "dividende", "dividend", "investor", "investor relations",
+    "analyst", "upgrade", "downgrade", "rating", "outperform", "underperform",
+}
+
+NEWS_COMPANY_ACTION_TERMS = {
+    "announces", "announced", "reports", "reported", "appoints", "acquires",
+    "acquisition", "settlement", "restructuring", "restructure", "spinoff",
+    "spin off", "merger", "lawsuit", "verkauft", "uebernimmt", "übernimmt",
+    "ernennung", "erwirbt", "vergleich", "umstrukturierung",
+}
+
 
 def normalize_for_search(value: Any) -> str:
     """Normalisiert Text für robuste, aber nicht zu breite Alias-Suchen."""
@@ -1266,12 +1298,58 @@ def normalize_for_search(value: Any) -> str:
     return re.sub(r"\s+", " ", text_value).strip()
 
 
-def safe_write_csv(df: pd.DataFrame, path: Path) -> None:
-    """Schreibt CSV atomar, damit bei Streamlit-Reruns keine halben Dateien entstehen."""
+def safe_write_csv(
+    df: pd.DataFrame,
+    path: Path,
+    retries: int = 6,
+    retry_delay: float = 0.15,
+) -> tuple[bool, str]:
+    """Schreibt CSV robust unter Windows, ohne Streamlit bei Dateisperren zu stoppen.
+
+    Ein eindeutiger Temp-Dateiname verhindert Kollisionen zwischen zwei schnellen
+    Streamlit-Reruns. Falls Excel, Explorer-Vorschau oder ein Virenscanner die
+    Ziel-Datei kurz sperren, wird mehrmals versucht und anschließend eine
+    zeitgestempelte Sicherungsdatei geschrieben.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(temp_path, index=False, encoding="utf-8")
-    temp_path.replace(path)
+    temp_path: Path | None = None
+
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{path.stem}_",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        os.close(file_descriptor)
+        temp_path = Path(temp_name)
+        df.to_csv(temp_path, index=False, encoding="utf-8")
+
+        last_error: PermissionError | None = None
+        for attempt in range(max(1, int(retries))):
+            try:
+                os.replace(temp_path, path)
+                return True, ""
+            except PermissionError as error:
+                last_error = error
+                time.sleep(float(retry_delay) * (attempt + 1))
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fallback_path = path.with_name(f"{path.stem}_{stamp}{path.suffix}")
+        os.replace(temp_path, fallback_path)
+        return (
+            False,
+            f"{path.name} war gesperrt und wurde nicht überschrieben. "
+            f"Die neuen Daten liegen stattdessen in {fallback_path.name}. "
+            "Schließe die Datei in Excel oder einer Vorschau und aktualisiere danach erneut.",
+        )
+    except Exception as error:
+        return False, f"CSV-Datei konnte nicht gespeichert werden: {type(error).__name__}: {error}"
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def empty_news_frame() -> pd.DataFrame:
@@ -1279,6 +1357,7 @@ def empty_news_frame() -> pd.DataFrame:
         columns=[
             "published", "ticker_yahoo", "title", "link", "source", "source_kind",
             "matched_alias", "sentiment_score", "sentiment_label", "event_type",
+            "relevance_score", "relevance_label", "relevance_reason", "is_relevant",
         ]
     )
 
@@ -1347,6 +1426,134 @@ def aliases_for_ticker(company_name: str, ticker: str) -> list[str]:
     return sorted({alias for alias in aliases if len(normalize_for_search(alias)) >= 3})
 
 
+def news_identity_aliases(company_name: str, ticker: str) -> list[str]:
+    """Liefert Firmenbegriffe für News, ohne einen bloßen Ticker zu bevorzugen."""
+    ticker = clean_ticker(ticker)
+    ticker_base = ticker.split(".")[0]
+    company = str(company_name or "").strip()
+    simplified = re.sub(
+        r"\b(ag|se|sa|s\.a\.|plc|n\.v\.|gmbh|kgaa|inc\.?|corp\.?|ltd\.?)\b",
+        "",
+        company,
+        flags=re.IGNORECASE,
+    ).strip(" ,-")
+
+    candidates: list[str] = [company, simplified, *KNOWN_ALIASES.get(ticker, [])]
+    candidates.extend(aliases_for_ticker(company_name, ticker))
+
+    result: list[str] = []
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        norm = normalize_for_search(candidate)
+        if not norm:
+            continue
+        # Der automatisch aus dem Ticker entstandene Begriff ist nur dann
+        # sinnvoll, wenn er wirklich auch der Firmenname ist (z. B. SAP).
+        if norm == normalize_for_search(ticker_base) and norm != normalize_for_search(company):
+            continue
+        # Sehr kurze Marken (z. B. 3M) sind nur erlaubt, wenn sie bewusst in
+        # den gepflegten Standardaliasen stehen.
+        is_known_short_brand = candidate in KNOWN_ALIASES.get(ticker, []) and len(norm) >= 2
+        if len(norm) < 3 and not is_known_short_brand:
+            continue
+        result.append(candidate)
+
+    return sorted(set(result), key=lambda item: len(normalize_for_search(item)), reverse=True)
+
+
+def primary_news_query_alias(company_name: str, ticker: str) -> str:
+    """Wählt für Google News einen möglichst eindeutigen Unternehmensbegriff."""
+    candidates = news_identity_aliases(company_name, ticker)
+    if not candidates:
+        return str(company_name or clean_ticker(ticker)).strip()
+
+    # Mehrwort-Aliase sind bei mehrdeutigen Kürzeln wesentlich präziser.
+    multiword = [value for value in candidates if len(normalize_for_search(value).split()) >= 2]
+    pool = multiword or candidates
+    return max(pool, key=lambda item: len(normalize_for_search(item)))
+
+
+def contains_alias_precise(text: str, aliases: Iterable[str]) -> Optional[str]:
+    normalized = f" {normalize_for_search(text)} "
+    for alias in sorted(set(aliases), key=lambda item: len(normalize_for_search(item)), reverse=True):
+        candidate = normalize_for_search(alias)
+        if not candidate:
+            continue
+        if f" {candidate} " in normalized:
+            return alias
+    return None
+
+
+def news_context_score(text: str) -> tuple[int, list[str]]:
+    normalized = normalize_for_search(text)
+    terms: list[str] = []
+    for term in NEWS_FINANCE_CONTEXT_TERMS:
+        if normalize_for_search(term) in normalized:
+            terms.append(term)
+    for term in NEWS_COMPANY_ACTION_TERMS:
+        if normalize_for_search(term) in normalized:
+            terms.append(term)
+    # Begrenze, damit eine lange Schlagwortliste nicht den Firmenbezug ersetzt.
+    return min(20, len(set(terms)) * 7), sorted(set(terms))[:4]
+
+
+def evaluate_news_relevance(
+    title: str,
+    summary: str,
+    company_name: str,
+    ticker: str,
+    source_kind: str,
+) -> dict[str, Any]:
+    """Bewertet Firmenbezug und trennt verlässliche von unsicheren Treffern."""
+    aliases = news_identity_aliases(company_name, ticker)
+    title_alias = contains_alias_precise(title, aliases)
+    summary_alias = contains_alias_precise(summary, aliases)
+    matched_alias = title_alias or summary_alias
+    score = 0
+    reasons: list[str] = []
+
+    if matched_alias:
+        alias_length = len(normalize_for_search(matched_alias))
+        if title_alias:
+            score = 82 if alias_length >= 5 else 52
+            reasons.append("Firmenalias im Titel")
+        else:
+            score = 64 if alias_length >= 5 else 38
+            reasons.append("Firmenalias in der Beschreibung")
+
+    context_points, context_terms = news_context_score(f"{title} {summary}")
+    if context_points:
+        score += context_points
+        # Kurze, aber bewusst gepflegte Marken wie SAP, 3M oder AT&T werden
+        # erst zusammen mit einem Finanz-/Unternehmenskontext als belastbar
+        # eingestuft. Ohne Kontext bleiben sie absichtlich unsicher.
+        if title_alias and len(normalize_for_search(title_alias)) < 5:
+            score += 12
+        reasons.append("Finanz-/Unternehmenskontext: " + ", ".join(context_terms))
+
+    # Google-Suchergebnisse ohne sichtbaren Firmenbezug werden bewusst nicht
+    # als relevante Unternehmensnews durchgewunken.
+    if source_kind == "search_fallback" and not matched_alias:
+        score = min(score, 20)
+        reasons.append("nur Suchabfrage, kein sichtbarer Firmenalias")
+
+    score = max(0, min(100, score))
+    if score >= 85:
+        label = "hoch"
+    elif score >= 70:
+        label = "mittel"
+    else:
+        label = "niedrig"
+
+    return {
+        "matched_alias": matched_alias or "–",
+        "relevance_score": score,
+        "relevance_label": label,
+        "relevance_reason": " · ".join(reasons) if reasons else "kein ausreichend eindeutiger Firmenbezug",
+        "is_relevant": bool(score >= 70),
+    }
+
+
 def save_aliases_for_ticker(ticker: str, aliases_text: str) -> None:
     alias_frame = read_aliases()
     ticker = clean_ticker(ticker)
@@ -1361,29 +1568,22 @@ def save_aliases_for_ticker(ticker: str, aliases_text: str) -> None:
     safe_write_csv(alias_frame, ALIAS_PATH)
 
 
-def contains_alias_precise(text: str, aliases: Iterable[str]) -> Optional[str]:
-    normalized = f" {normalize_for_search(text)} "
-    for alias in sorted(set(aliases), key=lambda item: len(normalize_for_search(item)), reverse=True):
-        candidate = normalize_for_search(alias)
-        if not candidate:
-            continue
-        if f" {candidate} " in normalized:
-            return alias
-    return None
-
-
 def classify_event_from_text(text: str) -> str:
+    """Ordnet nur konkrete Finanzereignisse ein; allgemeine News bleiben News."""
     normalized = normalize_for_search(text)
-    if any(word in normalized for word in ["quartalszahlen", "geschaeftszahlen", "jahreszahlen", "earnings", "results", "q1", "q2", "q3", "q4"]):
+    if any(phrase in normalized for phrase in [
+        "quarterly results", "quarterly earnings", "earnings results", "quartalszahlen",
+        "quartalsbericht", "geschaeftszahlen", "geschäftszahlen", "jahreszahlen",
+    ]):
         return "earnings"
-    if any(word in normalized for word in ["upgrade", "downgrade", "kursziel", "analyst", "outperform", "underperform"]):
-        return "analyst"
-    if any(word in normalized for word in ["hauptversammlung", "annual general meeting", "agm"]):
-        return "annual_meeting"
-    if any(word in normalized for word in ["geschaeftsbericht", "annual report", "quartalsbericht", "quarterly report"]):
-        return "report"
-    if any(word in normalized for word in ["dividende", "ex divid", "dividend"]):
+    if any(phrase in normalized for phrase in ["ex divid", "dividend", "dividende"]):
         return "dividend"
+    if any(phrase in normalized for phrase in ["hauptversammlung", "annual general meeting", "annual meeting", "agm"]):
+        return "annual_meeting"
+    if any(phrase in normalized for phrase in ["geschaeftsbericht", "geschäftsbericht", "annual report", "quarterly report"]):
+        return "report"
+    if any(phrase in normalized for phrase in ["kursziel", "analyst", "upgrade", "downgrade", "outperform", "underperform"]):
+        return "analyst"
     return "news"
 
 
@@ -1462,19 +1662,13 @@ def fetch_news_bundle(
     locale: str = "de",
     max_items: int = 80,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Lädt News plus nachvollziehbare Statusdaten je Quelle.
-
-    Allgemeine RSS-Feeds werden mit präzisen Aliasen gefiltert. Der optionale
-    Google-News-Fallback ist eine firmenbezogene Suche und erhöht die Treffer-
-    chance, ersetzt aber keine lizenzierte Datenquelle.
-    """
+    """Lädt News mit Quellenstatus und einem transparenten Firmenbezug-Score."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days_back))).replace(tzinfo=None)
     ticker = clean_ticker(ticker)
-    aliases = aliases_for_ticker(company_name, ticker)
     source_specs = [dict(source) for source in GLOBAL_RSS_SOURCES]
 
     if include_google_news:
-        preferred_alias = max(aliases, key=lambda item: len(normalize_for_search(item)))
+        preferred_alias = primary_news_query_alias(company_name, ticker)
         query = f'"{preferred_alias}"'
         source_specs.append(
             {
@@ -1486,12 +1680,12 @@ def fetch_news_bundle(
 
     news_rows: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    seen_titles: set[str] = set()
 
     for source in source_specs:
         payload, diagnostic = request_feed(source["url"])
         diagnostic["source"] = source["name"]
         diagnostic["kind"] = source["kind"]
+        diagnostic["uncertain_matches"] = 0
 
         if payload is None:
             diagnostics.append(diagnostic)
@@ -1509,21 +1703,26 @@ def fetch_news_bundle(
             if not entry["title"] or entry["published"] < cutoff:
                 continue
 
+            relevance = evaluate_news_relevance(
+                title=entry["title"],
+                summary=entry["summary"],
+                company_name=company_name,
+                ticker=ticker,
+                source_kind=source["kind"],
+            )
+            # Treffer ohne sichtbaren Firmenbezug werden nicht einmal als
+            # unsicher gespeichert; so bleibt die Oberfläche sauber.
+            if int(relevance["relevance_score"]) < 35:
+                continue
+
+            if bool(relevance["is_relevant"]):
+                diagnostic["matches"] += 1
+            else:
+                diagnostic["uncertain_matches"] += 1
+
             combined_text = f"{entry['title']} {entry['summary']}"
-            # Bei Google News ist die Abfrage firmenbezogen. Trotzdem prüfen wir
-            # Aliase, damit breit gefasste Treffer nicht ungefiltert landen.
-            matched_alias = contains_alias_precise(combined_text, aliases)
-            if matched_alias is None and source["kind"] == "global":
-                continue
-            if matched_alias is None:
-                matched_alias = "Suchabfrage"
-
-            title_key = normalize_for_search(entry["title"])
-            if not title_key or title_key in seen_titles:
-                continue
-            seen_titles.add(title_key)
-
             sentiment_score, sentiment_label = simple_sentiment(combined_text)
+            event_type = classify_event_from_text(combined_text) if bool(relevance["is_relevant"]) else "news"
             news_rows.append(
                 {
                     "published": entry["published"],
@@ -1532,23 +1731,39 @@ def fetch_news_bundle(
                     "link": entry["link"],
                     "source": entry["source"],
                     "source_kind": entry["source_kind"],
-                    "matched_alias": matched_alias,
+                    "matched_alias": relevance["matched_alias"],
                     "sentiment_score": sentiment_score,
                     "sentiment_label": sentiment_label,
-                    "event_type": classify_event_from_text(combined_text),
+                    "event_type": event_type,
+                    "relevance_score": relevance["relevance_score"],
+                    "relevance_label": relevance["relevance_label"],
+                    "relevance_reason": relevance["relevance_reason"],
+                    "is_relevant": relevance["is_relevant"],
                 }
             )
-            diagnostic["matches"] += 1
 
         if diagnostic["status"] == "OK" and diagnostic["entries"] == 0:
             diagnostic["status"] = "Keine Einträge"
+        elif diagnostic["status"] == "OK" and diagnostic["matches"] == 0 and diagnostic["uncertain_matches"] > 0:
+            diagnostic["status"] = "Nur unsichere Treffer"
+            diagnostic["message"] = "Treffer mit schwachem Firmenbezug werden standardmäßig ausgeblendet."
         elif diagnostic["status"] == "OK" and diagnostic["matches"] == 0:
             diagnostic["status"] = "Keine Firmen-Treffer"
         diagnostics.append(diagnostic)
 
     news = pd.DataFrame(news_rows) if news_rows else empty_news_frame()
     if not news.empty:
-        news = news.sort_values("published", ascending=False).head(max_items).reset_index(drop=True)
+        # Gleiche Überschriften aus mehreren Quellen werden einmal behalten –
+        # bevorzugt mit höherer Relevanz und neuerem Datum.
+        news["_dedupe_key"] = news["title"].map(normalize_for_search)
+        news = (
+            news.sort_values(["relevance_score", "published"], ascending=[False, False])
+            .drop_duplicates("_dedupe_key", keep="first")
+            .drop(columns="_dedupe_key")
+            .sort_values("published", ascending=False)
+            .head(max_items)
+            .reset_index(drop=True)
+        )
 
     diagnostic_frame = pd.DataFrame(diagnostics)
     return news, diagnostic_frame
@@ -1662,18 +1877,28 @@ def fetch_yahoo_calendar_events(ticker: str, days_back: int = 365, days_forward:
 
 
 def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Übernimmt nur relevante, konkret klassifizierte Nachrichten in den Kalender."""
     if news is None or news.empty:
         return empty_events_frame()
+
+    eligible = news.copy()
+    if "is_relevant" in eligible.columns:
+        eligible = eligible[eligible["is_relevant"].fillna(False)]
+    if "event_type" in eligible.columns:
+        eligible = eligible[eligible["event_type"].astype(str) != "news"]
+    if eligible.empty:
+        return empty_events_frame()
+
     events = pd.DataFrame(
         {
-            "date": pd.to_datetime(news["published"], errors="coerce"),
+            "date": pd.to_datetime(eligible["published"], errors="coerce"),
             "ticker_yahoo": ticker,
-            "event_type": news.get("event_type", "news"),
-            "title": news.get("title", ""),
-            "source": news.get("source", ""),
-            "link": news.get("link", ""),
-            "sentiment_score": news.get("sentiment_score", 0.0),
-            "sentiment_label": news.get("sentiment_label", "neutral"),
+            "event_type": eligible.get("event_type", "news"),
+            "title": eligible.get("title", ""),
+            "source": eligible.get("source", ""),
+            "link": eligible.get("link", ""),
+            "sentiment_score": eligible.get("sentiment_score", 0.0),
+            "sentiment_label": eligible.get("sentiment_label", "neutral"),
             "importance": "mittel",
             "is_future_event": False,
         }
@@ -1681,16 +1906,32 @@ def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return events.dropna(subset=["date"]).reset_index(drop=True)
 
 
-def persist_events(events: pd.DataFrame) -> None:
-    if events is None or events.empty:
-        return
+def persist_events(events: pd.DataFrame, replace_ticker: Optional[str] = None) -> tuple[bool, str]:
+    """Speichert Kalenderdaten; bei Aktualisierung kann ein Ticker ersetzt werden.
+
+    Das verhindert, dass alte, vor einer Alias-Korrektur gespeicherte
+    Google-News-Ereignisse dauerhaft im Chart verbleiben.
+    """
+    if events is None:
+        events = empty_events_frame()
+
     existing = empty_events_frame()
     if EVENTS_PATH.exists():
         try:
             existing = pd.read_csv(EVENTS_PATH)
         except Exception:
             existing = empty_events_frame()
+
+    if replace_ticker:
+        ticker = clean_ticker(replace_ticker)
+        if not existing.empty and "ticker_yahoo" in existing.columns:
+            existing["ticker_yahoo"] = existing["ticker_yahoo"].map(clean_ticker)
+            existing = existing[existing["ticker_yahoo"] != ticker].copy()
+
     combined = pd.concat([existing, events], ignore_index=True)
+    if combined.empty:
+        return safe_write_csv(empty_events_frame(), EVENTS_PATH)
+
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = combined.dropna(subset=["date"])
     combined["date"] = combined["date"].dt.strftime("%Y-%m-%d")
@@ -1698,7 +1939,7 @@ def persist_events(events: pd.DataFrame) -> None:
         combined.drop_duplicates(["ticker_yahoo", "date", "event_type", "title"], keep="last")
         .sort_values(["ticker_yahoo", "date"], ascending=[True, False])
     )
-    safe_write_csv(combined, EVENTS_PATH)
+    return safe_write_csv(combined, EVENTS_PATH)
 
 
 def load_persisted_events(ticker: str, days_back: int = 1825) -> pd.DataFrame:
@@ -2730,22 +2971,98 @@ def render_sector_view(df: pd.DataFrame) -> None:
     st.altair_chart(chart, use_container_width=True)
 
 
+def render_news_card(item: pd.Series, card_index: int) -> None:
+    """Kompakte, lesbare News-Karte statt einer breiten Rohdaten-Tabelle."""
+    published = pd.to_datetime(item.get("published"), errors="coerce")
+    date_label = published.strftime("%d.%m.%Y, %H:%M") if pd.notna(published) else "Datum unbekannt"
+    event_label = EVENT_META.get(str(item.get("event_type", "news")), {}).get("label", "News")
+    sentiment = str(item.get("sentiment_label") or "neutral").capitalize()
+    relevance = str(item.get("relevance_label") or "–").capitalize()
+
+    with st.container(border=True):
+        st.markdown(f"**{str(item.get('title') or 'Ohne Titel')}**")
+        st.caption(
+            f"{event_label} · {sentiment} · Relevanz: {relevance} · "
+            f"{str(item.get('source') or 'Quelle unbekannt')} · {date_label}"
+        )
+        reason = str(item.get("relevance_reason") or "").strip()
+        if reason:
+            st.caption(f"Warum zugeordnet: {reason}")
+        link = str(item.get("link") or "").strip()
+        if link:
+            st.link_button("Artikel öffnen", link, key=f"news_link_{card_index}_{normalize_for_search(str(item.get('title', '')))}")
+
+
+def render_news_summary(
+    ticker: str,
+    company_name: str,
+    relevant_news: pd.DataFrame,
+    uncertain_news: pd.DataFrame,
+    events: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+) -> None:
+    """Zeigt eine sachliche Einordnung ohne daraus ein Handelssignal abzuleiten."""
+    future_events = pd.DataFrame()
+    if events is not None and not events.empty:
+        future_events = events.copy()
+        future_events["date"] = pd.to_datetime(future_events["date"], errors="coerce")
+        future_events["_future"] = future_events["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"})
+        future_events = future_events[future_events["_future"] & future_events["date"].notna()].sort_values("date")
+
+    if relevant_news.empty:
+        headline = "Keine verlässlich passende Unternehmensmeldung erkannt."
+    else:
+        latest = relevant_news.iloc[0]
+        headline = f"{len(relevant_news)} relevante Meldung(en) im gewählten Zeitraum; zuletzt: {str(latest.get('title') or '')}"
+
+    st.markdown("#### Einordnung")
+    st.info(headline)
+
+    notes: list[str] = []
+    if not future_events.empty:
+        next_event = future_events.iloc[0]
+        event_label = EVENT_META.get(str(next_event.get("event_type")), {}).get("label", str(next_event.get("event_type")))
+        notes.append(f"Nächstes Ereignis: **{event_label}** am **{pd.Timestamp(next_event['date']).strftime('%d.%m.%Y')}**.")
+    else:
+        notes.append("Kein kommender Termin aus den aktuell verfügbaren Yahoo-Kalenderdaten erkannt.")
+
+    if not diagnostics.empty:
+        reachable = diagnostics[diagnostics.get("http_status", pd.Series(dtype=float)).fillna(0).astype(int).between(200, 299)]
+        notes.append(f"Quellenabruf: **{len(reachable)} von {len(diagnostics)}** Quellen technisch erreichbar.")
+    if not uncertain_news.empty:
+        notes.append(f"{len(uncertain_news)} Treffer mit schwachem Firmenbezug wurden standardmäßig ausgeblendet.")
+    notes.append("Die Einordnung ist eine Recherchehilfe und kein Kauf- oder Verkaufssignal.")
+
+    for note in notes:
+        st.markdown(f"- {note}")
+
+
 def render_news(df: pd.DataFrame) -> None:
     st.subheader("News & Ereignisse")
     st.caption(
-        "Die Ansicht trennt jetzt Datenabruf, Firmenzuordnung und Treffer. "
-        "Der Google-News-Fallback ist optional; RSS-Quellen können sich ändern oder nur aktuelle Meldungen liefern."
+        "Relevante Unternehmensnews, bestätigte Kalendertermine und technische Quelleninformationen sind getrennt dargestellt. "
+        "Mehrdeutige Ticker werden bewusst strenger gefiltert."
     )
+
     ticker = st.selectbox("Aktie für News", df["ticker_yahoo"].tolist(), key="news_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
-    days_back = st.slider("Zeitraum", min_value=3, max_value=180, value=30, step=1, key="news_days")
+    company_name = str(row.get("name", ticker))
+
+    controls_left, controls_right = st.columns([2, 1])
+    with controls_left:
+        days_back = st.slider("Zeitraum", min_value=3, max_value=180, value=30, step=1, key="news_days")
+    with controls_right:
+        locale = st.radio("News-Sprache", ["Deutsch", "Englisch"], horizontal=True, key="news_locale")
     include_google = st.checkbox("Google News als firmenbezogenen Such-Fallback verwenden", value=True)
-    locale = st.radio("News-Sprache", ["Deutsch", "Englisch"], horizontal=True)
     locale_code = "en" if locale == "Englisch" else "de"
     key = f"news_bundle::{ticker}::{days_back}::{include_google}::{locale_code}"
 
-    aliases = aliases_for_ticker(str(row.get("name", ticker)), ticker)
+    aliases = news_identity_aliases(company_name, ticker)
     with st.expander("Firmen-Aliase verwalten", expanded=False):
+        st.caption(
+            "Für mehrdeutige Kürzel wie MMM, T oder F nutze bitte möglichst eindeutige Namen, "
+            "beispielsweise „3M Company“ statt nur „MMM“."
+        )
         alias_text = ", ".join(aliases)
         edited_aliases = st.text_area(
             "Suchbegriffe (Komma, Semikolon oder Zeilenumbruch trennen)",
@@ -2762,75 +3079,132 @@ def render_news(df: pd.DataFrame) -> None:
         with st.spinner("RSS-Feeds, Such-Fallback und Yahoo-Kalender werden geladen …"):
             news, diagnostics = fetch_news_bundle(
                 ticker=ticker,
-                company_name=str(row.get("name", ticker)),
+                company_name=company_name,
                 days_back=days_back,
                 include_google_news=include_google,
                 locale=locale_code,
             )
             calendar_events = fetch_yahoo_calendar_events(ticker, days_back=max(365, days_back), days_forward=365)
             events = combine_events(news, calendar_events, ticker)
-            persist_events(events)
+            events_ok, events_message = persist_events(events, replace_ticker=ticker)
             snapshot_path = NEWS_SNAPSHOT_DIR / f"{ticker.replace('.', '_')}.csv"
-            safe_write_csv(news, snapshot_path)
+            snapshot_ok, snapshot_message = safe_write_csv(news, snapshot_path)
             st.session_state[key] = {
                 "news": news,
                 "diagnostics": diagnostics,
                 "events": events,
                 "loaded_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "snapshot_warning": "" if snapshot_ok else snapshot_message,
+                "events_warning": "" if events_ok else events_message,
             }
 
     bundle = st.session_state.get(key)
     if bundle is None:
         stored_events = load_persisted_events(ticker, days_back=max(365, days_back))
         if not stored_events.empty:
-            st.info("Gespeicherte Ereignisse werden angezeigt. Für neue News bitte aktualisieren.")
+            st.info("Gespeicherte Kalenderereignisse sind verfügbar. Für aktuelle News bitte aktualisieren.")
             render_event_calendar(stored_events)
         else:
             st.info("Noch keine News geladen. Klicke auf „News & Ereignisse aktualisieren“.")
         return
 
-    news = bundle["news"]
-    diagnostics = bundle["diagnostics"]
-    events = bundle["events"]
+    news = bundle["news"].copy()
+    diagnostics = bundle["diagnostics"].copy()
+    events = bundle["events"].copy()
+    warning = str(bundle.get("snapshot_warning") or "")
+    events_warning = str(bundle.get("events_warning") or "")
+    if warning:
+        st.warning(warning)
+    if events_warning:
+        st.warning(events_warning)
+
+    is_relevant = news.get("is_relevant", pd.Series(False, index=news.index)).fillna(False).astype(bool) if not news.empty else pd.Series(dtype=bool)
+    relevant_news = news[is_relevant].copy() if not news.empty else empty_news_frame()
+    uncertain_news = news[~is_relevant].copy() if not news.empty else empty_news_frame()
+
+    future_events = pd.DataFrame()
+    if not events.empty:
+        future_events = events.copy()
+        future_events["date"] = pd.to_datetime(future_events["date"], errors="coerce")
+        future_events["_future"] = future_events["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"})
+        future_events = future_events[future_events["_future"] & future_events["date"].notna()].sort_values("date")
+
+    reachable_sources = 0
+    total_sources = len(diagnostics)
+    if not diagnostics.empty and "http_status" in diagnostics.columns:
+        reachable_sources = int(diagnostics["http_status"].fillna(0).astype(int).between(200, 299).sum())
 
     status_columns = st.columns(4)
-    status_columns[0].metric("News-Treffer", int(len(news)))
-    status_columns[1].metric("Ereignisse", int(len(events)))
-    status_columns[2].metric("Quellen OK", int((diagnostics.get("status") == "OK").sum()) if not diagnostics.empty else 0)
-    status_columns[3].metric("Letzte Abfrage", bundle.get("loaded_at", "–"))
+    status_columns[0].metric("Relevante News", int(len(relevant_news)))
+    status_columns[1].metric("Nächstes Ereignis", pd.Timestamp(future_events.iloc[0]["date"]).strftime("%d.%m.%Y") if not future_events.empty else "–")
+    status_columns[2].metric("Abrufbare Quellen", f"{reachable_sources} / {total_sources}" if total_sources else "–")
+    status_columns[3].metric("Daten aktualisiert", bundle.get("loaded_at", "–"))
 
-    st.markdown("#### Quellen-Diagnose")
-    if diagnostics.empty:
-        st.info("Keine Quelle wurde abgefragt.")
-    else:
-        diagnostic_columns = ["source", "kind", "status", "http_status", "entries", "matches", "duration_ms", "message", "url"]
-        visible_diagnostics = [column for column in diagnostic_columns if column in diagnostics.columns]
-        st.dataframe(diagnostics[visible_diagnostics], use_container_width=True, hide_index=True)
+    render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
 
-    st.markdown("#### Gefundene News")
-    if news.empty:
-        st.warning(
-            "Keine passenden Meldungen gefunden. Prüfe zuerst die Quellen-Diagnose. "
-            "Bei „Keine Firmen-Treffer“ helfen meist bessere Aliase; bei HTTP-/Parser-Fehlern ist die Quelle selbst das Problem."
-        )
-    else:
-        show_columns = [
-            "published", "title", "source", "source_kind", "matched_alias",
-            "event_type", "sentiment_label", "sentiment_score", "link",
-        ]
-        st.dataframe(news[[column for column in show_columns if column in news.columns]], use_container_width=True, hide_index=True)
+    tab_news, tab_calendar, tab_sources, tab_export = st.tabs([
+        "Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"
+    ])
+
+    with tab_news:
+        if relevant_news.empty:
+            st.warning(
+                "Keine verlässlich passende Unternehmensmeldung gefunden. "
+                "Prüfe bei Bedarf die Firmen-Aliase oder die Quellen-Diagnose."
+            )
+        else:
+            for index, (_, item) in enumerate(relevant_news.iterrows()):
+                render_news_card(item, index)
+
+        if not uncertain_news.empty:
+            with st.expander(f"Unsichere Treffer anzeigen ({len(uncertain_news)})", expanded=False):
+                st.caption(
+                    "Diese Artikel hatten einen zu schwachen Firmenbezug und werden nicht als relevante Unternehmensnews gezählt. "
+                    "Sie erscheinen nicht im Kalender und nicht im Chart."
+                )
+                for index, (_, item) in enumerate(uncertain_news.iterrows(), start=1000):
+                    render_news_card(item, index)
+
+    with tab_calendar:
+        st.caption("Der Kalender enthält Yahoo-Dividenden-/Kalenderdaten sowie nur konkret klassifizierte, relevante Nachrichten.")
+        render_event_calendar(events)
+
+    with tab_sources:
+        st.caption("Dieser Bereich ist für technische Prüfung gedacht. Fehlerhafte oder eingeschränkte Quellen beeinflussen die News-Abdeckung.")
+        if diagnostics.empty:
+            st.info("Keine Quelle wurde abgefragt.")
+        else:
+            diagnostic_columns = [
+                "source", "kind", "status", "http_status", "entries", "matches",
+                "uncertain_matches", "duration_ms", "message", "url",
+            ]
+            visible_diagnostics = [column for column in diagnostic_columns if column in diagnostics.columns]
+            st.dataframe(diagnostics[visible_diagnostics], use_container_width=True, hide_index=True)
+            failed = diagnostics[~diagnostics.get("http_status", pd.Series(dtype=float)).fillna(0).astype(int).between(200, 299)]
+            if not failed.empty:
+                st.warning("Mindestens eine Quelle war nicht erreichbar oder lieferte keinen brauchbaren Feed. Das ist ein Quellenproblem, kein Handelssignal.")
+
+    with tab_export:
+        st.caption("CSV-Export enthält relevante und unsichere Treffer samt Relevanzbegründung.")
         st.download_button(
-            "News als CSV herunterladen",
+            "Alle News als CSV herunterladen",
             data=news.to_csv(index=False).encode("utf-8"),
             file_name=f"news_{ticker.lower()}.csv",
             mime="text/csv",
             key=f"download_news_{ticker}",
         )
+        if not events.empty:
+            st.download_button(
+                "Kalender als CSV herunterladen",
+                data=events.to_csv(index=False).encode("utf-8"),
+                file_name=f"events_{ticker.lower()}.csv",
+                mime="text/csv",
+                key=f"download_events_{ticker}",
+            )
 
-    render_event_calendar(events)
     st.caption(
-        "Yahoo-Kalender liefert nicht für jede Aktie Earnings- oder Ex-Dividenden-Termine. "
-        "Die Quellen-Diagnose zeigt deshalb transparent, ob keine Daten verfügbar waren oder die Zuordnung fehlte."
+        "News-Relevanz wird aus Firmenalias und Finanz-/Unternehmenskontext abgeleitet. "
+        "Sie ist eine Filterhilfe; Quellen, Inhalte und Termine können unvollständig sein."
     )
 
 
