@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import quote_plus
 
 import altair as alt
 import feedparser
@@ -35,7 +36,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "2.1"
+APP_VERSION = "3.1"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -225,11 +226,12 @@ def ensure_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
 def empty_metrics_frame() -> pd.DataFrame:
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d",
-        "change_5d", "change_1y", "vol_30d", "vol_1y", "high_52w", "low_52w",
-        "market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda",
-        "net_margin", "operating_margin", "roe", "roa", "dividend_yield",
-        "dividend_per_share", "payout_ratio", "dividend_growth_5y",
-        "dividend_frequency", "debt_to_equity", "net_debt_ebitda", "data_updated_at",
+        "change_5d", "change_1y", "total_return_1y", "vol_30d", "vol_1y",
+        "max_drawdown_1y", "high_52w", "low_52w", "market_cap", "pe_ratio",
+        "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda", "net_margin",
+        "operating_margin", "roe", "roa", "dividend_yield", "dividend_per_share",
+        "payout_ratio", "dividend_growth_5y", "dividend_frequency",
+        "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
     ]
     return pd.DataFrame(columns=columns)
 
@@ -374,8 +376,13 @@ def _extract_ticker_history(downloaded: pd.DataFrame, ticker: str, ticker_count:
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> dict[str, pd.DataFrame]:
-    """Lädt Kursdaten gebündelt; das ist schneller als ein Abruf je Ticker."""
+    """Lädt historische Kurse gebündelt und behält Close sowie Adj Close.
+
+    Close = Preisrendite, Adj Close = von Yahoo bereinigte Reihe (als
+    Näherung für Total Return). Die Datenquelle bleibt Yahoo Finance.
+    """
     clean_tickers = tuple(dict.fromkeys(ticker for ticker in tickers if ticker))
     if not clean_tickers:
         return {}
@@ -405,7 +412,10 @@ def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> di
                 history = pd.DataFrame()
         if not history.empty:
             history = ensure_datetime_index(history)
-            valid_columns = [column for column in ["Open", "High", "Low", "Close", "Volume"] if column in history.columns]
+            valid_columns = [
+                column for column in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+                if column in history.columns
+            ]
             histories[ticker] = history[valid_columns].copy()
         else:
             histories[ticker] = pd.DataFrame()
@@ -414,18 +424,38 @@ def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> di
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ticker_info(ticker: str) -> dict[str, Any]:
-    """Beschränkt die gespeicherten Yahoo-Felder auf wirklich benötigte Daten."""
+    """Lädt Kennzahlen plus Basisprofil von Yahoo Finance.
+
+    Yahoo liefert nicht für jeden Börsenplatz alle Profilfelder. Die Funktion
+    gibt deshalb nur die Felder zurück, die das Tool tatsächlich verwendet;
+    fehlende Werte werden im UI als „–“ dargestellt.
+    """
     wanted_keys = [
-        "marketCap", "trailingPE", "forwardPE", "priceToBook", "priceToSalesTrailing12Months",
-        "enterpriseToEbitda", "profitMargins", "operatingMargins", "returnOnEquity",
-        "returnOnAssets", "dividendYield", "dividendRate", "payoutRatio", "debtToEquity",
-        "totalDebt", "totalCash", "ebitda", "currency", "financialCurrency", "beta",
+        # Bewertung, Profitabilität, Bilanz und Währung
+        "marketCap", "trailingPE", "forwardPE", "priceToBook",
+        "priceToSalesTrailing12Months", "enterpriseToEbitda",
+        "profitMargins", "operatingMargins", "returnOnEquity",
+        "returnOnAssets", "dividendYield", "dividendRate", "payoutRatio",
+        "debtToEquity", "totalDebt", "totalCash", "ebitda",
+        "currency", "financialCurrency", "beta",
+
+        # Unternehmensprofil und Management
+        "shortName", "longName", "sector", "industry", "country", "city",
+        "fullTimeEmployees", "website", "longBusinessSummary",
+        "companyOfficers",
+
+        # Ownership und Analystenschätzungen
+        "heldPercentInstitutions", "heldPercentInsiders",
+        "recommendationKey", "recommendationMean",
+        "targetMeanPrice", "targetHighPrice", "targetLowPrice",
+        "numberOfAnalystOpinions",
     ]
     try:
-        info = yf.Ticker(ticker).get_info()
+        raw_info = yf.Ticker(ticker).get_info() or {}
     except Exception:
-        info = {}
-    return {key: info.get(key) for key in wanted_keys}
+        raw_info = {}
+
+    return {key: raw_info.get(key) for key in wanted_keys}
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
@@ -531,9 +561,9 @@ def metrics_from_ticker(
     sector: str,
     history: pd.DataFrame,
     info: dict[str, Any],
-    dividends: pd.DataFrame,
+    dividends: pd.Series,
 ) -> dict[str, Any]:
-    """Erstellt eine flache, tabellenfreundliche Kennzahlenzeile."""
+    """Erstellt Kennzahlen inklusive Preis- und bereinigter Gesamtrendite."""
     record: dict[str, Any] = {
         "name": name,
         "ticker_yahoo": ticker,
@@ -543,8 +573,10 @@ def metrics_from_ticker(
         "change_1d": None,
         "change_5d": None,
         "change_1y": None,
+        "total_return_1y": None,
         "vol_30d": None,
         "vol_1y": None,
+        "max_drawdown_1y": None,
         "high_52w": None,
         "low_52w": None,
         "market_cap": safe_float(info.get("marketCap")),
@@ -593,13 +625,17 @@ def metrics_from_ticker(
                 record["vol_30d"] = float(returns.tail(30).std() * (252 ** 0.5) * 100)
             if len(returns) >= 2:
                 record["vol_1y"] = float(returns.std() * (252 ** 0.5) * 100)
+                cumulative = (1 + returns).cumprod()
+                record["max_drawdown_1y"] = float((cumulative / cumulative.cummax() - 1).min() * 100)
+
+        if "Adj Close" in history.columns:
+            adjusted = pd.to_numeric(history["Adj Close"], errors="coerce").dropna()
+            record["total_return_1y"] = series_change(adjusted, 252) if len(adjusted) >= 253 else None
 
     trailing_dps = trailing_dividend_per_share(dividends)
     if record["dividend_per_share"] is None:
         record["dividend_per_share"] = trailing_dps
 
-    # Plausibilitäts-Fallback: Yahoo liefert die Yield gelegentlich leer oder in
-    # einer unpassenden Skalierung. Erst dann rechnen wir aus DPS / letztem Kurs.
     price = safe_float(record["last_price"])
     dps = safe_float(record["dividend_per_share"])
     estimated_yield = dps / price * 100 if price not in (None, 0) and dps not in (None, 0) else None
@@ -613,7 +649,7 @@ def metrics_from_ticker(
 
 
 def collect_metrics(constituents: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
-    """Lädt Kurse gebündelt; Fundamentaldaten bleiben pro Ticker gecacht."""
+    """Lädt Kurse gebündelt und Fundamentals pro Ticker mit Cache."""
     if constituents.empty:
         return empty_metrics_frame(), {}, []
 
@@ -640,10 +676,16 @@ def collect_metrics(constituents: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,
             )
             if history.empty:
                 errors.append(f"{ticker}: keine Kursdaten")
+            if not info:
+                errors.append(f"{ticker}: keine Fundamentaldaten")
         except Exception as error:
-            errors.append(f"{ticker}: {type(error).__name__}")
+            errors.append(f"{ticker}: {type(error).__name__}: {error}")
 
-    return pd.DataFrame(records), histories, errors
+    frame = pd.DataFrame(records)
+    for column in empty_metrics_frame().columns:
+        if column not in frame.columns:
+            frame[column] = None
+    return frame[empty_metrics_frame().columns], histories, errors
 
 
 # -----------------------------------------------------------------------------
@@ -955,17 +997,21 @@ def build_portfolio_view(metrics: pd.DataFrame, portfolio: pd.DataFrame) -> pd.D
 
     metric_columns = [
         "ticker_yahoo", "name", "sector", "currency", "last_price", "dividend_yield",
-        "dividend_per_share", "total_score", "value_score", "value_trigger",
+        "dividend_per_share", "total_score", "value_score", "value_trigger", "vol_1y",
+        "total_return_1y", "max_drawdown_1y",
     ]
     available_columns = [column for column in metric_columns if column in metrics.columns]
     result = portfolio.merge(metrics[available_columns], on="ticker_yahoo", how="left", suffixes=("", "_asset"))
 
+    # currency aus Portfolio/Transaktionsbuch = Einstandswährung; currency_asset
+    # aus Market Data = Handelswährung des Wertpapiers.
     asset_currency = result.get("currency_asset", result.get("currency", "EUR"))
     result["asset_currency"] = asset_currency.fillna("EUR") if isinstance(asset_currency, pd.Series) else "EUR"
-    result["cost_currency"] = (
-        result["currency"].replace(r"^\s*$", pd.NA, regex=True).fillna(result["asset_currency"])
-        if "currency" in result.columns else result["asset_currency"]
-    )
+    if "currency" in result.columns:
+        result["cost_currency"] = result["currency"].replace(r"^\s*$", pd.NA, regex=True).fillna(result["asset_currency"])
+    else:
+        result["cost_currency"] = result["asset_currency"]
+
     result["fx_asset_to_eur"] = result["asset_currency"].map(fx_to_eur)
     result["fx_cost_to_eur"] = result["cost_currency"].map(fx_to_eur)
 
@@ -981,6 +1027,10 @@ def build_portfolio_view(metrics: pd.DataFrame, portfolio: pd.DataFrame) -> pd.D
 
     total_value = result["market_value_eur"].sum(skipna=True)
     result["weight_pct"] = result["market_value_eur"] / total_value * 100 if total_value > 0 else None
+    result["fx_status"] = result.apply(
+        lambda row: "OK" if pd.notna(row.get("fx_asset_to_eur")) and pd.notna(row.get("fx_cost_to_eur")) else "FX fehlt",
+        axis=1,
+    )
     return result
 
 
@@ -1121,6 +1171,1016 @@ def fetch_news_for_ticker(ticker: str, company_name: str, days_back: int, max_it
     return pd.DataFrame(entries).sort_values("published", ascending=False).head(max_items).reset_index(drop=True)
 
 
+
+# -----------------------------------------------------------------------------
+# Version 3.0 – Datenqualität, News-/Event-Pipeline, Portfolio-Risiko & Research
+# -----------------------------------------------------------------------------
+
+# Die App legt diese Dateien bei Bedarf automatisch an. Sie sind bewusst CSV-
+# basiert, damit du sie auch ohne Datenbank in Excel bearbeiten kannst.
+TRANSACTIONS_PATH = DATA_DIR / "transactions.csv"
+ALIAS_PATH = DATA_DIR / "company_aliases.csv"
+EVENTS_PATH = DATA_DIR / "events.csv"
+NEWS_SNAPSHOT_DIR = DATA_DIR / "news_snapshots"
+NEWS_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+GLOBAL_RSS_SOURCES: list[dict[str, str]] = [
+    {
+        "name": "finanzen.net News",
+        "url": "https://www.finanzen.net/rss/news",
+        "kind": "global",
+    },
+    {
+        "name": "Tagesschau Wirtschaft",
+        "url": "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
+        "kind": "global",
+    },
+    {
+        "name": "Tagesschau Unternehmen",
+        "url": "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
+        "kind": "global",
+    },
+]
+
+# Diese Profile setzen nur sinnvolle Scanner-Startwerte. Die Regeln bleiben
+# anschließend transparent über die Sidebar-Slider anpassbar.
+STRATEGY_PROFILES: dict[str, dict[str, Any]] = {
+    "Ausgewogen": {
+        "drawdown": 25,
+        "payout": 90,
+        "score": 65,
+        "yield": 5.0,
+        "description": "Qualität, Ausschüttungsquote, Rendite und Drawdown ausgewogen gewichtet.",
+    },
+    "Defensive Dividende": {
+        "drawdown": 15,
+        "payout": 75,
+        "score": 70,
+        "yield": 3.5,
+        "description": "Strengere Qualität und Ausschüttungsquote, moderate Mindest-Rendite.",
+    },
+    "Value / Turnaround": {
+        "drawdown": 35,
+        "payout": 100,
+        "score": 55,
+        "yield": 2.5,
+        "description": "Stärkerer Drawdown und etwas mehr Raum für zyklische Titel; kein Kaufsignal.",
+    },
+    "Ertragsorientiert": {
+        "drawdown": 20,
+        "payout": 85,
+        "score": 60,
+        "yield": 6.0,
+        "description": "Fokus auf hohe Ausschüttung, aber mit Mindestqualität und Payout-Limit.",
+    },
+}
+
+EVENT_META: dict[str, dict[str, str]] = {
+    "news": {"label": "News", "shape": "circle"},
+    "earnings": {"label": "Quartalszahlen", "shape": "triangle-up"},
+    "dividend": {"label": "Dividende", "shape": "diamond"},
+    "annual_meeting": {"label": "Hauptversammlung", "shape": "square"},
+    "report": {"label": "Bericht", "shape": "cross"},
+    "analyst": {"label": "Analysten", "shape": "triangle-down"},
+}
+
+KNOWN_ALIASES: dict[str, list[str]] = {
+    "DHL.DE": ["DHL", "DHL Group", "Deutsche Post"],
+    "VOW3.DE": ["Volkswagen", "Volkswagen Group", "VW"],
+    "MBG.DE": ["Mercedes-Benz", "Mercedes Benz", "Mercedes"],
+    "DTE.DE": ["Deutsche Telekom", "Telekom", "T-Mobile"],
+    "MUV2.DE": ["Munich Re", "Münchener Rück", "Muenchener Rueck"],
+    "DBK.DE": ["Deutsche Bank"],
+    "BAS.DE": ["BASF"],
+    "SIE.DE": ["Siemens"],
+    "SAP.DE": ["SAP"],
+    "ALV.DE": ["Allianz"],
+}
+
+
+def normalize_for_search(value: Any) -> str:
+    """Normalisiert Text für robuste, aber nicht zu breite Alias-Suchen."""
+    text_value = str(value or "").lower()
+    text_value = text_value.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    text_value = re.sub(r"[^a-z0-9]+", " ", text_value)
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def safe_write_csv(df: pd.DataFrame, path: Path) -> None:
+    """Schreibt CSV atomar, damit bei Streamlit-Reruns keine halben Dateien entstehen."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(temp_path, index=False, encoding="utf-8")
+    temp_path.replace(path)
+
+
+def empty_news_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "published", "ticker_yahoo", "title", "link", "source", "source_kind",
+            "matched_alias", "sentiment_score", "sentiment_label", "event_type",
+        ]
+    )
+
+
+def empty_events_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "date", "ticker_yahoo", "event_type", "title", "source", "link",
+            "sentiment_score", "sentiment_label", "importance", "is_future_event",
+        ]
+    )
+
+
+def ensure_alias_file() -> None:
+    if ALIAS_PATH.exists():
+        return
+    seed_rows = []
+    for ticker, aliases in KNOWN_ALIASES.items():
+        for alias in aliases:
+            seed_rows.append({"ticker_yahoo": ticker, "alias": alias, "source": "Voreinstellung"})
+    safe_write_csv(pd.DataFrame(seed_rows, columns=["ticker_yahoo", "alias", "source"]), ALIAS_PATH)
+
+
+def read_aliases() -> pd.DataFrame:
+    ensure_alias_file()
+    try:
+        aliases = pd.read_csv(ALIAS_PATH, dtype=str)
+    except Exception:
+        aliases = pd.DataFrame(columns=["ticker_yahoo", "alias", "source"])
+    for column in ["ticker_yahoo", "alias", "source"]:
+        if column not in aliases.columns:
+            aliases[column] = ""
+    aliases["ticker_yahoo"] = aliases["ticker_yahoo"].map(clean_ticker)
+    aliases["alias"] = aliases["alias"].fillna("").astype(str).str.strip()
+    aliases = aliases[aliases["alias"].str.len() >= 2].drop_duplicates(["ticker_yahoo", "alias"])
+    return aliases.reset_index(drop=True)
+
+
+def default_company_aliases(company_name: str, ticker: str) -> list[str]:
+    cleaned_name = str(company_name or "").strip()
+    simplified = re.sub(
+        r"\b(ag|se|sa|s\.a\.|plc|n\.v\.|gmbh|kgaa|inc\.?|corp\.?|ltd\.?)\b",
+        "",
+        cleaned_name,
+        flags=re.IGNORECASE,
+    ).strip(" ,-")
+    candidates = {
+        cleaned_name,
+        simplified,
+        clean_ticker(ticker).split(".")[0],
+        *KNOWN_ALIASES.get(clean_ticker(ticker), []),
+    }
+    # Einzelwörter werden nur übernommen, wenn sie nicht sehr kurz sind.
+    candidates.update(part for part in simplified.split() if len(part) >= 5)
+    return sorted({candidate.strip() for candidate in candidates if len(candidate.strip()) >= 3})
+
+
+def aliases_for_ticker(company_name: str, ticker: str) -> list[str]:
+    aliases = set(default_company_aliases(company_name, ticker))
+    alias_frame = read_aliases()
+    manual = alias_frame.loc[
+        alias_frame["ticker_yahoo"] == clean_ticker(ticker), "alias"
+    ].dropna().astype(str).tolist()
+    aliases.update(manual)
+    # Sehr kurze Ticker ohne Firmenname erzeugen viele False Positives.
+    return sorted({alias for alias in aliases if len(normalize_for_search(alias)) >= 3})
+
+
+def save_aliases_for_ticker(ticker: str, aliases_text: str) -> None:
+    alias_frame = read_aliases()
+    ticker = clean_ticker(ticker)
+    values = [part.strip() for part in re.split(r"[,\n;|]+", aliases_text) if part.strip()]
+    alias_frame = alias_frame[alias_frame["ticker_yahoo"] != ticker].copy()
+    if values:
+        additions = pd.DataFrame(
+            [{"ticker_yahoo": ticker, "alias": value, "source": "manuell"} for value in values]
+        )
+        alias_frame = pd.concat([alias_frame, additions], ignore_index=True)
+    alias_frame = alias_frame.drop_duplicates(["ticker_yahoo", "alias"])
+    safe_write_csv(alias_frame, ALIAS_PATH)
+
+
+def contains_alias_precise(text: str, aliases: Iterable[str]) -> Optional[str]:
+    normalized = f" {normalize_for_search(text)} "
+    for alias in sorted(set(aliases), key=lambda item: len(normalize_for_search(item)), reverse=True):
+        candidate = normalize_for_search(alias)
+        if not candidate:
+            continue
+        if f" {candidate} " in normalized:
+            return alias
+    return None
+
+
+def classify_event_from_text(text: str) -> str:
+    normalized = normalize_for_search(text)
+    if any(word in normalized for word in ["quartalszahlen", "geschaeftszahlen", "jahreszahlen", "earnings", "results", "q1", "q2", "q3", "q4"]):
+        return "earnings"
+    if any(word in normalized for word in ["upgrade", "downgrade", "kursziel", "analyst", "outperform", "underperform"]):
+        return "analyst"
+    if any(word in normalized for word in ["hauptversammlung", "annual general meeting", "agm"]):
+        return "annual_meeting"
+    if any(word in normalized for word in ["geschaeftsbericht", "annual report", "quartalsbericht", "quarterly report"]):
+        return "report"
+    if any(word in normalized for word in ["dividende", "ex divid", "dividend"]):
+        return "dividend"
+    return "news"
+
+
+def request_feed(url: str) -> tuple[Optional[bytes], dict[str, Any]]:
+    """HTTP-Abruf mit Diagnose statt stiller Fehlerunterdrückung."""
+    started = time.perf_counter()
+    diagnostic: dict[str, Any] = {
+        "url": url,
+        "status": "Fehler",
+        "http_status": None,
+        "content_type": None,
+        "entries": 0,
+        "matches": 0,
+        "message": "",
+        "duration_ms": None,
+    }
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)
+        diagnostic["http_status"] = response.status_code
+        diagnostic["content_type"] = response.headers.get("Content-Type", "")
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        response.raise_for_status()
+        payload = response.content
+        if not payload:
+            diagnostic["status"] = "Leer"
+            diagnostic["message"] = "Antwort ohne Inhalt"
+            return None, diagnostic
+        diagnostic["status"] = "OK"
+        return payload, diagnostic
+    except requests.RequestException as error:
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        diagnostic["message"] = f"{type(error).__name__}: {error}"
+        return None, diagnostic
+
+
+def parse_feed_entries(payload: bytes, source_name: str, source_kind: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    parsed = feedparser.parse(payload)
+    if getattr(parsed, "bozo", False) and not getattr(parsed, "entries", []):
+        error = getattr(parsed, "bozo_exception", None)
+        return [], f"Parser: {type(error).__name__ if error else 'unbekannt'}"
+    entries: list[dict[str, Any]] = []
+    for entry in getattr(parsed, "entries", []):
+        published = entry_datetime(entry)
+        if published is None:
+            continue
+        entries.append(
+            {
+                "published": published.replace(tzinfo=None),
+                "title": str(entry.get("title", "") or "").strip(),
+                "summary": str(entry.get("summary", "") or "").strip(),
+                "link": str(entry.get("link", "") or "").strip(),
+                "source": source_name,
+                "source_kind": source_kind,
+            }
+        )
+    return entries, None
+
+
+def google_news_rss_url(query: str, locale: str = "de") -> str:
+    # Google News RSS ist nur ein optionaler Such-Fallback. Der Link enthält
+    # einen klaren Firmennamen statt einer breiten allgemeinen Abfrage.
+    locale = "en" if locale == "en" else "de"
+    country = "US" if locale == "en" else "DE"
+    return (
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(query)}&hl={locale}&gl={country}&ceid={country}:{locale}"
+    )
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def fetch_news_bundle(
+    ticker: str,
+    company_name: str,
+    days_back: int,
+    include_google_news: bool = True,
+    locale: str = "de",
+    max_items: int = 80,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lädt News plus nachvollziehbare Statusdaten je Quelle.
+
+    Allgemeine RSS-Feeds werden mit präzisen Aliasen gefiltert. Der optionale
+    Google-News-Fallback ist eine firmenbezogene Suche und erhöht die Treffer-
+    chance, ersetzt aber keine lizenzierte Datenquelle.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days_back))).replace(tzinfo=None)
+    ticker = clean_ticker(ticker)
+    aliases = aliases_for_ticker(company_name, ticker)
+    source_specs = [dict(source) for source in GLOBAL_RSS_SOURCES]
+
+    if include_google_news:
+        preferred_alias = max(aliases, key=lambda item: len(normalize_for_search(item)))
+        query = f'"{preferred_alias}"'
+        source_specs.append(
+            {
+                "name": f"Google News Suche: {preferred_alias}",
+                "url": google_news_rss_url(query, locale),
+                "kind": "search_fallback",
+            }
+        )
+
+    news_rows: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+
+    for source in source_specs:
+        payload, diagnostic = request_feed(source["url"])
+        diagnostic["source"] = source["name"]
+        diagnostic["kind"] = source["kind"]
+
+        if payload is None:
+            diagnostics.append(diagnostic)
+            continue
+
+        parsed_entries, parser_error = parse_feed_entries(payload, source["name"], source["kind"])
+        diagnostic["entries"] = len(parsed_entries)
+        if parser_error:
+            diagnostic["status"] = "Parser-Fehler"
+            diagnostic["message"] = parser_error
+            diagnostics.append(diagnostic)
+            continue
+
+        for entry in parsed_entries:
+            if not entry["title"] or entry["published"] < cutoff:
+                continue
+
+            combined_text = f"{entry['title']} {entry['summary']}"
+            # Bei Google News ist die Abfrage firmenbezogen. Trotzdem prüfen wir
+            # Aliase, damit breit gefasste Treffer nicht ungefiltert landen.
+            matched_alias = contains_alias_precise(combined_text, aliases)
+            if matched_alias is None and source["kind"] == "global":
+                continue
+            if matched_alias is None:
+                matched_alias = "Suchabfrage"
+
+            title_key = normalize_for_search(entry["title"])
+            if not title_key or title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+
+            sentiment_score, sentiment_label = simple_sentiment(combined_text)
+            news_rows.append(
+                {
+                    "published": entry["published"],
+                    "ticker_yahoo": ticker,
+                    "title": entry["title"],
+                    "link": entry["link"],
+                    "source": entry["source"],
+                    "source_kind": entry["source_kind"],
+                    "matched_alias": matched_alias,
+                    "sentiment_score": sentiment_score,
+                    "sentiment_label": sentiment_label,
+                    "event_type": classify_event_from_text(combined_text),
+                }
+            )
+            diagnostic["matches"] += 1
+
+        if diagnostic["status"] == "OK" and diagnostic["entries"] == 0:
+            diagnostic["status"] = "Keine Einträge"
+        elif diagnostic["status"] == "OK" and diagnostic["matches"] == 0:
+            diagnostic["status"] = "Keine Firmen-Treffer"
+        diagnostics.append(diagnostic)
+
+    news = pd.DataFrame(news_rows) if news_rows else empty_news_frame()
+    if not news.empty:
+        news = news.sort_values("published", ascending=False).head(max_items).reset_index(drop=True)
+
+    diagnostic_frame = pd.DataFrame(diagnostics)
+    return news, diagnostic_frame
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_yahoo_calendar_events(ticker: str, days_back: int = 365, days_forward: int = 365) -> pd.DataFrame:
+    """Liest verfügbare Dividenden- und Kalendereinträge defensiv aus yfinance."""
+    ticker = clean_ticker(ticker)
+    now = datetime.now().replace(tzinfo=None)
+    earliest = now - timedelta(days=int(days_back))
+    latest = now + timedelta(days=int(days_forward))
+    rows: list[dict[str, Any]] = []
+
+    try:
+        dividends = fetch_dividends(ticker)
+    except Exception:
+        dividends = pd.DataFrame(columns=["date", "amount"])
+
+    if dividends is not None and not dividends.empty:
+        if isinstance(dividends, pd.DataFrame) and {"date", "amount"}.issubset(dividends.columns):
+            dividend_rows = dividends[["date", "amount"]].copy()
+        else:
+            series = pd.to_numeric(dividends, errors="coerce").dropna()
+            dividend_rows = pd.DataFrame({"date": series.index, "amount": series.values})
+
+        dividend_rows["date"] = pd.to_datetime(dividend_rows["date"], errors="coerce")
+        dividend_rows["amount"] = pd.to_numeric(dividend_rows["amount"], errors="coerce")
+        for _, dividend_row in dividend_rows.dropna(subset=["date", "amount"]).iterrows():
+            date_value = pd.Timestamp(dividend_row["date"]).tz_localize(None).to_pydatetime()
+            value = float(dividend_row["amount"])
+            if earliest <= date_value <= latest:
+                rows.append(
+                    {
+                        "date": date_value,
+                        "ticker_yahoo": ticker,
+                        "event_type": "dividend",
+                        "title": f"Dividende: {format_number(value, 4)} je Aktie",
+                        "source": "Yahoo Finance",
+                        "link": "",
+                        "sentiment_score": 0.0,
+                        "sentiment_label": "neutral",
+                        "importance": "mittel",
+                        "is_future_event": bool(date_value > now),
+                    }
+                )
+
+    # Yahoo liefert Kalenderinformationen nicht für alle Titel und in unter-
+    # schiedlichen Formaten. Deshalb sind diese Zeilen best effort.
+    try:
+        calendar = yf.Ticker(ticker).calendar
+    except Exception:
+        calendar = None
+
+    def add_calendar_dates(value: Any, event_type: str, title: str) -> None:
+        if value is None:
+            return
+        values: list[Any]
+        if isinstance(value, (pd.Series, pd.Index, list, tuple, set)):
+            values = list(value)
+        else:
+            values = [value]
+        for raw_date in values:
+            parsed_date = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(parsed_date):
+                continue
+            date_value = pd.Timestamp(parsed_date).tz_localize(None).to_pydatetime()
+            if earliest <= date_value <= latest:
+                rows.append(
+                    {
+                        "date": date_value,
+                        "ticker_yahoo": ticker,
+                        "event_type": event_type,
+                        "title": title,
+                        "source": "Yahoo Finance Calendar",
+                        "link": "",
+                        "sentiment_score": 0.0,
+                        "sentiment_label": "neutral",
+                        "importance": "hoch" if event_type == "earnings" else "mittel",
+                        "is_future_event": bool(date_value > now),
+                    }
+                )
+
+    if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+        for index_value, row in calendar.iterrows():
+            label = str(index_value)
+            values = row.tolist()
+            lowered = label.lower()
+            if "earning" in lowered:
+                add_calendar_dates(values, "earnings", "Quartalszahlen / Earnings")
+            elif "ex-dividend" in lowered or "ex dividend" in lowered:
+                add_calendar_dates(values, "dividend", "Ex-Dividende")
+    elif isinstance(calendar, dict):
+        for key, value in calendar.items():
+            lowered = str(key).lower()
+            if "earning" in lowered:
+                add_calendar_dates(value, "earnings", "Quartalszahlen / Earnings")
+            elif "ex-dividend" in lowered or "ex dividend" in lowered:
+                add_calendar_dates(value, "dividend", "Ex-Dividende")
+
+    events = pd.DataFrame(rows) if rows else empty_events_frame()
+    if not events.empty:
+        events["date"] = pd.to_datetime(events["date"], errors="coerce")
+        events = (
+            events.dropna(subset=["date"])
+            .drop_duplicates(["ticker_yahoo", "date", "event_type", "title"])
+            .sort_values("date", ascending=False)
+            .reset_index(drop=True)
+        )
+    return events
+
+
+def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if news is None or news.empty:
+        return empty_events_frame()
+    events = pd.DataFrame(
+        {
+            "date": pd.to_datetime(news["published"], errors="coerce"),
+            "ticker_yahoo": ticker,
+            "event_type": news.get("event_type", "news"),
+            "title": news.get("title", ""),
+            "source": news.get("source", ""),
+            "link": news.get("link", ""),
+            "sentiment_score": news.get("sentiment_score", 0.0),
+            "sentiment_label": news.get("sentiment_label", "neutral"),
+            "importance": "mittel",
+            "is_future_event": False,
+        }
+    )
+    return events.dropna(subset=["date"]).reset_index(drop=True)
+
+
+def persist_events(events: pd.DataFrame) -> None:
+    if events is None or events.empty:
+        return
+    existing = empty_events_frame()
+    if EVENTS_PATH.exists():
+        try:
+            existing = pd.read_csv(EVENTS_PATH)
+        except Exception:
+            existing = empty_events_frame()
+    combined = pd.concat([existing, events], ignore_index=True)
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = combined.dropna(subset=["date"])
+    combined["date"] = combined["date"].dt.strftime("%Y-%m-%d")
+    combined = (
+        combined.drop_duplicates(["ticker_yahoo", "date", "event_type", "title"], keep="last")
+        .sort_values(["ticker_yahoo", "date"], ascending=[True, False])
+    )
+    safe_write_csv(combined, EVENTS_PATH)
+
+
+def load_persisted_events(ticker: str, days_back: int = 1825) -> pd.DataFrame:
+    if not EVENTS_PATH.exists():
+        return empty_events_frame()
+    try:
+        events = pd.read_csv(EVENTS_PATH)
+    except Exception:
+        return empty_events_frame()
+    if events.empty or "ticker_yahoo" not in events.columns:
+        return empty_events_frame()
+    events["ticker_yahoo"] = events["ticker_yahoo"].map(clean_ticker)
+    events["date"] = pd.to_datetime(events["date"], errors="coerce")
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days_back)
+    events = events[
+        (events["ticker_yahoo"] == clean_ticker(ticker)) & (events["date"] >= cutoff)
+    ].copy()
+    for column, default in {
+        "sentiment_score": 0.0,
+        "sentiment_label": "neutral",
+        "importance": "mittel",
+        "is_future_event": False,
+        "link": "",
+        "source": "",
+        "title": "",
+        "event_type": "news",
+    }.items():
+        if column not in events.columns:
+            events[column] = default
+    return events.sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def combine_events(news: pd.DataFrame, calendar_events: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    combined = pd.concat([news_to_events(news, ticker), calendar_events], ignore_index=True)
+    if combined.empty:
+        return empty_events_frame()
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = combined.dropna(subset=["date"])
+    combined = (
+        combined.drop_duplicates(["ticker_yahoo", "date", "event_type", "title"])
+        .sort_values("date", ascending=False)
+        .reset_index(drop=True)
+    )
+    return combined
+
+
+def empty_transactions_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["date", "ticker_yahoo", "type", "shares", "price", "currency", "fees", "comment"]
+    )
+
+
+def ensure_transaction_template() -> None:
+    if TRANSACTIONS_PATH.exists():
+        return
+    safe_write_csv(empty_transactions_frame(), TRANSACTIONS_PATH)
+
+
+def read_transactions() -> pd.DataFrame:
+    ensure_transaction_template()
+    try:
+        transactions = pd.read_csv(TRANSACTIONS_PATH)
+    except Exception as error:
+        raise RuntimeError(f"data/transactions.csv konnte nicht gelesen werden: {error}") from error
+    if transactions.empty:
+        return empty_transactions_frame()
+
+    required = {"date", "ticker_yahoo", "type", "shares", "price"}
+    missing = required - set(transactions.columns)
+    if missing:
+        raise ValueError(f"transactions.csv fehlt: {', '.join(sorted(missing))}")
+
+    frame = transactions.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["ticker_yahoo"] = frame["ticker_yahoo"].map(clean_ticker)
+    frame["type"] = frame["type"].astype(str).str.lower().str.strip()
+    translations = {"kauf": "buy", "buy": "buy", "verkauf": "sell", "sell": "sell"}
+    frame["type"] = frame["type"].map(translations)
+    for column in ["shares", "price"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "fees" not in frame.columns:
+        frame["fees"] = 0.0
+    frame["fees"] = pd.to_numeric(frame["fees"], errors="coerce").fillna(0.0)
+    if "currency" not in frame.columns:
+        frame["currency"] = ""
+    if "comment" not in frame.columns:
+        frame["comment"] = ""
+    return (
+        frame.dropna(subset=["date", "ticker_yahoo", "type", "shares", "price"])
+        .query("shares > 0")
+        .sort_values(["ticker_yahoo", "date"])
+        .reset_index(drop=True)
+    )
+
+
+def holdings_from_transactions(transactions: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Ermittelt Bestände nach gleitendem Durchschnittseinstand.
+
+    Das ist bewusst eine Depotübersicht, keine steuerliche Gewinnermittlung.
+    Mehrere Handelswährungen pro Ticker werden als Warnung ausgegeben.
+    """
+    if transactions is None or transactions.empty:
+        return pd.DataFrame(columns=["ticker_yahoo", "shares", "cost_basis", "currency", "realized_pnl_local"]), []
+
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for ticker, group in transactions.groupby("ticker_yahoo", dropna=False):
+        shares = 0.0
+        cost_total = 0.0
+        realized = 0.0
+        currencies = {str(value).upper().strip() for value in group["currency"].dropna() if str(value).strip()}
+        if len(currencies) > 1:
+            warnings.append(f"{ticker}: mehrere Transaktionswährungen ({', '.join(sorted(currencies))})")
+        last_currency = next(iter(currencies), "")
+
+        for _, tx in group.sort_values("date").iterrows():
+            quantity = safe_float(tx["shares"]) or 0.0
+            price = safe_float(tx["price"]) or 0.0
+            fees = safe_float(tx["fees"]) or 0.0
+            if tx["type"] == "buy":
+                shares += quantity
+                cost_total += quantity * price + fees
+            elif tx["type"] == "sell":
+                if shares <= 0:
+                    warnings.append(f"{ticker}: Verkauf ohne verfügbaren Bestand am {tx['date'].date()}")
+                    continue
+                sold = min(quantity, shares)
+                if quantity > shares + 1e-9:
+                    warnings.append(f"{ticker}: Verkaufsmenge übersteigt Bestand am {tx['date'].date()}")
+                average_cost = cost_total / shares if shares else 0.0
+                proceeds = sold * price - fees
+                realized += proceeds - sold * average_cost
+                cost_total -= sold * average_cost
+                shares -= sold
+
+        if shares > 1e-9:
+            rows.append(
+                {
+                    "ticker_yahoo": ticker,
+                    "shares": shares,
+                    "cost_basis": cost_total / shares if shares else None,
+                    "currency": last_currency or None,
+                    "realized_pnl_local": realized,
+                }
+            )
+
+    return pd.DataFrame(rows), warnings
+
+
+def portfolio_input() -> tuple[pd.DataFrame, str, list[str]]:
+    """Nutzt transactions.csv bevorzugt, sonst die bisherige portfolio.csv."""
+    try:
+        transactions = read_transactions()
+    except Exception as error:
+        return pd.DataFrame(), "Transaktionsbuch", [str(error)]
+
+    if not transactions.empty:
+        holdings, warnings = holdings_from_transactions(transactions)
+        return holdings, "Transaktionsbuch", warnings
+
+    try:
+        holdings = read_portfolio()
+    except Exception as error:
+        return pd.DataFrame(), "portfolio.csv", [str(error)]
+    return holdings, "portfolio.csv", []
+
+
+def compute_return_metrics(series: pd.Series) -> dict[str, Optional[float]]:
+    prices = pd.to_numeric(series, errors="coerce").dropna()
+    if len(prices) < 3:
+        return {"return_pct": None, "volatility_pct": None, "max_drawdown_pct": None}
+    returns = prices.pct_change().dropna()
+    cumulative = (1 + returns).cumprod()
+    drawdown = cumulative / cumulative.cummax() - 1
+    return {
+        "return_pct": (prices.iloc[-1] / prices.iloc[0] - 1) * 100,
+        "volatility_pct": returns.std() * (252 ** 0.5) * 100 if len(returns) > 1 else None,
+        "max_drawdown_pct": drawdown.min() * 100 if not drawdown.empty else None,
+    }
+
+
+def portfolio_risk_analysis(
+    portfolio_view: pd.DataFrame,
+    histories: dict[str, pd.DataFrame],
+    risk_free_rate_pct: float = 2.0,
+) -> tuple[dict[str, Optional[float]], pd.DataFrame, pd.DataFrame]:
+    """Berechnet Risiko-Kennzahlen aus verfügbaren, währungslokalen Returns.
+
+    Für Multiwährungsportfolios ist das eine Näherung, weil die täglichen FX-
+    Bewegungen nicht in jeder Kursserie enthalten sind. Die aktuelle EUR-
+    Gewichtung wird dennoch korrekt aus dem Portfolio verwendet.
+    """
+    if portfolio_view is None or portfolio_view.empty:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+    weight_map = (
+        portfolio_view.dropna(subset=["ticker_yahoo", "weight_pct"])
+        .set_index("ticker_yahoo")["weight_pct"]
+        .astype(float)
+        .div(100)
+        .to_dict()
+    )
+    return_series: list[pd.Series] = []
+    for ticker, weight in weight_map.items():
+        history = histories.get(ticker, pd.DataFrame())
+        if history is None or history.empty:
+            continue
+        price_column = "Adj Close" if "Adj Close" in history.columns else "Close"
+        prices = pd.to_numeric(history[price_column], errors="coerce").dropna()
+        if len(prices) < 30:
+            continue
+        returns = prices.pct_change().rename(ticker)
+        return_series.append(returns)
+
+    if not return_series:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+    matrix = pd.concat(return_series, axis=1).sort_index().dropna(how="all")
+    available_tickers = [ticker for ticker in matrix.columns if ticker in weight_map]
+    if not available_tickers:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+    weights = pd.Series({ticker: weight_map[ticker] for ticker in available_tickers}, dtype=float)
+    weights = weights / weights.sum()
+    matrix = matrix[available_tickers].fillna(0.0)
+    portfolio_returns = matrix.mul(weights, axis=1).sum(axis=1)
+    portfolio_index = (1 + portfolio_returns).cumprod() * 100
+    drawdown = portfolio_index / portfolio_index.cummax() - 1
+
+    periods = len(portfolio_returns)
+    annual_return = ((1 + portfolio_returns).prod() ** (252 / periods) - 1) * 100 if periods else None
+    annual_volatility = portfolio_returns.std() * (252 ** 0.5) * 100 if periods > 1 else None
+    sharpe = None
+    if annual_return is not None and annual_volatility not in (None, 0):
+        sharpe = (annual_return - risk_free_rate_pct) / annual_volatility
+
+    metrics = {
+        "annual_return_pct": annual_return,
+        "annual_volatility_pct": annual_volatility,
+        "max_drawdown_pct": drawdown.min() * 100 if not drawdown.empty else None,
+        "sharpe": sharpe,
+        "observations": float(periods),
+        "covered_weight_pct": weights.sum() * 100,
+    }
+    curve = pd.DataFrame({"date": portfolio_index.index, "portfolio_index": portfolio_index.values, "drawdown_pct": drawdown.values * 100})
+    correlation = matrix.corr()
+    return metrics, curve, correlation
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_benchmark_history(benchmark: str, period: str = "5y") -> pd.DataFrame:
+    try:
+        history = yf.Ticker(benchmark).history(period=period, auto_adjust=False)
+    except Exception:
+        history = pd.DataFrame()
+    return ensure_datetime_index(history) if not history.empty else pd.DataFrame()
+
+
+
+def render_company_profile(ticker: str) -> None:
+    """Zeigt verfügbare Basisdaten aus Yahoo, ohne Vollständigkeit zu behaupten."""
+    try:
+        info = fetch_ticker_info(ticker)
+    except Exception:
+        info = {}
+    if not info:
+        st.info("Für dieses Unternehmen sind aktuell keine Profilinformationen verfügbar.")
+        return
+
+    st.markdown("#### Unternehmensprofil")
+    left, right, third = st.columns(3)
+    left.metric("Branche", str(info.get("industry") or "–"))
+    right.metric("Land", str(info.get("country") or "–"))
+    third.metric("Mitarbeitende", format_number(info.get("fullTimeEmployees"), 0))
+    if info.get("website"):
+        st.link_button("Unternehmenswebsite", str(info["website"]))
+
+    summary = str(info.get("longBusinessSummary") or "").strip()
+    if summary:
+        st.caption(summary[:1800] + (" …" if len(summary) > 1800 else ""))
+
+    ownership = pd.DataFrame(
+        [
+            {"Kennzahl": "Institutioneller Anteil", "Wert": format_percent(to_percent(info.get("heldPercentInstitutions")), 2)},
+            {"Kennzahl": "Insider-Anteil", "Wert": format_percent(to_percent(info.get("heldPercentInsiders")), 2)},
+            {"Kennzahl": "Analysten-Einstufung", "Wert": str(info.get("recommendationKey") or "–")},
+            {"Kennzahl": "Analystenziel", "Wert": format_number(info.get("targetMeanPrice"), 2)},
+        ]
+    )
+    st.dataframe(ownership, hide_index=True, use_container_width=True)
+
+    officers = info.get("companyOfficers") or []
+    if officers:
+        officer_rows = []
+        for officer in officers[:12]:
+            if not isinstance(officer, dict):
+                continue
+            officer_rows.append(
+                {
+                    "Name": officer.get("name", ""),
+                    "Funktion": officer.get("title", ""),
+                    "Alter": officer.get("age", ""),
+                }
+            )
+        if officer_rows:
+            st.markdown("**Management (soweit von Yahoo geliefert)**")
+            st.dataframe(pd.DataFrame(officer_rows), hide_index=True, use_container_width=True)
+
+    st.caption(
+        "Regionale Umsätze, Segmentumsätze und vollständige Ownership-Strukturen liefert Yahoo nicht zuverlässig. "
+        "Dafür wäre später eine ergänzende, lizenzierte Quelle oder eine manuell gepflegte Profildatei nötig."
+    )
+
+
+def render_event_calendar(events: pd.DataFrame) -> None:
+    st.markdown("#### Ereigniskalender")
+    if events is None or events.empty:
+        st.info("Noch keine Ereignisse gespeichert. Aktualisiere im News-Tab eine Aktie.")
+        return
+
+    display = events.copy()
+    display["date"] = pd.to_datetime(display["date"], errors="coerce")
+    display["Typ"] = display["event_type"].map(lambda value: EVENT_META.get(str(value), {}).get("label", str(value)))
+    future_flags = display["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"})
+    display["Zukunft"] = future_flags.map(lambda value: "Ja" if value else "Nein")
+    visible = ["date", "ticker_yahoo", "Typ", "title", "source", "sentiment_label", "Zukunft", "link"]
+    visible = [column for column in visible if column in display.columns]
+    st.dataframe(
+        display[visible].sort_values("date", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+
+
+
+
+
+
+def render_portfolio_risk(portfolio_view: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.markdown("#### Portfolio-Risiko & Konzentration")
+    risk_free_rate = st.slider("Risikofreier Zinssatz für Sharpe", 0.0, 8.0, 2.0, 0.25, key="risk_free_rate")
+    metrics, curve, correlation = portfolio_risk_analysis(portfolio_view, histories, risk_free_rate)
+
+    if not metrics:
+        st.info("Für die Risikoanalyse fehlen ausreichend historische Kursdaten zu den Portfolio-Positionen.")
+        return
+
+    columns = st.columns(5)
+    columns[0].metric("Ann. Rendite*", format_percent(metrics.get("annual_return_pct"), 1, signed=True))
+    columns[1].metric("Ann. Volatilität*", format_percent(metrics.get("annual_volatility_pct"), 1))
+    columns[2].metric("Max. Drawdown*", format_percent(metrics.get("max_drawdown_pct"), 1, signed=True))
+    columns[3].metric("Sharpe*", format_number(metrics.get("sharpe"), 2))
+    columns[4].metric("Datengewicht", format_percent(metrics.get("covered_weight_pct"), 0))
+
+    if not curve.empty:
+        curve_chart = alt.Chart(curve).mark_line().encode(
+            x=alt.X("date:T", title="Datum"),
+            y=alt.Y("portfolio_index:Q", title="Index (Start = 100)", scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("date:T", format="%d.%m.%Y"), alt.Tooltip("portfolio_index:Q", format=".2f")],
+        ).properties(height=240, title="Portfolioentwicklung aus historischen Tagesrenditen")
+        st.altair_chart(curve_chart, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        sector = (
+            portfolio_view.groupby("sector", dropna=False)["weight_pct"]
+            .sum()
+            .reset_index()
+            .dropna(subset=["weight_pct"])
+        )
+        if not sector.empty:
+            sector_chart = alt.Chart(sector).mark_bar().encode(
+                x=alt.X("weight_pct:Q", title="Gewichtung (%)"),
+                y=alt.Y("sector:N", sort="-x", title="Sektor"),
+                tooltip=["sector:N", alt.Tooltip("weight_pct:Q", format=".2f")],
+            ).properties(height=max(180, 32 * len(sector)), title="Sektor-Konzentration")
+            st.altair_chart(sector_chart, use_container_width=True)
+
+    with right:
+        currencies = (
+            portfolio_view.groupby("asset_currency", dropna=False)["weight_pct"]
+            .sum()
+            .reset_index()
+            .dropna(subset=["weight_pct"])
+        )
+        if not currencies.empty:
+            currency_chart = alt.Chart(currencies).mark_bar().encode(
+                x=alt.X("weight_pct:Q", title="Gewichtung (%)"),
+                y=alt.Y("asset_currency:N", sort="-x", title="Handelswährung"),
+                tooltip=["asset_currency:N", alt.Tooltip("weight_pct:Q", format=".2f")],
+            ).properties(height=max(180, 32 * len(currencies)), title="Währungs-Exponierung")
+            st.altair_chart(currency_chart, use_container_width=True)
+
+    if not correlation.empty and len(correlation.columns) >= 2:
+        correlation_long = (
+            correlation.reset_index()
+            .melt(id_vars="index", var_name="Ticker 2", value_name="Korrelation")
+            .rename(columns={"index": "Ticker 1"})
+        )
+        heatmap = alt.Chart(correlation_long).mark_rect().encode(
+            x=alt.X("Ticker 1:N", title=None),
+            y=alt.Y("Ticker 2:N", title=None),
+            color=alt.Color("Korrelation:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue"), title="Korrelation"),
+            tooltip=["Ticker 1:N", "Ticker 2:N", alt.Tooltip("Korrelation:Q", format=".2f")],
+        ).properties(height=max(260, 25 * len(correlation.columns)), title="Korrelation der Tagesrenditen")
+        st.altair_chart(heatmap, use_container_width=True)
+
+    st.caption(
+        "*Die Kennzahlen basieren auf verfügbaren Yahoo-Preisreihen (Adj Close, wenn vorhanden) und heutigen Gewichten. "
+        "Bei mehreren Währungen ist dies eine Näherung ohne tägliche FX-Absicherung."
+    )
+
+
+
+
+def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_name: str) -> None:
+    st.subheader("Research & historische Einordnung")
+    st.caption(
+        "Dieser Bereich vergleicht historische Kurs-/Adj-Close-Entwicklung mit einem Benchmark. "
+        "Er ist bewusst kein fundamentaler Backtest: Historische Fundamentals, damalige Indexzusammensetzungen und Transaktionskosten fehlen dafür."
+    )
+    ticker = st.selectbox("Aktie für Vergleich", df["ticker_yahoo"].tolist(), key="research_ticker")
+    use_adjusted = st.checkbox("Bereinigte Kurse verwenden (Adj Close)", value=True, key="research_adjusted")
+    history = histories.get(ticker, pd.DataFrame())
+    benchmark_ticker = "^GDAXI" if index_name == "DAX 40" else "^GSPC"
+    benchmark = fetch_benchmark_history(benchmark_ticker, period="5y")
+    column = "Adj Close" if use_adjusted and "Adj Close" in history.columns else "Close"
+    benchmark_column = "Adj Close" if use_adjusted and "Adj Close" in benchmark.columns else "Close"
+
+    if history.empty or benchmark.empty or column not in history.columns or benchmark_column not in benchmark.columns:
+        st.info("Für Aktie oder Benchmark fehlen ausreichende historische Daten.")
+        return
+
+    company_series = pd.to_numeric(history[column], errors="coerce").dropna().rename("Aktie")
+    benchmark_series = pd.to_numeric(benchmark[benchmark_column], errors="coerce").dropna().rename("Benchmark")
+    comparison = pd.concat([company_series, benchmark_series], axis=1, join="inner").dropna()
+    if len(comparison) < 30:
+        st.info("Zu wenige gemeinsame Handelstage für den Vergleich.")
+        return
+
+    indexed = comparison / comparison.iloc[0] * 100
+    long = indexed.reset_index().melt(id_vars=indexed.index.name or "Date", var_name="Serie", value_name="Index")
+    long = long.rename(columns={long.columns[0]: "Datum"})
+    chart = alt.Chart(long).mark_line().encode(
+        x=alt.X("Datum:T", title="Datum"),
+        y=alt.Y("Index:Q", title="Index (Start = 100)", scale=alt.Scale(zero=False)),
+        color=alt.Color("Serie:N", title=None),
+        tooltip=[alt.Tooltip("Datum:T", format="%d.%m.%Y"), "Serie:N", alt.Tooltip("Index:Q", format=".2f")],
+    ).properties(height=350)
+    st.altair_chart(chart, use_container_width=True)
+
+    company_metrics = compute_return_metrics(comparison["Aktie"])
+    benchmark_metrics = compute_return_metrics(comparison["Benchmark"])
+    table = pd.DataFrame(
+        [
+            {"Serie": ticker, "Rendite": company_metrics["return_pct"], "Volatilität": company_metrics["volatility_pct"], "Max. Drawdown": company_metrics["max_drawdown_pct"]},
+            {"Serie": benchmark_ticker, "Rendite": benchmark_metrics["return_pct"], "Volatilität": benchmark_metrics["volatility_pct"], "Max. Drawdown": benchmark_metrics["max_drawdown_pct"]},
+        ]
+    )
+    st.dataframe(
+        table.style.format(
+            {
+                "Rendite": lambda value: format_percent(value, 2, signed=True),
+                "Volatilität": lambda value: format_percent(value, 2),
+                "Max. Drawdown": lambda value: format_percent(value, 2, signed=True),
+            },
+            na_rep="–",
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### Fallstudien-Checkliste")
+    st.markdown(
+        "Für ein Reverse Engineering wie „BAT bei 28 €“ solltest du zum jeweiligen Einstiegszeitpunkt "
+        "manuell erfassen: Bewertung, Verschuldung, Ausschüttungsquote, Dividendenhistorie, Geschäftslage, "
+        "Makroumfeld und den damals verfügbaren Nachrichtenstand. Erst mit historischen Fundamentals wäre daraus ein belastbarer Backtest möglich."
+    )
+
+
 # -----------------------------------------------------------------------------
 # Charts und Tabellendarstellung
 # -----------------------------------------------------------------------------
@@ -1140,31 +2200,40 @@ def colorize_score(value: Any) -> str:
     return "color: #16a34a; font-weight: 700" if number >= 70 else "color: #d97706; font-weight: 700" if number >= 45 else "color: #dc2626; font-weight: 700"
 
 
+def format_value_trigger(value: Any) -> str:
+    """Macht den strengen Ja/Nein-Trigger in Tabellen eindeutig lesbar."""
+    if value is None or pd.isna(value):
+        return "–"
+    return "✓ erfüllt" if bool(value) else "✗ offen"
+
+
 def colorize_value_trigger(value: Any) -> str:
-    if value is True:
-        return "background-color: #dcfce7; color: #166534; font-weight: 700"
-    if value is False:
+    """Hebt nur wirklich ausgelöste Trigger grün hervor."""
+    if value is None or pd.isna(value):
         return "color: #6b7280"
-    return ""
+    if bool(value):
+        return "background-color: #dcfce7; color: #166534; font-weight: 700"
+    return "color: #9ca3af"
 
 
 def make_price_chart(
     history: pd.DataFrame,
     period_label: str,
     show_smas: bool,
-    news: Optional[pd.DataFrame] = None,
+    events: Optional[pd.DataFrame] = None,
+    use_total_return: bool = False,
 ) -> Optional[alt.Chart]:
     if history is None or history.empty or "Close" not in history.columns:
         return None
 
-    frame = history.copy()
-    frame = ensure_datetime_index(frame)
-    frame["Kurs"] = pd.to_numeric(frame["Close"], errors="coerce")
+    frame = ensure_datetime_index(history.copy())
+    price_column = "Adj Close" if use_total_return and "Adj Close" in frame.columns else "Close"
+    frame["Kurs"] = pd.to_numeric(frame[price_column], errors="coerce")
     frame = frame.dropna(subset=["Kurs"])
     if frame.empty:
         return None
 
-    # WICHTIG: SMA zuerst auf vollständiger Historie berechnen, dann Zeitraum filtern.
+    # SMAs stets auf vollständiger Historie berechnen, erst danach sichtbar filtern.
     frame["SMA 20"] = frame["Kurs"].rolling(20, min_periods=20).mean()
     frame["SMA 50"] = frame["Kurs"].rolling(50, min_periods=50).mean()
     frame["SMA 200"] = frame["Kurs"].rolling(200, min_periods=200).mean()
@@ -1173,10 +2242,14 @@ def make_price_chart(
     visible = frame.tail(days_by_period.get(period_label, 260)).copy().reset_index()
     visible = visible.rename(columns={visible.columns[0]: "Datum"})
 
+    title = "Bereinigter Kurs (Yahoo Adj Close)" if price_column == "Adj Close" else "Schlusskurs"
     base = alt.Chart(visible).mark_line(strokeWidth=2).encode(
         x=alt.X("Datum:T", title="Datum"),
-        y=alt.Y("Kurs:Q", title="Kurs", scale=alt.Scale(zero=False)),
-        tooltip=[alt.Tooltip("Datum:T", format="%d.%m.%Y"), alt.Tooltip("Kurs:Q", format=".2f")],
+        y=alt.Y("Kurs:Q", title=title, scale=alt.Scale(zero=False)),
+        tooltip=[
+            alt.Tooltip("Datum:T", format="%d.%m.%Y"),
+            alt.Tooltip("Kurs:Q", title=title, format=".2f"),
+        ],
     )
     layers: list[alt.Chart] = [base]
 
@@ -1189,43 +2262,59 @@ def make_price_chart(
             layers.append(
                 alt.Chart(sma_frame).mark_line(strokeWidth=1.7).encode(
                     x="Datum:T",
-                    y=alt.Y(f"{sma_name}:Q", title="Kurs", scale=alt.Scale(zero=False)),
+                    y=alt.Y(f"{sma_name}:Q", title=title, scale=alt.Scale(zero=False)),
                     color=alt.Color(
                         "Linie:N",
                         scale=alt.Scale(domain=list(SMA_COLORS), range=list(SMA_COLORS.values())),
                         legend=alt.Legend(title="Durchschnitte", orient="bottom"),
                     ),
-                    tooltip=[alt.Tooltip("Datum:T", format="%d.%m.%Y"), alt.Tooltip(f"{sma_name}:Q", format=".2f")],
+                    tooltip=[
+                        alt.Tooltip("Datum:T", format="%d.%m.%Y"),
+                        alt.Tooltip(f"{sma_name}:Q", format=".2f"),
+                    ],
                 )
             )
 
-    if news is not None and not news.empty and "published" in news.columns:
-        event_frame = news.copy()
-        event_frame["Datum"] = pd.to_datetime(event_frame["published"], errors="coerce").dt.normalize()
+    if events is not None and not events.empty and "date" in events.columns:
+        event_frame = events.copy()
+        event_frame["Datum"] = pd.to_datetime(event_frame["date"], errors="coerce").dt.normalize()
         event_frame = event_frame.dropna(subset=["Datum"])
         event_frame = event_frame[event_frame["Datum"].between(visible["Datum"].min(), visible["Datum"].max())]
         if not event_frame.empty:
+            event_frame["event_type"] = event_frame["event_type"].fillna("news")
+            event_frame["sentiment_label"] = event_frame["sentiment_label"].fillna("neutral")
             price_lookup = visible[["Datum", "Kurs"]].sort_values("Datum")
             event_frame = pd.merge_asof(
                 event_frame.sort_values("Datum"), price_lookup, on="Datum", direction="nearest"
             )
             layers.append(
-                alt.Chart(event_frame).mark_point(filled=True, size=65).encode(
+                alt.Chart(event_frame).mark_point(filled=True, size=85, opacity=0.9).encode(
                     x="Datum:T",
                     y=alt.Y("Kurs:Q", scale=alt.Scale(zero=False)),
+                    shape=alt.Shape(
+                        "event_type:N",
+                        scale=alt.Scale(
+                            domain=list(EVENT_META),
+                            range=[EVENT_META[item]["shape"] for item in EVENT_META],
+                        ),
+                        legend=alt.Legend(title="Ereignistyp", orient="bottom"),
+                    ),
                     color=alt.Color(
                         "sentiment_label:N",
-                        scale=alt.Scale(domain=["positiv", "neutral", "negativ"], range=["#16a34a", "#64748b", "#dc2626"]),
-                        legend=alt.Legend(title="News", orient="bottom"),
+                        scale=alt.Scale(
+                            domain=["positiv", "neutral", "negativ"],
+                            range=["#16a34a", "#64748b", "#dc2626"],
+                        ),
+                        legend=alt.Legend(title="News-Sentiment", orient="bottom"),
                     ),
                     tooltip=[
                         alt.Tooltip("Datum:T", format="%d.%m.%Y"),
-                        "title:N", "source:N", "sentiment_label:N", "link:N",
+                        "event_type:N", "title:N", "source:N", "sentiment_label:N", "link:N",
                     ],
                 )
             )
 
-    return alt.layer(*layers).resolve_scale(y="shared").properties(height=360)
+    return alt.layer(*layers).resolve_scale(y="shared").properties(height=380)
 
 
 def overview_styler(df: pd.DataFrame) -> Any:
@@ -1257,8 +2346,8 @@ def overview_styler(df: pd.DataFrame) -> Any:
 def show_header() -> None:
     st.title("Aktien Explorer")
     st.caption(
-        f"Version {APP_VERSION} · Fundamentaldaten, Value-Scanner, Portfolio und News. "
-        "Keine Anlageberatung – Daten vor Entscheidungen immer selbst prüfen."
+        f"Version {APP_VERSION} · Fundamentaldaten, Score-Profile, News & Events, Portfolio-Risiko und Research. "
+        "Keine Anlageberatung – Daten, Quellen und Annahmen vor Entscheidungen immer selbst prüfen."
     )
 
 
@@ -1268,19 +2357,67 @@ def render_overview(df: pd.DataFrame) -> None:
         st.info("Keine Daten für die aktuelle Filtereinstellung.")
         return
 
-    metric_columns = st.columns(4)
+    metric_columns = st.columns(5)
     metric_columns[0].metric("Unternehmen", f"{len(df):,}".replace(",", "."))
-    metric_columns[1].metric("Trigger", int(df["value_trigger"].fillna(False).sum()))
+    metric_columns[1].metric("Trigger erfüllt", int(df["value_trigger"].fillna(False).sum()))
     metric_columns[2].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
-    metric_columns[3].metric("Ø 1J-Performance", format_percent(df["change_1y"].mean(), 1, signed=True))
+    metric_columns[3].metric("Ø Kursrendite 1J", format_percent(df["change_1y"].mean(), 1, signed=True))
+    metric_columns[4].metric("Ø Gesamtrendite 1J*", format_percent(df["total_return_1y"].mean(), 1, signed=True))
 
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d", "change_5d",
-        "change_1y", "vol_1y", "dividend_yield", "total_score", "score_coverage", "value_score",
-        "drawdown_1y_high_pct", "value_trigger",
+        "change_1y", "total_return_1y", "vol_1y", "max_drawdown_1y", "dividend_yield",
+        "total_score", "score_coverage", "value_score", "drawdown_1y_high_pct", "value_trigger",
     ]
     visible_columns = [column for column in columns if column in df.columns]
-    st.dataframe(overview_styler(df[visible_columns]), use_container_width=True, hide_index=True)
+    display = df[visible_columns].rename(
+        columns={
+            "name": "Unternehmen",
+            "ticker_yahoo": "Ticker",
+            "sector": "Sektor",
+            "currency": "Währung",
+            "last_price": "Letzter Kurs",
+            "change_1d": "Veränderung 1T",
+            "change_5d": "Veränderung 5T",
+            "change_1y": "Kursrendite 1J",
+            "total_return_1y": "Gesamtrendite 1J*",
+            "vol_1y": "Volatilität 1J",
+            "max_drawdown_1y": "Max. Drawdown 1J",
+            "dividend_yield": "Dividendenrendite",
+            "total_score": "Qualitäts-Score",
+            "score_coverage": "Datenabdeckung",
+            "value_score": "Value-Score",
+            "drawdown_1y_high_pct": "Drawdown vom 52W-Hoch",
+            "value_trigger": "Value-Trigger",
+        }
+    )
+    formats = {
+        "Letzter Kurs": lambda value: format_number(value, 2),
+        "Veränderung 1T": lambda value: format_percent(value, 2, signed=True),
+        "Veränderung 5T": lambda value: format_percent(value, 2, signed=True),
+        "Kursrendite 1J": lambda value: format_percent(value, 2, signed=True),
+        "Gesamtrendite 1J*": lambda value: format_percent(value, 2, signed=True),
+        "Volatilität 1J": lambda value: format_percent(value, 1),
+        "Max. Drawdown 1J": lambda value: format_percent(value, 1, signed=True),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Datenabdeckung": lambda value: format_percent(value, 0),
+        "Value-Score": lambda value: format_number(value, 1),
+        "Drawdown vom 52W-Hoch": lambda value: format_percent(value, 1, signed=True),
+        "Value-Trigger": format_value_trigger,
+    }
+    styled = (
+        display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
+        .map(colorize_change, subset=[column for column in ["Veränderung 1T", "Veränderung 5T", "Kursrendite 1J", "Gesamtrendite 1J*"] if column in display.columns])
+        .map(colorize_score, subset=[column for column in ["Qualitäts-Score"] if column in display.columns])
+        .map(colorize_value_trigger, subset=[column for column in ["Value-Trigger"] if column in display.columns])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption(
+        "Value-Score und Value-Trigger sind verschieden: Der Score ordnet Kandidaten ein; der Trigger ist ein strenger Filter, "
+        "bei dem alle Regeln erfüllt sein müssen. Details stehen im Tab „Value-Scanner“."
+    )
+    st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
 
 def render_fundamentals(df: pd.DataFrame) -> None:
@@ -1289,11 +2426,10 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "name", "ticker_yahoo", "currency", "market_cap", "pe_ratio", "forward_pe", "pb_ratio",
         "ps_ratio", "ev_ebitda", "net_margin", "operating_margin", "roe", "roa", "dividend_yield",
         "dividend_per_share", "payout_ratio", "dividend_growth_5y", "dividend_frequency",
-        "debt_to_equity", "net_debt_ebitda", "score_raw", "score_coverage", "total_score",
+        "debt_to_equity", "net_debt_ebitda", "beta", "score_raw", "score_coverage", "score_confidence",
+        "total_score",
     ]
     visible_columns = [column for column in columns if column in df.columns]
-
-    # Nur für die Anzeige: interne Spaltennamen bleiben im restlichen Code unverändert.
     display_names = {
         "name": "Unternehmen",
         "ticker_yahoo": "Ticker",
@@ -1315,11 +2451,12 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "dividend_frequency": "Ausschüttungsrhythmus",
         "debt_to_equity": "Debt/Equity",
         "net_debt_ebitda": "Netto-Schulden/EBITDA",
+        "beta": "Beta",
         "score_raw": "Rohscore",
         "score_coverage": "Datenabdeckung",
+        "score_confidence": "Datenvertrauen",
         "total_score": "Qualitäts-Score",
     }
-
     display_df = df[visible_columns].rename(columns=display_names)
     formats = {
         "Marktkapitalisierung": human_market_cap,
@@ -1338,25 +2475,112 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
         "Debt/Equity": lambda value: f"{format_number(value, 2)}x",
         "Netto-Schulden/EBITDA": lambda value: f"{format_number(value, 2)}x",
+        "Beta": lambda value: format_number(value, 2),
         "Rohscore": lambda value: format_number(value, 1),
         "Datenabdeckung": lambda value: format_percent(value, 0),
         "Qualitäts-Score": lambda value: format_number(value, 1),
     }
-    styled = (
-        display_df.style.format(formats, na_rep="–")
-        .map(colorize_score, subset=["Qualitäts-Score"])
-    )
+    styled = display_df.style.format(formats, na_rep="–").map(colorize_score, subset=["Qualitäts-Score"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
-        "Die Marktkapitalisierung wird kompakt in Mio., Mrd. oder Bio. angezeigt und "
-        "bezieht sich auf die jeweilige Originalwährung in der Spalte „Währung“. "
-        "Score und Value-Score sind heuristische Recherchehilfen."
+        "Die Marktkapitalisierung bezieht sich auf die Originalwährung. "
+        "Negative KGVs werden im Score nicht als günstig bewertet. Datenabdeckung und Datenvertrauen zeigen, "
+        "wie belastbar eine heuristische Einstufung ist."
     )
 
 
-def render_value_watchlist(df: pd.DataFrame) -> None:
+def render_value_trigger_explanation(
+    df: pd.DataFrame,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
+    profile_name: str,
+) -> None:
+    """Erklärt die aktuelle strenge Trigger-Logik und prüft einen Titel einzeln."""
+    with st.expander("So funktioniert der Value-Trigger", expanded=False):
+        st.markdown(
+            "Der **Value-Trigger** ist ein strenger Ja/Nein-Filter – kein Kaufsignal. Er wird nur ausgelöst, "
+            "wenn eine Aktie **alle fünf** Bedingungen des aktuell gewählten Scanner-Profils erfüllt. "
+            "Der **Value-Score** dagegen ist eine Rangfolge von 0 bis 100 und kann auch hoch sein, wenn der Trigger noch offen ist."
+        )
+
+        sector_default_note = (
+            "Die Mindest-Dividendenrendite ist je nach Sektor unterschiedlich: Es gilt immer der höhere Wert aus "
+            f"deinem Slider ({format_percent(yield_min, 1)}) und dem Sektor-Mindestwert."
+        )
+        rules = pd.DataFrame([
+            {"Kriterium": "Qualitäts-Score", "Aktuelle Regel": f"mindestens {format_number(score_min, 0)} Punkte", "Warum": "Grundqualität und Stabilität müssen ausreichend sein."},
+            {"Kriterium": "Datenabdeckung", "Aktuelle Regel": f"mindestens {format_percent(MIN_SCORE_COVERAGE_FOR_TRIGGER, 0)}", "Warum": "Ein guter Score soll auf genügend Kennzahlen beruhen."},
+            {"Kriterium": "Ausschüttungsquote", "Aktuelle Regel": f"0 % bis {format_percent(payout_max, 0)}", "Warum": "Eine Dividende soll aus heutiger Sicht nicht zu stark überzogen wirken."},
+            {"Kriterium": "Dividendenrendite", "Aktuelle Regel": "Sektor- bzw. Slider-Mindestwert", "Warum": "Der Scanner sucht bewusst ertragsorientierte Value-Kandidaten."},
+            {"Kriterium": "Drawdown", "Aktuelle Regel": f"mindestens {format_percent(-drawdown_trigger, 0, signed=True)} unter dem 52W-Hoch", "Warum": "Es muss ein klarer Rücksetzer gegenüber dem jüngsten Hoch vorliegen."},
+        ])
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+        st.caption(sector_default_note)
+
+        st.markdown("**Wie entsteht der Value-Score?**")
+        st.markdown(
+            "Er bewertet Kandidaten unabhängig vom strengen Trigger: **Drawdown 35 %**, **Dividendenrendite 20 %**, "
+            "**KGV oder KBV 20 %**, **Ausschüttungsquote 15 %** und – außerhalb von Finanzsektoren – **Verschuldung 10 %**. "
+            "Fehlende Werte senken die Datenabdeckung und dämpfen den Score. Ein negatives KGV zählt dabei nicht als günstig."
+        )
+
+        if df.empty:
+            return
+        ticker = st.selectbox("Trigger für einen Titel prüfen", df["ticker_yahoo"].tolist(), key="value_trigger_explanation_ticker")
+        row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+        minimum_yield = sector_yield_trigger(row.get("sector"), yield_min)
+        drawdown = safe_float(row.get("drawdown_1y_high_pct"))
+        quality_score = safe_float(row.get("total_score"))
+        coverage = safe_float(row.get("score_coverage"))
+        payout = safe_float(row.get("payout_ratio"))
+        dividend_yield = safe_float(row.get("dividend_yield"))
+
+        checks = [
+            ("Qualitäts-Score", quality_score, f"≥ {format_number(score_min, 0)}", quality_score is not None and quality_score >= score_min),
+            ("Datenabdeckung", coverage, f"≥ {format_percent(MIN_SCORE_COVERAGE_FOR_TRIGGER, 0)}", coverage is not None and coverage >= MIN_SCORE_COVERAGE_FOR_TRIGGER),
+            ("Ausschüttungsquote", payout, f"0 % bis {format_percent(payout_max, 0)}", payout is not None and 0 <= payout <= payout_max),
+            ("Dividendenrendite", dividend_yield, f"≥ {format_percent(minimum_yield, 1)}", dividend_yield is not None and dividend_yield >= minimum_yield),
+            ("Drawdown vom 52W-Hoch", drawdown, f"≤ {format_percent(-drawdown_trigger, 0, signed=True)}", drawdown is not None and drawdown <= -drawdown_trigger),
+        ]
+        detail = pd.DataFrame([
+            {
+                "Kriterium": label,
+                "Aktuell": format_percent(value, 1, signed=(label == "Drawdown vom 52W-Hoch")) if label in {"Ausschüttungsquote", "Dividendenrendite", "Datenabdeckung", "Drawdown vom 52W-Hoch"} else format_number(value, 1),
+                "Regel": rule,
+                "Status": "✓ erfüllt" if passed else "✗ offen",
+            }
+            for label, value, rule, passed in checks
+        ])
+        st.markdown(f"**Einzelprüfung: {row.get('name', ticker)} ({ticker})**")
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+        if bool(row.get("value_trigger", False)):
+            st.success("Der Value-Trigger ist aktuell erfüllt. Das ist eine Vorauswahl nach Regeln, keine Kaufempfehlung.")
+        else:
+            st.info("Der Value-Trigger ist noch nicht erfüllt. In der Tabelle siehst du, welches Kriterium fehlt oder welche Kennzahl nicht vorliegt.")
+        st.caption(str(row.get("value_reason", "")))
+
+
+def render_value_watchlist(
+    df: pd.DataFrame,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
+    profile_name: str,
+) -> None:
     st.subheader("Dividenden-Value-Scanner")
-    st.caption("Ein Trigger verlangt ausreichend Score-Daten, kontrollierte Ausschüttungsquote, Mindest-Rendite und klaren Drawdown.")
+    st.caption("Der Trigger ist ein strenger Filter. Value-Score und Trigger sind keine Anlageberatung und keine Kaufempfehlung.")
+    render_value_trigger_explanation(
+        df=df,
+        drawdown_trigger=drawdown_trigger,
+        payout_max=payout_max,
+        score_min=score_min,
+        yield_min=yield_min,
+        profile_name=profile_name,
+    )
+
     columns = [
         "name", "ticker_yahoo", "sector", "total_score", "score_coverage", "value_score", "value_coverage",
         "value_status", "value_trigger", "dividend_yield", "payout_ratio", "pe_ratio", "pb_ratio",
@@ -1364,21 +2588,39 @@ def render_value_watchlist(df: pd.DataFrame) -> None:
     ]
     visible_columns = [column for column in columns if column in df.columns]
     result = df.sort_values(["value_trigger", "value_score"], ascending=[False, False], na_position="last")
+    display = result[visible_columns].rename(columns={
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "sector": "Sektor",
+        "total_score": "Qualitäts-Score",
+        "score_coverage": "Datenabdeckung",
+        "value_score": "Value-Score",
+        "value_coverage": "Value-Daten",
+        "value_status": "Trigger-Status",
+        "value_trigger": "Value-Trigger",
+        "dividend_yield": "Dividendenrendite",
+        "payout_ratio": "Ausschüttungsquote",
+        "pe_ratio": "KGV",
+        "pb_ratio": "KBV",
+        "drawdown_1y_high_pct": "Drawdown vom 52W-Hoch",
+        "value_reason": "Begründung",
+    })
     formats = {
-        "total_score": lambda value: format_number(value, 1),
-        "score_coverage": lambda value: format_percent(value, 0),
-        "value_score": lambda value: format_number(value, 1),
-        "value_coverage": lambda value: format_percent(value, 0),
-        "dividend_yield": lambda value: format_percent(value, 2),
-        "payout_ratio": lambda value: format_percent(value, 2),
-        "pe_ratio": lambda value: format_number(value, 2),
-        "pb_ratio": lambda value: format_number(value, 2),
-        "drawdown_1y_high_pct": lambda value: format_percent(value, 1, signed=True),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Datenabdeckung": lambda value: format_percent(value, 0),
+        "Value-Score": lambda value: format_number(value, 1),
+        "Value-Daten": lambda value: format_percent(value, 0),
+        "Value-Trigger": format_value_trigger,
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Ausschüttungsquote": lambda value: format_percent(value, 2),
+        "KGV": lambda value: format_number(value, 2),
+        "KBV": lambda value: format_number(value, 2),
+        "Drawdown vom 52W-Hoch": lambda value: format_percent(value, 1, signed=True),
     }
     styled = (
-        result[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
-        .map(colorize_score, subset=["total_score"])
-        .map(colorize_value_trigger, subset=["value_trigger"])
+        display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
+        .map(colorize_score, subset=["Qualitäts-Score"])
+        .map(colorize_value_trigger, subset=["Value-Trigger"])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -1387,13 +2629,15 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     st.subheader("Einzelanalyse & Chart")
     ticker = st.selectbox("Aktie auswählen", df["ticker_yahoo"].tolist(), key="analysis_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+    events = load_persisted_events(ticker, days_back=1825)
 
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("Letzter Kurs", f"{format_number(row.get('last_price'), 2)} {row.get('currency', '')}")
-    columns[1].metric("Volatilität 1J", format_percent(row.get("vol_1y"), 1))
-    columns[2].metric("Qualitäts-Score", format_number(row.get("total_score"), 1))
-    columns[3].metric("Datenabdeckung", format_percent(row.get("score_coverage"), 0))
-    columns[4].metric("Value-Score", format_number(row.get("value_score"), 1))
+    columns[1].metric("Kursrendite 1J", format_percent(row.get("change_1y"), 1, signed=True))
+    columns[2].metric("Gesamtrendite 1J*", format_percent(row.get("total_return_1y"), 1, signed=True))
+    columns[3].metric("Volatilität 1J", format_percent(row.get("vol_1y"), 1))
+    columns[4].metric("Max. Drawdown 1J", format_percent(row.get("max_drawdown_1y"), 1, signed=True))
+    columns[5].metric("Qualitäts-Score", format_number(row.get("total_score"), 1))
 
     left, right = st.columns([2, 1])
     with right:
@@ -1401,24 +2645,40 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
         st.caption(str(row.get("score_components", "–")))
         st.markdown("**Value-Check**")
         st.caption(str(row.get("value_reason", "–")))
+        st.markdown("**Datenvertrauen**")
+        st.caption(f"{row.get('score_confidence', '–')} · Abdeckung: {format_percent(row.get('score_coverage'), 0)}")
         if st.button("Zur Watchlist hinzufügen", key=f"watch_{ticker}"):
             if add_to_watchlist(ticker, str(row.get("name", ticker)), str(row.get("sector", "Unbekannt"))):
                 st.success(f"{ticker} wurde gespeichert.")
             else:
                 st.info(f"{ticker} ist bereits auf der Watchlist.")
 
+        with st.expander("Unternehmensprofil & Management"):
+            render_company_profile(ticker)
+
     with left:
         period = st.selectbox("Chart-Zeitraum", ["2 Monate", "6 Monate", "1 Jahr", "5 Jahre"], index=2)
         show_smas = st.checkbox("SMA 20 / 50 / 200 anzeigen", value=True)
-        news_key = f"news::{ticker}"
-        news = st.session_state.get(news_key)
-        chart = make_price_chart(histories.get(ticker, pd.DataFrame()), period, show_smas, news)
+        use_total_return = st.checkbox(
+            "Bereinigten Kurs verwenden (Adj Close / Total-Return-Näherung)",
+            value=False,
+            help="Yahoo Adj Close kann Dividenden und Splits berücksichtigen.",
+        )
+        chart = make_price_chart(
+            histories.get(ticker, pd.DataFrame()),
+            period,
+            show_smas,
+            events,
+            use_total_return=use_total_return,
+        )
         if chart is None:
             st.info("Für diese Aktie sind keine Kursdaten verfügbar.")
         else:
             st.altair_chart(chart, use_container_width=True)
-            if news is not None and not news.empty:
-                st.caption("Punkte im Chart stehen für die zuletzt geladenen News zu dieser Aktie.")
+            if not events.empty:
+                st.caption("Chartmarker stammen aus gespeicherten News sowie Yahoo-Dividenden-/Kalenderdaten. Verfügbarkeit variiert je Aktie.")
+
+    st.caption("*Gesamtrendite und bereinigter Kurs: Yahoo Adj Close als Näherung, nicht als Broker- oder Steuerberechnung.")
 
 
 def render_sector_view(df: pd.DataFrame) -> None:
@@ -1427,7 +2687,9 @@ def render_sector_view(df: pd.DataFrame) -> None:
         df.groupby("sector", dropna=False)
         .agg(
             Unternehmen=("ticker_yahoo", "count"),
-            Performance_1J=("change_1y", "mean"),
+            Kursrendite_1J=("change_1y", "mean"),
+            Gesamtrendite_1J=("total_return_1y", "mean"),
+            Max_Drawdown_1J=("max_drawdown_1y", "mean"),
             Qualitäts_Score=("total_score", "mean"),
             Value_Score=("value_score", "mean"),
             Trigger=("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
@@ -1438,7 +2700,9 @@ def render_sector_view(df: pd.DataFrame) -> None:
     st.dataframe(
         sector_stats.style.format(
             {
-                "Performance_1J": lambda value: format_percent(value, 2, signed=True),
+                "Kursrendite_1J": lambda value: format_percent(value, 2, signed=True),
+                "Gesamtrendite_1J": lambda value: format_percent(value, 2, signed=True),
+                "Max_Drawdown_1J": lambda value: format_percent(value, 1, signed=True),
                 "Qualitäts_Score": lambda value: format_number(value, 1),
                 "Value_Score": lambda value: format_number(value, 1),
             },
@@ -1447,38 +2711,114 @@ def render_sector_view(df: pd.DataFrame) -> None:
         use_container_width=True,
         hide_index=True,
     )
-    chart = alt.Chart(sector_stats.dropna(subset=["Performance_1J"])).mark_bar().encode(
-        x=alt.X("Performance_1J:Q", title="Ø Performance 1 Jahr (%)"),
+    metric_choice = st.radio(
+        "Diagramm",
+        ["Kursrendite 1J", "Gesamtrendite 1J", "Value Score"],
+        horizontal=True,
+        key="sector_chart_metric",
+    )
+    field = {
+        "Kursrendite 1J": "Kursrendite_1J",
+        "Gesamtrendite 1J": "Gesamtrendite_1J",
+        "Value Score": "Value_Score",
+    }[metric_choice]
+    chart = alt.Chart(sector_stats.dropna(subset=[field])).mark_bar().encode(
+        x=alt.X(f"{field}:Q", title=metric_choice),
         y=alt.Y("sector:N", sort="-x", title="Sektor"),
-        tooltip=["sector:N", "Unternehmen:Q", alt.Tooltip("Performance_1J:Q", format=".2f")],
-    ).properties(height=max(220, 30 * len(sector_stats)))
+        tooltip=["sector:N", "Unternehmen:Q", alt.Tooltip(f"{field}:Q", format=".2f")],
+    ).properties(height=max(220, 32 * len(sector_stats)))
     st.altair_chart(chart, use_container_width=True)
 
 
 def render_news(df: pd.DataFrame) -> None:
     st.subheader("News & Ereignisse")
-    st.caption("RSS-News werden per Unternehmensalias zugeordnet. Das Sentiment ist eine einfache deutsch/englische Heuristik, kein Signal.")
+    st.caption(
+        "Die Ansicht trennt jetzt Datenabruf, Firmenzuordnung und Treffer. "
+        "Der Google-News-Fallback ist optional; RSS-Quellen können sich ändern oder nur aktuelle Meldungen liefern."
+    )
     ticker = st.selectbox("Aktie für News", df["ticker_yahoo"].tolist(), key="news_ticker")
-    days_back = st.slider("Zeitraum", min_value=3, max_value=90, value=30, step=1, key="news_days")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
-    key = f"news::{ticker}"
+    days_back = st.slider("Zeitraum", min_value=3, max_value=180, value=30, step=1, key="news_days")
+    include_google = st.checkbox("Google News als firmenbezogenen Such-Fallback verwenden", value=True)
+    locale = st.radio("News-Sprache", ["Deutsch", "Englisch"], horizontal=True)
+    locale_code = "en" if locale == "Englisch" else "de"
+    key = f"news_bundle::{ticker}::{days_back}::{include_google}::{locale_code}"
 
-    if st.button("News aktualisieren", key=f"refresh_news_{ticker}"):
-        with st.spinner("RSS-Feeds werden durchsucht …"):
-            st.session_state[key] = fetch_news_for_ticker(
+    aliases = aliases_for_ticker(str(row.get("name", ticker)), ticker)
+    with st.expander("Firmen-Aliase verwalten", expanded=False):
+        alias_text = ", ".join(aliases)
+        edited_aliases = st.text_area(
+            "Suchbegriffe (Komma, Semikolon oder Zeilenumbruch trennen)",
+            value=alias_text,
+            key=f"aliases_editor_{ticker}",
+        )
+        if st.button("Aliase speichern", key=f"save_aliases_{ticker}"):
+            save_aliases_for_ticker(ticker, edited_aliases)
+            fetch_news_bundle.clear()
+            st.success("Aliase wurden gespeichert. Aktualisiere danach die News.")
+            st.rerun()
+
+    if st.button("News & Ereignisse aktualisieren", key=f"refresh_news_{ticker}", type="primary"):
+        with st.spinner("RSS-Feeds, Such-Fallback und Yahoo-Kalender werden geladen …"):
+            news, diagnostics = fetch_news_bundle(
                 ticker=ticker,
                 company_name=str(row.get("name", ticker)),
                 days_back=days_back,
+                include_google_news=include_google,
+                locale=locale_code,
             )
+            calendar_events = fetch_yahoo_calendar_events(ticker, days_back=max(365, days_back), days_forward=365)
+            events = combine_events(news, calendar_events, ticker)
+            persist_events(events)
+            snapshot_path = NEWS_SNAPSHOT_DIR / f"{ticker.replace('.', '_')}.csv"
+            safe_write_csv(news, snapshot_path)
+            st.session_state[key] = {
+                "news": news,
+                "diagnostics": diagnostics,
+                "events": events,
+                "loaded_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            }
 
-    news = st.session_state.get(key)
-    if news is None:
-        st.info("Noch keine News geladen.")
-    elif news.empty:
-        st.info("In den hinterlegten RSS-Feeds wurden keine passenden aktuellen Einträge gefunden.")
+    bundle = st.session_state.get(key)
+    if bundle is None:
+        stored_events = load_persisted_events(ticker, days_back=max(365, days_back))
+        if not stored_events.empty:
+            st.info("Gespeicherte Ereignisse werden angezeigt. Für neue News bitte aktualisieren.")
+            render_event_calendar(stored_events)
+        else:
+            st.info("Noch keine News geladen. Klicke auf „News & Ereignisse aktualisieren“.")
+        return
+
+    news = bundle["news"]
+    diagnostics = bundle["diagnostics"]
+    events = bundle["events"]
+
+    status_columns = st.columns(4)
+    status_columns[0].metric("News-Treffer", int(len(news)))
+    status_columns[1].metric("Ereignisse", int(len(events)))
+    status_columns[2].metric("Quellen OK", int((diagnostics.get("status") == "OK").sum()) if not diagnostics.empty else 0)
+    status_columns[3].metric("Letzte Abfrage", bundle.get("loaded_at", "–"))
+
+    st.markdown("#### Quellen-Diagnose")
+    if diagnostics.empty:
+        st.info("Keine Quelle wurde abgefragt.")
     else:
-        show_columns = ["published", "title", "source", "sentiment_label", "sentiment_score", "link"]
-        st.dataframe(news[show_columns], use_container_width=True, hide_index=True)
+        diagnostic_columns = ["source", "kind", "status", "http_status", "entries", "matches", "duration_ms", "message", "url"]
+        visible_diagnostics = [column for column in diagnostic_columns if column in diagnostics.columns]
+        st.dataframe(diagnostics[visible_diagnostics], use_container_width=True, hide_index=True)
+
+    st.markdown("#### Gefundene News")
+    if news.empty:
+        st.warning(
+            "Keine passenden Meldungen gefunden. Prüfe zuerst die Quellen-Diagnose. "
+            "Bei „Keine Firmen-Treffer“ helfen meist bessere Aliase; bei HTTP-/Parser-Fehlern ist die Quelle selbst das Problem."
+        )
+    else:
+        show_columns = [
+            "published", "title", "source", "source_kind", "matched_alias",
+            "event_type", "sentiment_label", "sentiment_score", "link",
+        ]
+        st.dataframe(news[[column for column in show_columns if column in news.columns]], use_container_width=True, hide_index=True)
         st.download_button(
             "News als CSV herunterladen",
             data=news.to_csv(index=False).encode("utf-8"),
@@ -1487,32 +2827,45 @@ def render_news(df: pd.DataFrame) -> None:
             key=f"download_news_{ticker}",
         )
 
+    render_event_calendar(events)
+    st.caption(
+        "Yahoo-Kalender liefert nicht für jede Aktie Earnings- oder Ex-Dividenden-Termine. "
+        "Die Quellen-Diagnose zeigt deshalb transparent, ob keine Daten verfügbar waren oder die Zuordnung fehlte."
+    )
+
 
 def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
     st.subheader("Portfolio")
-    st.caption("portfolio.csv: ticker_yahoo, shares, cost_basis, currency (optional), purchase_date (optional)")
-    try:
-        portfolio = read_portfolio()
-    except Exception as error:
-        st.error(str(error))
+    st.caption(
+        "Nutze bevorzugt data/transactions.csv für mehrere Käufe/Verkäufe. "
+        "Ohne Transaktionsbuch bleibt die bisherige portfolio.csv kompatibel."
+    )
+    portfolio, origin, warnings = portfolio_input()
+    if portfolio.empty:
+        st.info(
+            "Keine Bestände gefunden. Lege entweder portfolio.csv neben app.py an oder fülle data/transactions.csv. "
+            "Im Tab kannst du eine Vorlage herunterladen."
+        )
+        st.download_button(
+            "Vorlage transactions.csv herunterladen",
+            data=empty_transactions_frame().to_csv(index=False).encode("utf-8"),
+            file_name="transactions.csv",
+            mime="text/csv",
+        )
         return
 
-    if portfolio.empty:
-        st.info("Keine portfolio.csv gefunden. Lege die Datei neben app.py an und nutze die Beispielstruktur aus dem Kopf des Codes.")
-        return
+    if warnings:
+        for warning in warnings:
+            st.warning(warning)
+    st.caption(f"Datenbasis: {origin}")
 
     portfolio_tickers = set(portfolio["ticker_yahoo"].map(clean_ticker))
     known_tickers = set(metrics["ticker_yahoo"].map(clean_ticker))
     missing_tickers = sorted(portfolio_tickers - known_tickers)
-
     if missing_tickers:
-        st.warning("Diese Portfolio-Ticker liegen außerhalb der aktuellen Indexanalyse: " + ", ".join(missing_tickers))
+        st.warning("Portfolio-Ticker außerhalb der Indexanalyse: " + ", ".join(missing_tickers))
         if st.button("Fehlende Portfolio-Ticker laden", key="load_portfolio_extras"):
-            companies = pd.DataFrame({
-                "name": missing_tickers,
-                "ticker_yahoo": missing_tickers,
-                "sector": "Unbekannt",
-            })
+            companies = pd.DataFrame({"name": missing_tickers, "ticker_yahoo": missing_tickers, "sector": "Unbekannt"})
             with st.spinner("Zusätzliche Portfolio-Daten werden geladen …"):
                 extra_metrics, extra_histories, extra_errors = collect_metrics(companies)
             st.session_state["portfolio_extra_metrics"] = extra_metrics
@@ -1522,6 +2875,8 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
             st.rerun()
 
     extras = st.session_state.get("portfolio_extra_metrics", empty_metrics_frame())
+    extra_histories = st.session_state.get("portfolio_extra_histories", {})
+    all_histories = {**histories, **extra_histories}
     combined = pd.concat([metrics, extras], ignore_index=True).drop_duplicates(subset=["ticker_yahoo"], keep="first")
     portfolio_view = build_portfolio_view(combined, portfolio)
 
@@ -1530,7 +2885,7 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     total_pnl = portfolio_view["pnl_abs_eur"].sum(skipna=True)
     total_income = portfolio_view["dividend_income_eur"].sum(skipna=True)
 
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Marktwert", format_eur(total_value, 0))
     columns[1].metric("Einstandswert", format_eur(total_cost, 0))
     columns[2].metric(
@@ -1539,11 +2894,13 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
         delta=format_percent(total_pnl / total_cost * 100 if total_cost else None, 1, signed=True),
     )
     columns[3].metric("Dividende p.a. (Schätzung)", format_eur(total_income, 0))
+    columns[4].metric("Yield on Cost", format_percent(total_income / total_cost * 100 if total_cost else None, 2))
 
     visible_columns = [
-        "ticker_yahoo", "name", "shares", "cost_basis", "cost_currency", "asset_currency", "last_price",
-        "market_value_eur", "cost_value_eur", "pnl_abs_eur", "pnl_pct", "weight_pct", "dividend_income_eur",
-        "yield_on_cost", "total_score", "value_score", "value_trigger",
+        "ticker_yahoo", "name", "sector", "shares", "cost_basis", "cost_currency", "asset_currency",
+        "last_price", "market_value_eur", "cost_value_eur", "pnl_abs_eur", "pnl_pct", "weight_pct",
+        "dividend_income_eur", "yield_on_cost", "total_return_1y", "vol_1y", "max_drawdown_1y",
+        "total_score", "value_score", "value_trigger", "fx_status",
     ]
     visible_columns = [column for column in visible_columns if column in portfolio_view.columns]
     formats = {
@@ -1557,17 +2914,28 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
         "weight_pct": lambda value: format_percent(value, 2),
         "dividend_income_eur": lambda value: format_eur(value, 2),
         "yield_on_cost": lambda value: format_percent(value, 2),
+        "total_return_1y": lambda value: format_percent(value, 2, signed=True),
+        "vol_1y": lambda value: format_percent(value, 1),
+        "max_drawdown_1y": lambda value: format_percent(value, 1, signed=True),
         "total_score": lambda value: format_number(value, 1),
         "value_score": lambda value: format_number(value, 1),
     }
     styled = (
         portfolio_view[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
-        .map(colorize_change, subset=[column for column in ["pnl_abs_eur", "pnl_pct"] if column in visible_columns])
+        .map(colorize_change, subset=[column for column in ["pnl_abs_eur", "pnl_pct", "total_return_1y"] if column in visible_columns])
         .map(colorize_score, subset=[column for column in ["total_score"] if column in visible_columns])
         .map(colorize_value_trigger, subset=[column for column in ["value_trigger"] if column in visible_columns])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption("EUR-Werte verwenden aktuelle Yahoo-FX-Kurse. Fehlt eine Umrechnung, bleibt die Position teilweise leer.")
+    st.download_button(
+        "Portfolio-Übersicht als CSV herunterladen",
+        data=portfolio_view.to_csv(index=False).encode("utf-8"),
+        file_name="portfolio_uebersicht.csv",
+        mime="text/csv",
+    )
+    st.caption("EUR-Werte verwenden aktuelle Yahoo-FX-Kurse. Für steuerliche Werte, Gebühren oder historische FX-Kurse ist diese Ansicht nicht geeignet.")
+
+    render_portfolio_risk(portfolio_view, all_histories)
 
 
 def render_watchlist(metrics: pd.DataFrame) -> None:
@@ -1599,8 +2967,8 @@ def main() -> None:
     # ----- Sidebar: Daten, Filter und Scanner-Parameter -----
     with st.sidebar:
         st.header("Analyse-Einstellungen")
-        index_name = st.selectbox("Index", ["DAX 40", "S&P 500"])
-        st.caption("Tipp: Lege optional data/indices/dax40.csv oder sp500.csv an, um Wikipedia als Quelle zu ersetzen.")
+        index_name = st.selectbox("Index", ["DAX 40", "S&P 500"], key="index_name")
+        st.caption("Für maximale Stabilität: data/indices/dax40.csv oder sp500.csv pflegen; Wikipedia bleibt nur Fallback.")
 
         try:
             constituents = load_index_constituents(index_name)
@@ -1626,15 +2994,28 @@ def main() -> None:
         if maximum <= 0:
             st.error("Der Filter enthält keine Unternehmen.")
             st.stop()
-        default_count = min(40 if index_name == "S&P 500" else 40, maximum)
+        default_count = min(40, maximum)
         max_stocks = st.slider("Max. Unternehmen laden", min_value=1, max_value=maximum, value=default_count, step=1)
 
         st.divider()
-        st.header("Dividenden-Value-Scanner")
-        drawdown_trigger = st.slider("Min. Drawdown vom 52W-Hoch", 10, 60, int(DEFAULT_DRAWDOWN_TRIGGER), 5)
-        payout_max = st.slider("Max. Payout Ratio", 40, 120, int(DEFAULT_PAYOUT_MAX), 5)
-        score_min = st.slider("Min. Qualitäts-Score", 0, 100, int(DEFAULT_SCORE_MIN), 5)
-        yield_min = st.slider("Min. Dividendenrendite", 1.0, 10.0, float(DEFAULT_YIELD_MIN), 0.5)
+        st.header("Scanner-Profil")
+        profile_name = st.selectbox("Profil", list(STRATEGY_PROFILES), key="strategy_profile")
+        profile = STRATEGY_PROFILES[profile_name]
+
+        # Presets werden nur bei einem Profilwechsel gesetzt, danach bleiben die
+        # Slider frei einstellbar.
+        if st.session_state.get("_applied_strategy_profile") != profile_name:
+            st.session_state["scanner_drawdown"] = int(profile["drawdown"])
+            st.session_state["scanner_payout"] = int(profile["payout"])
+            st.session_state["scanner_score"] = int(profile["score"])
+            st.session_state["scanner_yield"] = float(profile["yield"])
+            st.session_state["_applied_strategy_profile"] = profile_name
+
+        st.caption(profile["description"])
+        drawdown_trigger = st.slider("Min. Drawdown vom 52W-Hoch", 10, 60, int(profile["drawdown"]), 5, key="scanner_drawdown")
+        payout_max = st.slider("Max. Payout Ratio", 40, 120, int(profile["payout"]), 5, key="scanner_payout")
+        score_min = st.slider("Min. Qualitäts-Score", 0, 100, int(profile["score"]), 5, key="scanner_score")
+        yield_min = st.slider("Min. Dividendenrendite", 1.0, 10.0, float(profile["yield"]), 0.5, key="scanner_yield")
 
         st.divider()
         reload_clicked = st.button("Daten laden / aktualisieren", type="primary", use_container_width=True)
@@ -1644,17 +3025,23 @@ def main() -> None:
             fetch_ticker_info.clear()
             fetch_dividends.clear()
             fetch_news_for_ticker.clear()
+            fetch_news_bundle.clear()
+            fetch_yahoo_calendar_events.clear()
+            fetch_benchmark_history.clear()
             fx_to_eur.clear()
-            st.session_state.pop("metrics_raw", None)
-            st.session_state.pop("histories", None)
+            for state_key in [
+                "metrics_raw", "histories", "loaded_tickers", "portfolio_extra_metrics",
+                "portfolio_extra_histories",
+            ]:
+                st.session_state.pop(state_key, None)
             st.success("Zwischenspeicher wurde geleert.")
             st.rerun()
 
     selected_constituents = filtered_constituents.head(max_stocks).reset_index(drop=True)
     selected_tickers = tuple(selected_constituents["ticker_yahoo"].map(clean_ticker))
 
-    # Rohdaten sind unabhängig von den Sliderwerten. Die Score-Berechnung läuft
-    # bei jeder UI-Änderung neu und braucht keinen erneuten Datenabruf.
+    # Rohdaten sind unabhängig vom Profil und den Sliderwerten. Der Score wird
+    # bei jeder UI-Änderung erneut berechnet, ohne externe Daten erneut zu laden.
     loaded_tickers = tuple(st.session_state.get("loaded_tickers", ()))
     if reload_clicked or loaded_tickers != selected_tickers:
         with st.spinner(f"Lade Daten für {len(selected_constituents)} Unternehmen …"):
@@ -1668,9 +3055,8 @@ def main() -> None:
 
     raw_metrics = st.session_state.get("metrics_raw")
     histories = st.session_state.get("histories", {})
-
     if raw_metrics is None or raw_metrics.empty:
-        st.info("Wähle links einen Index und klicke auf „Daten laden / aktualisieren“.")
+        st.info("Wähle links einen Index und klicke auf „Daten laden / aktualisieren“. ")
         st.stop()
 
     data = enrich_with_scores(
@@ -1682,10 +3068,14 @@ def main() -> None:
     )
 
     last_refresh = st.session_state.get("last_refresh", "–")
-    st.caption(f"Aktualisiert: {last_refresh} · {len(data)} Unternehmen analysiert · Basiswährung Portfolio: {BASE_CURRENCY}")
+    st.caption(
+        f"Aktualisiert: {last_refresh} · {len(data)} Unternehmen analysiert · "
+        f"Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
+    )
 
     tabs = st.tabs([
-        "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren", "News", "Portfolio", "Watchlist", "Value-Scanner",
+        "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Research",
     ])
     with tabs[0]:
         render_overview(data)
@@ -1702,7 +3092,17 @@ def main() -> None:
     with tabs[6]:
         render_watchlist(data)
     with tabs[7]:
-        render_value_watchlist(data)
+        render_value_watchlist(
+            data,
+            drawdown_trigger=float(drawdown_trigger),
+            payout_max=float(payout_max),
+            score_min=float(score_min),
+            yield_min=float(yield_min),
+            profile_name=profile_name,
+        )
+    with tabs[8]:
+        render_research(data, histories, index_name)
+
 
 
 if __name__ == "__main__":
