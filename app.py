@@ -35,7 +35,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -162,13 +162,20 @@ def find_col(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]
 
 
 def format_number(value: Any, decimals: int = 2, suffix: str = "") -> str:
+    """Formatiert Zahlen im deutschen Stil: 1.234.567,89."""
     number = safe_float(value)
     if number is None:
         return "–"
-    return f"{number:,.{decimals}f}{suffix}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return (
+        f"{number:,.{decimals}f}{suffix}"
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
 
 
 def format_percent(value: Any, decimals: int = 1, signed: bool = False) -> str:
+    """Formatiert Prozentwerte im deutschen Stil."""
     number = safe_float(value)
     if number is None:
         return "–"
@@ -176,15 +183,27 @@ def format_percent(value: Any, decimals: int = 1, signed: bool = False) -> str:
     return f"{prefix}{format_number(number, decimals)} %"
 
 
-def human_market_cap(value: Any) -> str:
+def format_eur(value: Any, decimals: int = 2, signed: bool = False) -> str:
+    """Formatiert Beträge, die intern bereits in Euro vorliegen."""
     number = safe_float(value)
     if number is None:
         return "–"
-    if abs(number) >= 1_000_000_000_000:
+    prefix = "+" if signed and number > 0 else ""
+    return f"{prefix}{format_number(number, decimals)} EUR"
+
+
+def human_market_cap(value: Any) -> str:
+    """Kompakte Marktkapitalisierung: Mio., Mrd. oder Bio. mit deutschem Zahlenformat."""
+    number = safe_float(value)
+    if number is None:
+        return "–"
+
+    absolute = abs(number)
+    if absolute >= 1_000_000_000_000:
         return f"{format_number(number / 1_000_000_000_000, 1)} Bio."
-    if abs(number) >= 1_000_000_000:
+    if absolute >= 1_000_000_000:
         return f"{format_number(number / 1_000_000_000, 1)} Mrd."
-    if abs(number) >= 1_000_000:
+    if absolute >= 1_000_000:
         return f"{format_number(number / 1_000_000, 1)} Mio."
     return format_number(number, 0)
 
@@ -1211,10 +1230,16 @@ def make_price_chart(
 
 def overview_styler(df: pd.DataFrame) -> Any:
     formats = {
-        "last_price": "{:.2f}", "change_1d": "{:+.2f}%", "change_5d": "{:+.2f}%",
-        "change_1y": "{:+.2f}%", "vol_1y": "{:.1f}%", "total_score": "{:.1f}",
-        "score_coverage": "{:.0f}%", "value_score": "{:.1f}",
-        "drawdown_1y_high_pct": "{:+.1f}%", "dividend_yield": "{:.2f}%",
+        "last_price": lambda value: format_number(value, 2),
+        "change_1d": lambda value: format_percent(value, 2, signed=True),
+        "change_5d": lambda value: format_percent(value, 2, signed=True),
+        "change_1y": lambda value: format_percent(value, 2, signed=True),
+        "vol_1y": lambda value: format_percent(value, 1),
+        "total_score": lambda value: format_number(value, 1),
+        "score_coverage": lambda value: format_percent(value, 0),
+        "value_score": lambda value: format_number(value, 1),
+        "drawdown_1y_high_pct": lambda value: format_percent(value, 1, signed=True),
+        "dividend_yield": lambda value: format_percent(value, 2),
     }
     return (
         df.style.format({key: value for key, value in formats.items() if key in df.columns}, na_rep="–")
@@ -1267,20 +1292,66 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "debt_to_equity", "net_debt_ebitda", "score_raw", "score_coverage", "total_score",
     ]
     visible_columns = [column for column in columns if column in df.columns]
+
+    # Nur für die Anzeige: interne Spaltennamen bleiben im restlichen Code unverändert.
+    display_names = {
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "currency": "Währung",
+        "market_cap": "Marktkapitalisierung",
+        "pe_ratio": "KGV",
+        "forward_pe": "Forward KGV",
+        "pb_ratio": "KBV",
+        "ps_ratio": "KUV",
+        "ev_ebitda": "EV/EBITDA",
+        "net_margin": "Nettomarge",
+        "operating_margin": "Operative Marge",
+        "roe": "Eigenkapitalrendite",
+        "roa": "Gesamtkapitalrendite",
+        "dividend_yield": "Dividendenrendite",
+        "dividend_per_share": "Dividende je Aktie",
+        "payout_ratio": "Ausschüttungsquote",
+        "dividend_growth_5y": "Dividendenwachstum 5J",
+        "dividend_frequency": "Ausschüttungsrhythmus",
+        "debt_to_equity": "Debt/Equity",
+        "net_debt_ebitda": "Netto-Schulden/EBITDA",
+        "score_raw": "Rohscore",
+        "score_coverage": "Datenabdeckung",
+        "total_score": "Qualitäts-Score",
+    }
+
+    display_df = df[visible_columns].rename(columns=display_names)
     formats = {
-        "market_cap": "{:.0f}", "pe_ratio": "{:.2f}", "forward_pe": "{:.2f}", "pb_ratio": "{:.2f}",
-        "ps_ratio": "{:.2f}", "ev_ebitda": "{:.2f}", "net_margin": "{:.2f}%",
-        "operating_margin": "{:.2f}%", "roe": "{:.2f}%", "roa": "{:.2f}%", "dividend_yield": "{:.2f}%",
-        "dividend_per_share": "{:.2f}", "payout_ratio": "{:.2f}%", "dividend_growth_5y": "{:.2f}%",
-        "debt_to_equity": "{:.2f}x", "net_debt_ebitda": "{:.2f}x", "score_raw": "{:.1f}",
-        "score_coverage": "{:.0f}%", "total_score": "{:.1f}",
+        "Marktkapitalisierung": human_market_cap,
+        "KGV": lambda value: format_number(value, 2),
+        "Forward KGV": lambda value: format_number(value, 2),
+        "KBV": lambda value: format_number(value, 2),
+        "KUV": lambda value: format_number(value, 2),
+        "EV/EBITDA": lambda value: format_number(value, 2),
+        "Nettomarge": lambda value: format_percent(value, 2),
+        "Operative Marge": lambda value: format_percent(value, 2),
+        "Eigenkapitalrendite": lambda value: format_percent(value, 2),
+        "Gesamtkapitalrendite": lambda value: format_percent(value, 2),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Dividende je Aktie": lambda value: format_number(value, 2),
+        "Ausschüttungsquote": lambda value: format_percent(value, 2),
+        "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
+        "Debt/Equity": lambda value: f"{format_number(value, 2)}x",
+        "Netto-Schulden/EBITDA": lambda value: f"{format_number(value, 2)}x",
+        "Rohscore": lambda value: format_number(value, 1),
+        "Datenabdeckung": lambda value: format_percent(value, 0),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
     }
     styled = (
-        df[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
-        .map(colorize_score, subset=["total_score"])
+        display_df.style.format(formats, na_rep="–")
+        .map(colorize_score, subset=["Qualitäts-Score"])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption("Market Cap ist in der Originalwährung der Aktie. Score und Value-Score sind heuristische Recherchehilfen.")
+    st.caption(
+        "Die Marktkapitalisierung wird kompakt in Mio., Mrd. oder Bio. angezeigt und "
+        "bezieht sich auf die jeweilige Originalwährung in der Spalte „Währung“. "
+        "Score und Value-Score sind heuristische Recherchehilfen."
+    )
 
 
 def render_value_watchlist(df: pd.DataFrame) -> None:
@@ -1294,9 +1365,15 @@ def render_value_watchlist(df: pd.DataFrame) -> None:
     visible_columns = [column for column in columns if column in df.columns]
     result = df.sort_values(["value_trigger", "value_score"], ascending=[False, False], na_position="last")
     formats = {
-        "total_score": "{:.1f}", "score_coverage": "{:.0f}%", "value_score": "{:.1f}",
-        "value_coverage": "{:.0f}%", "dividend_yield": "{:.2f}%", "payout_ratio": "{:.2f}%",
-        "pe_ratio": "{:.2f}", "pb_ratio": "{:.2f}", "drawdown_1y_high_pct": "{:+.1f}%",
+        "total_score": lambda value: format_number(value, 1),
+        "score_coverage": lambda value: format_percent(value, 0),
+        "value_score": lambda value: format_number(value, 1),
+        "value_coverage": lambda value: format_percent(value, 0),
+        "dividend_yield": lambda value: format_percent(value, 2),
+        "payout_ratio": lambda value: format_percent(value, 2),
+        "pe_ratio": lambda value: format_number(value, 2),
+        "pb_ratio": lambda value: format_number(value, 2),
+        "drawdown_1y_high_pct": lambda value: format_percent(value, 1, signed=True),
     }
     styled = (
         result[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
@@ -1360,7 +1437,11 @@ def render_sector_view(df: pd.DataFrame) -> None:
     )
     st.dataframe(
         sector_stats.style.format(
-            {"Performance_1J": "{:+.2f}%", "Qualitäts_Score": "{:.1f}", "Value_Score": "{:.1f}"},
+            {
+                "Performance_1J": lambda value: format_percent(value, 2, signed=True),
+                "Qualitäts_Score": lambda value: format_number(value, 1),
+                "Value_Score": lambda value: format_number(value, 1),
+            },
             na_rep="–",
         ),
         use_container_width=True,
@@ -1450,10 +1531,14 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     total_income = portfolio_view["dividend_income_eur"].sum(skipna=True)
 
     columns = st.columns(4)
-    columns[0].metric("Marktwert", f"{format_number(total_value, 0)} EUR")
-    columns[1].metric("Einstandswert", f"{format_number(total_cost, 0)} EUR")
-    columns[2].metric("Gewinn / Verlust", f"{format_number(total_pnl, 0)} EUR", delta=format_percent(total_pnl / total_cost * 100 if total_cost else None, 1, signed=True))
-    columns[3].metric("Dividende p.a. (Schätzung)", f"{format_number(total_income, 0)} EUR")
+    columns[0].metric("Marktwert", format_eur(total_value, 0))
+    columns[1].metric("Einstandswert", format_eur(total_cost, 0))
+    columns[2].metric(
+        "Gewinn / Verlust",
+        format_eur(total_pnl, 0, signed=True),
+        delta=format_percent(total_pnl / total_cost * 100 if total_cost else None, 1, signed=True),
+    )
+    columns[3].metric("Dividende p.a. (Schätzung)", format_eur(total_income, 0))
 
     visible_columns = [
         "ticker_yahoo", "name", "shares", "cost_basis", "cost_currency", "asset_currency", "last_price",
@@ -1462,10 +1547,18 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     ]
     visible_columns = [column for column in visible_columns if column in portfolio_view.columns]
     formats = {
-        "shares": "{:.4f}", "cost_basis": "{:.2f}", "last_price": "{:.2f}",
-        "market_value_eur": "{:.2f}", "cost_value_eur": "{:.2f}", "pnl_abs_eur": "{:+.2f}",
-        "pnl_pct": "{:+.2f}%", "weight_pct": "{:.2f}%", "dividend_income_eur": "{:.2f}",
-        "yield_on_cost": "{:.2f}%", "total_score": "{:.1f}", "value_score": "{:.1f}",
+        "shares": lambda value: format_number(value, 4),
+        "cost_basis": lambda value: format_number(value, 2),
+        "last_price": lambda value: format_number(value, 2),
+        "market_value_eur": lambda value: format_eur(value, 2),
+        "cost_value_eur": lambda value: format_eur(value, 2),
+        "pnl_abs_eur": lambda value: format_eur(value, 2, signed=True),
+        "pnl_pct": lambda value: format_percent(value, 2, signed=True),
+        "weight_pct": lambda value: format_percent(value, 2),
+        "dividend_income_eur": lambda value: format_eur(value, 2),
+        "yield_on_cost": lambda value: format_percent(value, 2),
+        "total_score": lambda value: format_number(value, 1),
+        "value_score": lambda value: format_number(value, 1),
     }
     styled = (
         portfolio_view[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
