@@ -1,0 +1,42 @@
+name,ticker_yahoo,sector
+Adidas,ADS.DE,Apparel
+Airbus,AIR.PA,Aerospace & Defence
+Allianz,ALV.DE,Financial Services
+BASF,BAS.DE,Chemicals
+Bayer,BAYN.DE,Pharmaceuticals
+Beiersdorf,BEI.DE,Consumer goods
+BMW,BMW.DE,Automotive
+Brenntag,BNR.DE,Distribution
+Commerzbank,CBK.DE,Financial Services
+Continental,CON.DE,Automotive
+Covestro,1COV.DE,Chemicals
+Daimler Truck,DTG.DE,Automotive
+Deutsche Bank,DBK.DE,Financial Services
+Deutsche Börse,DB1.DE,Financial Services
+Deutsche Post,DHL.DE,Logistics
+Deutsche Telekom,DTE.DE,Telecommunication
+E.ON,EOAN.DE,Utilities
+Fresenius,FRE.DE,Healthcare
+Fresenius Medical Care,FME.DE,Healthcare
+Hannover Re,HNR1.DE,Insurance
+Heidelberg Materials,HEI.DE,Construction Materials
+Henkel,HEN3.DE,Consumer Goods
+Infineon Technologies,IFX.DE,Technology
+Mercedes-Benz Group,MBG.DE,Automotive
+Merck,MRK.DE,Pharmaceuticals
+MTU Aero Engines,MTX.DE,Aerospace & Defence
+Munich Re,MUV2.DE,Financial Services
+Porsche,P911.DE,Automotive
+Porsche SE,PAH3.DE,Automotive
+Qiagen,QIA.DE,Biotech
+Rheinmetall,RHM.DE,Aerospace & Defence
+RWE,RWE.DE,Utilities
+SAP,SAP.DE,Technology
+Sartorius,SRT3.DE,Medical Technology
+Siemens,SIE.DE,Industrials
+Siemens Energy,ENR.DE,Energy technology
+Siemens Healthineers,SHL.DE,Medical Equipment
+Symrise,SY1.DE,Chemicals
+Volkswagen Group,VOW3.DE,Automotive
+Vonovia,VNA.DE,Real Estate
+Zalando,ZAL.DE,E-Commerce
