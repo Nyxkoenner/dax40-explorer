@@ -1,1279 +1,1615 @@
-import streamlit as st
-import pandas as pd
-import yfinance as yf
-import requests
-import networkx as nx
-import matplotlib.pyplot as plt
-from math import sqrt
-from typing import List, Dict, Optional
-import feedparser
-from dateutil import parser as dateparser
-import altair as alt
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+"""
+Aktien Explorer – überarbeitete Einzeldatei für Streamlit.
+
+Start:
+    python -m streamlit run app.py
+
+Hinweise:
+- Die App nutzt yfinance als Datenquelle. Daten können fehlen, verzögert oder
+  von Yahoo geändert sein. Sie dienen der Recherche und sind keine Anlageberatung.
+- Lege optional eine portfolio.csv in denselben Ordner. Beispiel:
+  ticker_yahoo,shares,cost_basis,currency,purchase_date
+  ALV.DE,10,245.50,EUR,2024-01-15
+  MSFT,5,390.00,USD,2024-02-10
+"""
+
+from __future__ import annotations
+
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import altair as alt
+import feedparser
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+from dateutil import parser as dateparser
 
 
-# -----------------------------
-# Settings: Value Watchlist
-# -----------------------------
+# -----------------------------------------------------------------------------
+# App-Konfiguration
+# -----------------------------------------------------------------------------
 
-# Globale Trigger (du kannst die später im UI als Slider machen)
-DEFAULT_DRAWDOWN_TRIGGER = 25.0   # % unter 52W-Hoch
-DEFAULT_PAYOUT_MAX = 90.0         # % (payout_ratio muss < 90 sein)
-DEFAULT_SCORE_MIN = 70.0          # total_score muss >= 70 sein
+APP_VERSION = "2.0"
+APP_TITLE = "Aktien Explorer"
+BASE_CURRENCY = "EUR"
 
-# Sektorbasierte Yield-Trigger (Fallback, wenn Sector bekannt)
-# Du kannst diese Werte nach deinem Geschmack feinjustieren.
-YIELD_TRIGGER_BY_SECTOR = {
-    # defensiv/Income
-    "Telecommunication Services": 7.0,
-    "Communication Services": 7.0,
-    "Utilities": 6.5,
-    "Real Estate": 7.0,
-    "Financials": 7.5,
-    "Energy": 7.0,
-    "Consumer Staples": 6.5,
-    # default
-    "_default": 7.0,
-}
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "data"
+INDEX_DIR = DATA_DIR / "indices"
+CACHE_DIR = ROOT_DIR / ".cache"
+WATCHLIST_PATH = DATA_DIR / "watchlist.csv"
+PORTFOLIO_PATH = ROOT_DIR / "portfolio.csv"
 
-# Optional: harte Min-Yield-Grenze unabhängig vom Sektor
-ABSOLUTE_MIN_YIELD_FOR_VALUE = 6.5
-
-
-# -----------------------------
-# HTTP / Caching Helpers
-# -----------------------------
+for directory in (DATA_DIR, INDEX_DIR, CACHE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 }
 
-CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
-
-def fetch_html(url: str, retries: int = 3, backoff: float = 1.2, timeout: int = 20) -> str:
-    last_err = None
-    for i in range(retries):
-        try:
-            resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff * (i + 1))
-    raise RuntimeError(f"HTTP Fehler bei {url}: {last_err}")
-
-def read_html_tables(html: str) -> List[pd.DataFrame]:
-    return pd.read_html(html)
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-    return out
-
-def find_col(columns: List[str], candidates: List[str]) -> Optional[str]:
-    cols_lower = {c.lower(): c for c in columns}
-    for cand in candidates:
-        if cand.lower() in cols_lower:
-            return cols_lower[cand.lower()]
-    for c in columns:
-        cl = c.lower()
-        for cand in candidates:
-            if cand.lower() in cl:
-                return c
-    return None
-
-def disk_cache_load(name: str, max_age_hours: int = 24) -> Optional[pd.DataFrame]:
-    path = CACHE_DIR / f"{name}.csv"
-    if not path.exists():
-        return None
-    age_sec = time.time() - path.stat().st_mtime
-    if age_sec > max_age_hours * 3600:
-        return None
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return None
-
-def disk_cache_save(name: str, df: pd.DataFrame) -> None:
-    path = CACHE_DIR / f"{name}.csv"
-    try:
-        df.to_csv(path, index=False)
-    except Exception:
-        pass
-
-
-# -----------------------------
-# Index-Konstituenten laden
-# -----------------------------
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_index_constituents(index_name: str) -> pd.DataFrame:
-    try:
-        if index_name == "DAX 40":
-            urls = [
-                "https://en.wikipedia.org/wiki/DAX",
-                "https://de.wikipedia.org/wiki/DAX",
-            ]
-
-            for url in urls:
-                try:
-                    html = fetch_html(url)
-
-                    # Debug: nur vorübergehend sichtbar machen
-                    st.sidebar.caption(
-                        f"Quelle geladen: {url} | Größe: {len(html):,} Zeichen"
-                    )
-
-                    tables = pd.read_html(StringIO(html))
-
-                    st.sidebar.caption(
-                        f"Gefundene Tabellen: {len(tables)}"
-                    )
-
-                    for t in tables:
-                        t = normalize_columns(t)
-                        cols = list(t.columns)
-
-                        name_col = find_col(
-                            cols,
-                            ["Company", "Unternehmen", "Name", "Constituent", "Security"]
-                        )
-                        ticker_col = find_col(
-                            cols,
-                            ["Ticker symbol", "Ticker", "Symbol"]
-                        )
-                        sector_col = find_col(
-                            cols,
-                            ["Industry", "Sector", "Industrie", "Branche"]
-                        )
-
-                        if not name_col or not ticker_col:
-                            continue
-
-                        if sector_col is None:
-                            t["sector"] = "Unbekannt"
-                            sector_col = "sector"
-
-                        df_tmp = t[[name_col, ticker_col, sector_col]].copy()
-                        df_tmp.columns = ["name", "ticker_yahoo", "sector"]
-
-                        df_tmp["ticker_yahoo"] = (
-                            df_tmp["ticker_yahoo"]
-                            .astype(str)
-                            .str.replace(r"\[.*?\]", "", regex=True)
-                            .str.strip()
-                        )
-
-                        # Deutsche Aktien für Yahoo Finance
-                        df_tmp["ticker_yahoo"] = df_tmp["ticker_yahoo"].apply(
-                            lambda x: x if "." in x else f"{x}.DE"
-                        )
-
-                        df_tmp = df_tmp.drop_duplicates(
-                            subset=["ticker_yahoo"]
-                        ).reset_index(drop=True)
-
-                        if len(df_tmp) >= 30:
-                            return df_tmp[["name", "ticker_yahoo", "sector"]]
-
-                except Exception as e:
-                    st.sidebar.warning(f"Fehler bei {url}: {type(e).__name__}: {e}")
-
-            st.error(
-                "DAX-Daten konnten nicht aus Wikipedia gelesen werden. "
-                "Bitte die Debug-Ausgaben in der Sidebar prüfen."
-            )
-            return pd.DataFrame()
-
-        elif index_name == "S&P 500":
-            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            html = fetch_html(url)
-            tables = pd.read_html(StringIO(html))
-
-            for t in tables:
-                t = normalize_columns(t)
-                cols = list(t.columns)
-
-                name_col = find_col(cols, ["Security", "Company", "Name"])
-                ticker_col = find_col(cols, ["Symbol", "Ticker", "Ticker symbol"])
-                sector_col = find_col(cols, ["GICS Sector", "Sector"])
-
-                if name_col and ticker_col and sector_col:
-                    df_tmp = t[[name_col, ticker_col, sector_col]].copy()
-                    df_tmp.columns = ["name", "ticker_yahoo", "sector"]
-
-                    df_tmp["ticker_yahoo"] = (
-                        df_tmp["ticker_yahoo"]
-                        .astype(str)
-                        .str.replace(".", "-", regex=False)
-                        .str.strip()
-                    )
-
-                    return df_tmp.drop_duplicates(
-                        subset=["ticker_yahoo"]
-                    ).reset_index(drop=True)
-
-            st.error("Keine passende S&P-500-Tabelle gefunden.")
-            return pd.DataFrame()
-
-        st.error("Unbekannter Index.")
-        return pd.DataFrame()
-
-    except Exception as e:
-        st.exception(e)
-        return pd.DataFrame()
-
-
-# -----------------------------
-# Prozent-Helper
-# -----------------------------
-
-def to_percent(val) -> Optional[float]:
-    if val is None:
-        return None
-    try:
-        v = float(val)
-    except Exception:
-        return None
-    if abs(v) <= 1:
-        return v * 100.0
-    return v
-
-
-# -----------------------------
-# Dividend helpers
-# -----------------------------
-
-def infer_dividend_frequency(div_series: pd.Series) -> Optional[str]:
-    if div_series is None or div_series.empty:
-        return None
-    last_date = div_series.index.max()
-    one_year_ago = last_date - pd.Timedelta(days=365)
-    recent = div_series[div_series.index >= one_year_ago]
-    n = len(recent)
-    if n == 0:
-        return None
-    if n >= 4:
-        return "quarterly"
-    if 2 <= n <= 3:
-        return "semiannual"
-    if n == 1:
-        return "annual"
-    return "irregular"
-
-def calc_dividend_growth_5y(div_series: pd.Series) -> Optional[float]:
-    if div_series is None or div_series.empty:
-        return None
-    yearly = div_series.groupby(div_series.index.year).sum().sort_index()
-    if len(yearly) < 2:
-        return None
-    first_year = yearly.index[0]
-    last_year = yearly.index[-1]
-    n_years = last_year - first_year
-    if n_years <= 0:
-        return None
-    if n_years > 5:
-        first_year = last_year - 5
-        yearly = yearly[yearly.index >= first_year]
-        if len(yearly) < 2:
-            return None
-    first_val = float(yearly.iloc[0])
-    last_val = float(yearly.iloc[-1])
-    if first_val <= 0 or last_val <= 0:
-        return None
-    n_years = yearly.index[-1] - yearly.index[0]
-    if n_years <= 0:
-        return None
-    cagr = (last_val / first_val) ** (1 / n_years) - 1
-    return cagr * 100.0
-
-
-# -----------------------------
-# Kennzahlen & Kursdaten laden
-# -----------------------------
-
-def fetch_metrics(tickers: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
-    result: Dict[str, Dict[str, Optional[float]]] = {}
-    errors: List[str] = []
-
-    for ticker in tickers:
-        metrics: Dict[str, Optional[float]] = {
-            "last_price": None,
-            "change_1d": None,
-            "change_5d": None,
-            "change_1y": None,
-            "vol_30d": None,
-            "vol_1y": None,
-            "market_cap": None,
-            "pe_ratio": None,
-            "forward_pe": None,
-            "pb_ratio": None,
-            "ps_ratio": None,
-            "ev_ebitda": None,
-            "net_margin": None,
-            "operating_margin": None,
-            "roe": None,
-            "roa": None,
-            "dividend_yield": None,
-            "dividend_per_share": None,
-            "payout_ratio": None,
-            "dividend_growth_5y": None,
-            "dividend_frequency": None,
-            "debt_to_equity": None,
-            "net_debt_ebitda": None,
-            "history": None,
-            "high_52w": None,
-            "low_52w": None,
-        }
-
-        try:
-            t = yf.Ticker(ticker)
-
-            hist = t.history(period="1y")
-            if hist.empty:
-                errors.append(f"{ticker}: keine Kursdaten erhalten.")
-            else:
-                close = hist["Close"]
-
-                # UK tickers auf yfinance sind oft in Pence -> Korrekturheuristik
-                if ticker.endswith(".L") and close.iloc[-1] > 100:
-                    close = close / 100.0
-
-                metrics["history"] = close
-                last_price = float(close.iloc[-1])
-                metrics["last_price"] = last_price
-
-                metrics["high_52w"] = float(close.max())
-                metrics["low_52w"] = float(close.min())
-
-                def pct_change_from(idx_offset: int) -> Optional[float]:
-                    if len(close) <= idx_offset:
-                        return None
-                    base = float(close.iloc[-1 - idx_offset])
-                    if base == 0:
-                        return None
-                    return (last_price - base) / base * 100.0
-
-                metrics["change_1d"] = pct_change_from(1)
-                metrics["change_5d"] = pct_change_from(5)
-                metrics["change_1y"] = pct_change_from(len(close) - 1)
-
-                rets = close.pct_change().dropna()
-                if len(rets) >= 30:
-                    metrics["vol_30d"] = float(rets.tail(30).std() * sqrt(252) * 100.0)
-                if len(rets) > 0:
-                    metrics["vol_1y"] = float(rets.std() * sqrt(252) * 100.0)
-
-            try:
-                info = t.info
-
-                metrics["market_cap"] = info.get("marketCap")
-                metrics["pe_ratio"] = info.get("trailingPE")
-                metrics["forward_pe"] = info.get("forwardPE")
-                metrics["pb_ratio"] = info.get("priceToBook")
-                metrics["ps_ratio"] = info.get("priceToSalesTrailing12Months")
-                metrics["ev_ebitda"] = info.get("enterpriseToEbitda")
-
-                metrics["net_margin"] = to_percent(info.get("profitMargins"))
-                metrics["operating_margin"] = to_percent(info.get("operatingMargins"))
-                metrics["roe"] = to_percent(info.get("returnOnEquity"))
-                metrics["roa"] = to_percent(info.get("returnOnAssets"))
-
-                dy_raw = info.get("dividendYield")
-                metrics["dividend_yield"] = to_percent(dy_raw)
-                metrics["dividend_per_share"] = info.get("dividendRate")
-                metrics["payout_ratio"] = to_percent(info.get("payoutRatio"))
-
-                # Dividend Yield Fallback: DPS / Price
-                try:
-                    lp = metrics.get("last_price")
-                    dps = metrics.get("dividend_per_share")
-                    if lp not in (None, 0) and dps not in (None, 0):
-                        est_yield = float(dps) / float(lp) * 100.0
-                        dy_current = metrics["dividend_yield"]
-                        if dy_current is None or dy_current > 25 or abs(dy_current - est_yield) > 15:
-                            metrics["dividend_yield"] = est_yield
-                except Exception:
-                    pass
-
-                dte_raw = info.get("debtToEquity")
-                if dte_raw is not None:
-                    dte = float(dte_raw)
-                    if dte > 0:
-                        metrics["debt_to_equity"] = dte / 100.0
-
-                total_debt = info.get("totalDebt")
-                total_cash = info.get("totalCash")
-                ebitda = info.get("ebitda")
-                if total_debt is not None and total_cash is not None and ebitda not in (None, 0):
-                    net_debt = float(total_debt) - float(total_cash)
-                    metrics["net_debt_ebitda"] = float(net_debt) / float(ebitda)
-
-            except Exception as e_info:
-                errors.append(f"{ticker}: Fehler beim Laden von info – {e_info}")
-
-            try:
-                divs = t.dividends
-                if divs is not None and not divs.empty:
-                    metrics["dividend_frequency"] = infer_dividend_frequency(divs)
-                    metrics["dividend_growth_5y"] = calc_dividend_growth_5y(divs)
-            except Exception as e_div:
-                errors.append(f"{ticker}: Fehler bei Dividendenhistorie – {e_div}")
-
-        except Exception as e:
-            errors.append(f"{ticker}: Allgemeiner Fehler – {e}")
-
-        result[ticker] = metrics
-
-    if errors:
-        st.sidebar.error("Probleme beim Laden der Daten:")
-        for msg in errors[:30]:
-            st.sidebar.write("- ", msg)
-        if len(errors) > 30:
-            st.sidebar.write(f"... und {len(errors) - 30} weitere")
-
-    return result
-
-
-# -----------------------------
-# News & Sentiment
-# -----------------------------
+DEFAULT_DRAWDOWN_TRIGGER = 25.0
+DEFAULT_PAYOUT_MAX = 90.0
+DEFAULT_SCORE_MIN = 65.0
+DEFAULT_YIELD_MIN = 5.0
+MIN_SCORE_COVERAGE_FOR_TRIGGER = 55.0
+
+SMA_COLORS = {
+    "SMA 20": "#ef4444",
+    "SMA 50": "#f59e0b",
+    "SMA 200": "#14b8a6",
+}
+
+# Hohe Renditen sind je nach Sektor unterschiedlich normal. Diese Werte sind
+# absichtlich konservativer als in der alten Version und im UI anpassbar.
+YIELD_TRIGGER_BY_SECTOR = {
+    "Utilities": 4.5,
+    "Real Estate": 5.5,
+    "Financials": 5.5,
+    "Energy": 5.5,
+    "Consumer Staples": 4.5,
+    "Communication Services": 4.5,
+    "Telecommunication Services": 4.5,
+    "_default": 5.0,
+}
+
+FINANCIAL_SECTOR_TERMS = {
+    "financial",
+    "bank",
+    "insurance",
+    "asset management",
+    "capital markets",
+}
 
 POSITIVE_WORDS = {
-    "schlägt", "rekord", "stark", "upgrades", "kaufen", "outperform",
-    "bullish", "profit", "gewinn", "wachstum", "besser als erwartet", "angehoben"
-}
-NEGATIVE_WORDS = {
-    "warnung", "gewinnwarnung", "verfehlt", "herabgestuft", "verkaufen",
-    "schwach", "verlust", "betrug", "untersuchung", "klage", "senken"
+    "beat", "beats", "record", "strong", "upgrade", "upgrades", "buy",
+    "outperform", "bullish", "profit", "growth", "raised", "raise",
+    "besser als erwartet", "rekord", "stark", "angehoben", "kaufen",
+    "gewinn", "wachstum", "übertrifft", "uebertrifft",
 }
 
-RSS_SOURCES: List[str] = [
-    "https://www.tagesschau.de/xml/rss2",
+NEGATIVE_WORDS = {
+    "warning", "profit warning", "miss", "downgrade", "sell", "weak",
+    "loss", "fraud", "investigation", "lawsuit", "cut", "cuts",
+    "warnung", "gewinnwarnung", "verfehlt", "herabgestuft", "verkaufen",
+    "schwach", "verlust", "betrug", "untersuchung", "klage", "senken",
+}
+
+RSS_SOURCES = [
     "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
     "https://www.finanzen.net/rss/news",
     "https://www.onvista.de/news/feed/aktien",
     "https://www.handelsblatt.com/contentexport/feed/wirtschaft",
-    "https://www.investing.com/rss/news_25.rss",
     "https://www.eqs-news.com/de/news/dgap/rss",
 ]
 
-def simple_sentiment(text: str) -> float:
-    if not text:
-        return 0.0
-    t = text.lower()
-    score = 0
-    for w in POSITIVE_WORDS:
-        if w in t:
-            score += 1
-    for w in NEGATIVE_WORDS:
-        if w in t:
-            score -= 1
-    return float(score)
 
-def fetch_news_for_ticker(
+# -----------------------------------------------------------------------------
+# Allgemeine Hilfsfunktionen
+# -----------------------------------------------------------------------------
+
+
+def safe_float(value: Any) -> Optional[float]:
+    """Wandelt Werte robust in float um; unbrauchbare Werte werden None."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if pd.notna(result) else None
+
+
+def to_percent(value: Any) -> Optional[float]:
+    """Yahoo liefert einige Quoten als Dezimalzahl, andere bereits in Prozent."""
+    number = safe_float(value)
+    if number is None:
+        return None
+    return number * 100.0 if abs(number) <= 1 else number
+
+
+def clean_ticker(ticker: Any) -> str:
+    return str(ticker or "").strip().upper()
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    result.columns = [str(column).strip() for column in result.columns]
+    return result
+
+
+def find_col(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
+    """Findet Spalten auch bei leicht abweichender Wikipedia-Benennung."""
+    available = {str(column).lower(): str(column) for column in columns}
+    for candidate in candidates:
+        if candidate.lower() in available:
+            return available[candidate.lower()]
+
+    for column in columns:
+        column_lower = str(column).lower()
+        if any(candidate.lower() in column_lower for candidate in candidates):
+            return str(column)
+    return None
+
+
+def format_number(value: Any, decimals: int = 2, suffix: str = "") -> str:
+    number = safe_float(value)
+    if number is None:
+        return "–"
+    return f"{number:,.{decimals}f}{suffix}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_percent(value: Any, decimals: int = 1, signed: bool = False) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "–"
+    prefix = "+" if signed and number > 0 else ""
+    return f"{prefix}{format_number(number, decimals)} %"
+
+
+def human_market_cap(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "–"
+    if abs(number) >= 1_000_000_000_000:
+        return f"{format_number(number / 1_000_000_000_000, 1)} Bio."
+    if abs(number) >= 1_000_000_000:
+        return f"{format_number(number / 1_000_000_000, 1)} Mrd."
+    if abs(number) >= 1_000_000:
+        return f"{format_number(number / 1_000_000, 1)} Mio."
+    return format_number(number, 0)
+
+
+def is_financial_sector(sector: Any) -> bool:
+    text = str(sector or "").lower()
+    return any(term in text for term in FINANCIAL_SECTOR_TERMS)
+
+
+def ensure_datetime_index(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    result.index = pd.to_datetime(result.index, errors="coerce")
+    result = result[~result.index.isna()]
+    if getattr(result.index, "tz", None) is not None:
+        result.index = result.index.tz_localize(None)
+    return result.sort_index()
+
+
+def empty_metrics_frame() -> pd.DataFrame:
+    columns = [
+        "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d",
+        "change_5d", "change_1y", "vol_30d", "vol_1y", "high_52w", "low_52w",
+        "market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda",
+        "net_margin", "operating_margin", "roe", "roa", "dividend_yield",
+        "dividend_per_share", "payout_ratio", "dividend_growth_5y",
+        "dividend_frequency", "debt_to_equity", "net_debt_ebitda", "data_updated_at",
+    ]
+    return pd.DataFrame(columns=columns)
+
+
+# -----------------------------------------------------------------------------
+# Indexdaten: CSV-Fallback und Wikipedia
+# -----------------------------------------------------------------------------
+
+
+def fetch_html(url: str, retries: int = 3, timeout: int = 20) -> str:
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+            response.raise_for_status()
+            html = response.text
+            if "<table" not in html.lower():
+                raise RuntimeError("Die Antwort enthält keine HTML-Tabelle.")
+            return html
+        except Exception as error:  # externe Quelle: Fehler sind erwartbar
+            last_error = error
+            time.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"Abruf fehlgeschlagen: {last_error}")
+
+
+def read_html_tables(html: str) -> list[pd.DataFrame]:
+    return pd.read_html(StringIO(html))
+
+
+def validate_constituents(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"name", "ticker_yahoo", "sector"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Indexdatei enthält nicht alle benötigten Spalten: {sorted(missing)}")
+
+    result = df[["name", "ticker_yahoo", "sector"]].copy()
+    result["name"] = result["name"].astype(str).str.strip()
+    result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
+    result["sector"] = result["sector"].fillna("Unbekannt").astype(str).str.strip()
+    result = result[result["ticker_yahoo"].ne("")]
+    return result.drop_duplicates(subset=["ticker_yahoo"]).reset_index(drop=True)
+
+
+def parse_dax_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    for table in tables:
+        table = normalize_columns(table)
+        columns = list(table.columns)
+        name_col = find_col(columns, ["Company", "Unternehmen", "Name", "Constituent", "Security"])
+        ticker_col = find_col(columns, ["Ticker symbol", "Ticker", "Symbol"])
+        sector_col = find_col(columns, ["Industry", "Sector", "Industrie", "Branche"])
+
+        if not name_col or not ticker_col:
+            continue
+        if any(word in ticker_col.lower() for word in ("isin", "wkn")):
+            continue
+
+        result = table[[name_col, ticker_col]].copy()
+        result.columns = ["name", "ticker_yahoo"]
+        result["sector"] = table[sector_col] if sector_col else "Unbekannt"
+        result["ticker_yahoo"] = (
+            result["ticker_yahoo"].astype(str)
+            .str.replace(r"\[.*?\]", "", regex=True)
+            .str.strip()
+        )
+        result = result[result["ticker_yahoo"].str.len().gt(0)]
+        result["ticker_yahoo"] = result["ticker_yahoo"].apply(
+            lambda ticker: ticker if "." in ticker else f"{ticker}.DE"
+        )
+        result = validate_constituents(result)
+        if len(result) >= 30:
+            return result
+    raise RuntimeError("Keine passende DAX-Tabelle mit Yahoo-Tickern gefunden.")
+
+
+def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    for table in tables:
+        table = normalize_columns(table)
+        columns = list(table.columns)
+        name_col = find_col(columns, ["Security", "Company", "Name"])
+        ticker_col = find_col(columns, ["Symbol", "Ticker", "Ticker symbol"])
+        sector_col = find_col(columns, ["GICS Sector", "Sector"])
+        if not (name_col and ticker_col and sector_col):
+            continue
+
+        result = table[[name_col, ticker_col, sector_col]].copy()
+        result.columns = ["name", "ticker_yahoo", "sector"]
+        result["ticker_yahoo"] = result["ticker_yahoo"].astype(str).str.replace(".", "-", regex=False)
+        result = validate_constituents(result)
+        if len(result) >= 400:
+            return result
+    raise RuntimeError("Keine passende S&P-500-Tabelle gefunden.")
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_index_constituents(index_name: str) -> pd.DataFrame:
+    """Lädt zuerst eine optionale lokale CSV, sonst Wikipedia als Fallback."""
+    local_files = {
+        "DAX 40": INDEX_DIR / "dax40.csv",
+        "S&P 500": INDEX_DIR / "sp500.csv",
+    }
+    local_path = local_files.get(index_name)
+    if local_path and local_path.exists():
+        return validate_constituents(pd.read_csv(local_path))
+
+    if index_name == "DAX 40":
+        errors: list[str] = []
+        for url in ("https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"):
+            try:
+                return parse_dax_tables(read_html_tables(fetch_html(url)))
+            except Exception as error:
+                errors.append(f"{url}: {error}")
+        raise RuntimeError("DAX konnte nicht geladen werden. " + " | ".join(errors))
+
+    if index_name == "S&P 500":
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        return parse_sp500_tables(read_html_tables(fetch_html(url)))
+
+    raise ValueError(f"Unbekannter Index: {index_name}")
+
+
+# -----------------------------------------------------------------------------
+# Marktdaten und Dividenden
+# -----------------------------------------------------------------------------
+
+
+def _extract_ticker_history(downloaded: pd.DataFrame, ticker: str, ticker_count: int) -> pd.DataFrame:
+    """Extrahiert einen Ticker aus yf.download, unabhängig von Spaltenlayout."""
+    if downloaded.empty:
+        return pd.DataFrame()
+
+    if ticker_count == 1 and not isinstance(downloaded.columns, pd.MultiIndex):
+        return downloaded.copy()
+
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        level0 = downloaded.columns.get_level_values(0)
+        level1 = downloaded.columns.get_level_values(1)
+        if ticker in level0:
+            return downloaded[ticker].copy()
+        if ticker in level1:
+            return downloaded.xs(ticker, axis=1, level=1).copy()
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> dict[str, pd.DataFrame]:
+    """Lädt Kursdaten gebündelt; das ist schneller als ein Abruf je Ticker."""
+    clean_tickers = tuple(dict.fromkeys(ticker for ticker in tickers if ticker))
+    if not clean_tickers:
+        return {}
+
+    try:
+        downloaded = yf.download(
+            list(clean_tickers),
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            actions=False,
+            threads=True,
+            progress=False,
+            repair=False,
+        )
+    except Exception:
+        downloaded = pd.DataFrame()
+
+    histories: dict[str, pd.DataFrame] = {}
+    for ticker in clean_tickers:
+        history = _extract_ticker_history(downloaded, ticker, len(clean_tickers))
+        if history.empty:
+            try:
+                history = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+            except Exception:
+                history = pd.DataFrame()
+        if not history.empty:
+            history = ensure_datetime_index(history)
+            valid_columns = [column for column in ["Open", "High", "Low", "Close", "Volume"] if column in history.columns]
+            histories[ticker] = history[valid_columns].copy()
+        else:
+            histories[ticker] = pd.DataFrame()
+    return histories
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_ticker_info(ticker: str) -> dict[str, Any]:
+    """Beschränkt die gespeicherten Yahoo-Felder auf wirklich benötigte Daten."""
+    wanted_keys = [
+        "marketCap", "trailingPE", "forwardPE", "priceToBook", "priceToSalesTrailing12Months",
+        "enterpriseToEbitda", "profitMargins", "operatingMargins", "returnOnEquity",
+        "returnOnAssets", "dividendYield", "dividendRate", "payoutRatio", "debtToEquity",
+        "totalDebt", "totalCash", "ebitda", "currency", "financialCurrency", "beta",
+    ]
+    try:
+        info = yf.Ticker(ticker).get_info()
+    except Exception:
+        info = {}
+    return {key: info.get(key) for key in wanted_keys}
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_dividends(ticker: str) -> pd.DataFrame:
+    try:
+        dividends = yf.Ticker(ticker).dividends
+    except Exception:
+        dividends = pd.Series(dtype=float)
+
+    if dividends is None or dividends.empty:
+        return pd.DataFrame(columns=["date", "amount"])
+    frame = dividends.rename("amount").to_frame().reset_index()
+    frame.columns = ["date", "amount"]
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    if getattr(frame["date"].dt, "tz", None) is not None:
+        frame["date"] = frame["date"].dt.tz_localize(None)
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    return frame.dropna(subset=["date", "amount"]).sort_values("date")
+
+
+def infer_dividend_frequency(dividend_frame: pd.DataFrame) -> Optional[str]:
+    """Erkennt Monats-, Quartals-, Halbjahres- und Jahresdividenden."""
+    if dividend_frame is None or dividend_frame.empty:
+        return None
+    dates = pd.to_datetime(dividend_frame["date"], errors="coerce").dropna()
+    if dates.empty:
+        return None
+
+    cutoff = dates.max() - pd.Timedelta(days=400)
+    count = int((dates >= cutoff).sum())
+    if count >= 10:
+        return "monatlich"
+    if count >= 4:
+        return "quartalsweise"
+    if count in (2, 3):
+        return "halbjährlich"
+    if count == 1:
+        return "jährlich"
+    return "unregelmäßig"
+
+
+def calc_dividend_growth_5y(dividend_frame: pd.DataFrame) -> Optional[float]:
+    """CAGR nur aus abgeschlossenen Kalenderjahren, nie aus dem laufenden Jahr."""
+    if dividend_frame is None or dividend_frame.empty:
+        return None
+
+    frame = dividend_frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    frame = frame.dropna(subset=["date", "amount"])
+    if frame.empty:
+        return None
+
+    current_year = datetime.now().year
+    frame = frame[frame["date"].dt.year < current_year]
+    if frame.empty:
+        return None
+
+    yearly = frame.groupby(frame["date"].dt.year)["amount"].sum().sort_index()
+    if len(yearly) < 2:
+        return None
+
+    latest_year = int(yearly.index.max())
+    start_year = latest_year - 5
+    selected = yearly[yearly.index >= start_year]
+    if len(selected) < 2:
+        return None
+
+    first_value = safe_float(selected.iloc[0])
+    last_value = safe_float(selected.iloc[-1])
+    years = int(selected.index[-1] - selected.index[0])
+    if first_value is None or last_value is None or first_value <= 0 or last_value <= 0 or years <= 0:
+        return None
+    return ((last_value / first_value) ** (1 / years) - 1) * 100.0
+
+
+def series_change(close: pd.Series, periods_back: int) -> Optional[float]:
+    if close is None or len(close) <= periods_back:
+        return None
+    last_price = safe_float(close.iloc[-1])
+    base_price = safe_float(close.iloc[-1 - periods_back])
+    if last_price is None or base_price in (None, 0):
+        return None
+    return (last_price / base_price - 1) * 100.0
+
+
+def trailing_dividend_per_share(dividend_frame: pd.DataFrame) -> Optional[float]:
+    if dividend_frame is None or dividend_frame.empty:
+        return None
+    latest_date = pd.to_datetime(dividend_frame["date"], errors="coerce").max()
+    if pd.isna(latest_date):
+        return None
+    cutoff = latest_date - pd.Timedelta(days=365)
+    result = pd.to_numeric(
+        dividend_frame.loc[dividend_frame["date"] >= cutoff, "amount"], errors="coerce"
+    ).sum()
+    return safe_float(result) if result > 0 else None
+
+
+def metrics_from_ticker(
     ticker: str,
-    company_name: str = "",
-    days_back: int = 30,
-    max_items: int = 50,
+    name: str,
+    sector: str,
+    history: pd.DataFrame,
+    info: dict[str, Any],
+    dividends: pd.DataFrame,
+) -> dict[str, Any]:
+    """Erstellt eine flache, tabellenfreundliche Kennzahlenzeile."""
+    record: dict[str, Any] = {
+        "name": name,
+        "ticker_yahoo": ticker,
+        "sector": sector or "Unbekannt",
+        "currency": info.get("currency") or info.get("financialCurrency") or "–",
+        "last_price": None,
+        "change_1d": None,
+        "change_5d": None,
+        "change_1y": None,
+        "vol_30d": None,
+        "vol_1y": None,
+        "high_52w": None,
+        "low_52w": None,
+        "market_cap": safe_float(info.get("marketCap")),
+        "pe_ratio": safe_float(info.get("trailingPE")),
+        "forward_pe": safe_float(info.get("forwardPE")),
+        "pb_ratio": safe_float(info.get("priceToBook")),
+        "ps_ratio": safe_float(info.get("priceToSalesTrailing12Months")),
+        "ev_ebitda": safe_float(info.get("enterpriseToEbitda")),
+        "net_margin": to_percent(info.get("profitMargins")),
+        "operating_margin": to_percent(info.get("operatingMargins")),
+        "roe": to_percent(info.get("returnOnEquity")),
+        "roa": to_percent(info.get("returnOnAssets")),
+        "dividend_yield": to_percent(info.get("dividendYield")),
+        "dividend_per_share": safe_float(info.get("dividendRate")),
+        "payout_ratio": to_percent(info.get("payoutRatio")),
+        "dividend_growth_5y": calc_dividend_growth_5y(dividends),
+        "dividend_frequency": infer_dividend_frequency(dividends),
+        "debt_to_equity": None,
+        "net_debt_ebitda": None,
+        "beta": safe_float(info.get("beta")),
+        "data_updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+    debt_to_equity = safe_float(info.get("debtToEquity"))
+    if debt_to_equity is not None and debt_to_equity >= 0:
+        record["debt_to_equity"] = debt_to_equity / 100.0
+
+    total_debt = safe_float(info.get("totalDebt"))
+    total_cash = safe_float(info.get("totalCash"))
+    ebitda = safe_float(info.get("ebitda"))
+    if total_debt is not None and total_cash is not None and ebitda not in (None, 0):
+        record["net_debt_ebitda"] = (total_debt - total_cash) / ebitda
+
+    if history is not None and not history.empty and "Close" in history.columns:
+        close = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if not close.empty:
+            one_year = close.tail(253)
+            returns = one_year.pct_change().dropna()
+            record["last_price"] = safe_float(close.iloc[-1])
+            record["change_1d"] = series_change(close, 1)
+            record["change_5d"] = series_change(close, 5)
+            record["change_1y"] = series_change(close, 252) if len(close) >= 253 else None
+            record["high_52w"] = safe_float(one_year.max())
+            record["low_52w"] = safe_float(one_year.min())
+            if len(returns) >= 30:
+                record["vol_30d"] = float(returns.tail(30).std() * (252 ** 0.5) * 100)
+            if len(returns) >= 2:
+                record["vol_1y"] = float(returns.std() * (252 ** 0.5) * 100)
+
+    trailing_dps = trailing_dividend_per_share(dividends)
+    if record["dividend_per_share"] is None:
+        record["dividend_per_share"] = trailing_dps
+
+    # Plausibilitäts-Fallback: Yahoo liefert die Yield gelegentlich leer oder in
+    # einer unpassenden Skalierung. Erst dann rechnen wir aus DPS / letztem Kurs.
+    price = safe_float(record["last_price"])
+    dps = safe_float(record["dividend_per_share"])
+    estimated_yield = dps / price * 100 if price not in (None, 0) and dps not in (None, 0) else None
+    current_yield = safe_float(record["dividend_yield"])
+    if estimated_yield is not None and (
+        current_yield is None or current_yield < 0 or current_yield > 25 or abs(current_yield - estimated_yield) > 15
+    ):
+        record["dividend_yield"] = estimated_yield
+
+    return record
+
+
+def collect_metrics(constituents: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
+    """Lädt Kurse gebündelt; Fundamentaldaten bleiben pro Ticker gecacht."""
+    if constituents.empty:
+        return empty_metrics_frame(), {}, []
+
+    tickers = tuple(constituents["ticker_yahoo"].map(clean_ticker).tolist())
+    histories = download_price_histories(tickers, period="5y")
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for _, company in constituents.iterrows():
+        ticker = clean_ticker(company["ticker_yahoo"])
+        try:
+            info = fetch_ticker_info(ticker)
+            dividends = fetch_dividends(ticker)
+            history = histories.get(ticker, pd.DataFrame())
+            records.append(
+                metrics_from_ticker(
+                    ticker=ticker,
+                    name=str(company.get("name", ticker)),
+                    sector=str(company.get("sector", "Unbekannt")),
+                    history=history,
+                    info=info,
+                    dividends=dividends,
+                )
+            )
+            if history.empty:
+                errors.append(f"{ticker}: keine Kursdaten")
+        except Exception as error:
+            errors.append(f"{ticker}: {type(error).__name__}")
+
+    return pd.DataFrame(records), histories, errors
+
+
+# -----------------------------------------------------------------------------
+# Score und Value-Scanner
+# -----------------------------------------------------------------------------
+
+
+def score_band(value: Optional[float], thresholds: list[tuple[float, float]], default: float = 0.0) -> float:
+    if value is None:
+        return default
+    for minimum, score in thresholds:
+        if value >= minimum:
+            return score
+    return default
+
+
+def compute_total_score(row: pd.Series) -> pd.Series:
+    """Qualitäts-/Stabilitätsscore mit Datenabdeckungsabschlag.
+
+    Er verhindert, dass wenige zufällig vorhandene Spitzenwerte automatisch zu
+    einem 100er-Score führen. Negative KGVs erhalten keine Bewertungs-Punkte.
+    """
+    components: list[tuple[str, Optional[float], float]] = []
+
+    roe = safe_float(row.get("roe"))
+    if roe is not None:
+        points = score_band(roe, [(20, 20), (15, 16), (10, 12), (5, 8)], 2)
+        components.append(("ROE", points, 20))
+
+    margin = safe_float(row.get("net_margin"))
+    if margin is not None:
+        points = score_band(margin, [(20, 20), (15, 16), (10, 12), (5, 8)], 2)
+        components.append(("Netto-Marge", points, 20))
+
+    pe = safe_float(row.get("pe_ratio"))
+    pb = safe_float(row.get("pb_ratio"))
+    valuation_points: Optional[float] = None
+    if pe is not None:
+        if pe <= 0:
+            valuation_points = 0.0  # Verlustunternehmen sind nicht "günstig" per KGV.
+        else:
+            valuation_points = score_band(pe, [(0.0, 0)], 0)
+            if pe <= 10:
+                valuation_points = 20
+            elif pe <= 15:
+                valuation_points = 16
+            elif pe <= 22:
+                valuation_points = 11
+            elif pe <= 35:
+                valuation_points = 5
+            else:
+                valuation_points = 1
+    elif pb is not None and pb > 0:
+        valuation_points = 18 if pb <= 1 else 14 if pb <= 2 else 8 if pb <= 4 else 3
+    if valuation_points is not None:
+        components.append(("Bewertung", valuation_points, 20))
+
+    # D/E ist für Banken/Versicherungen weniger aussagekräftig und wird dort
+    # bewusst aus der Datenabdeckung herausgenommen.
+    if not is_financial_sector(row.get("sector")):
+        debt_to_equity = safe_float(row.get("debt_to_equity"))
+        net_debt_ebitda = safe_float(row.get("net_debt_ebitda"))
+        if debt_to_equity is not None or net_debt_ebitda is not None:
+            dte_points = None
+            nde_points = None
+            if debt_to_equity is not None:
+                dte_points = 20 if debt_to_equity < 0.5 else 16 if debt_to_equity < 1 else 11 if debt_to_equity < 2 else 5 if debt_to_equity < 3 else 0
+            if net_debt_ebitda is not None:
+                nde_points = 20 if net_debt_ebitda < 1 else 16 if net_debt_ebitda < 2 else 11 if net_debt_ebitda < 3 else 5 if net_debt_ebitda < 4 else 0
+            debt_points = max(point for point in (dte_points, nde_points) if point is not None)
+            components.append(("Verschuldung", debt_points, 20))
+
+    volatility = safe_float(row.get("vol_1y"))
+    if volatility is not None:
+        points = 20 if volatility <= 20 else 16 if volatility <= 30 else 10 if volatility <= 40 else 4
+        components.append(("Volatilität", points, 20))
+
+    if not components:
+        return pd.Series({
+            "total_score": None,
+            "score_raw": None,
+            "score_coverage": 0.0,
+            "score_confidence": "keine Daten",
+            "score_components": "Keine ausreichenden Kennzahlen",
+        })
+
+    available_weight = sum(weight for _, _, weight in components)
+    eligible_weight = 100.0 if not is_financial_sector(row.get("sector")) else 80.0
+    raw_score = sum(points for _, points, _ in components) / available_weight * 100
+    coverage = min(available_weight / eligible_weight * 100, 100.0)
+    # Bei geringer Abdeckung wird der Rohscore sichtbar abgeschwächt.
+    total_score = raw_score * (0.60 + 0.40 * coverage / 100)
+    confidence = "hoch" if coverage >= 80 else "mittel" if coverage >= 60 else "niedrig"
+    component_text = " | ".join(f"{name}: {points:.0f}/{weight:.0f}" for name, points, weight in components)
+
+    return pd.Series({
+        "total_score": round(total_score, 1),
+        "score_raw": round(raw_score, 1),
+        "score_coverage": round(coverage, 1),
+        "score_confidence": confidence,
+        "score_components": component_text,
+    })
+
+
+def sector_yield_trigger(sector: Any, global_minimum: float) -> float:
+    sector_text = str(sector or "")
+    return max(global_minimum, YIELD_TRIGGER_BY_SECTOR.get(sector_text, YIELD_TRIGGER_BY_SECTOR["_default"]))
+
+
+def compute_value_trigger_and_score(
+    row: pd.Series,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
+) -> pd.Series:
+    """Berechnet transparenten Value-Score und strengen Watchlist-Trigger."""
+    last_price = safe_float(row.get("last_price"))
+    high_52w = safe_float(row.get("high_52w"))
+    dividend_yield = safe_float(row.get("dividend_yield"))
+    payout_ratio = safe_float(row.get("payout_ratio"))
+    total_score = safe_float(row.get("total_score"))
+    score_coverage = safe_float(row.get("score_coverage"))
+    pe = safe_float(row.get("pe_ratio"))
+    pb = safe_float(row.get("pb_ratio"))
+    debt_to_equity = safe_float(row.get("debt_to_equity"))
+
+    drawdown = None
+    if last_price is not None and high_52w not in (None, 0):
+        drawdown = (last_price / high_52w - 1.0) * 100
+
+    value_points = 0.0
+    value_weight = 0.0
+
+    if drawdown is not None:
+        value_weight += 35
+        value_points += min(max(-drawdown, 0), 50) / 50 * 35
+
+    if dividend_yield is not None:
+        value_weight += 20
+        # Bis 8 % steigt der Nutzen. Extremrenditen erhalten keinen Zusatzbonus.
+        value_points += min(dividend_yield, 8) / 8 * 20
+
+    if pe is not None:
+        value_weight += 20
+        if pe <= 0:
+            pe_points = 0
+        elif pe <= 10:
+            pe_points = 20
+        elif pe <= 16:
+            pe_points = 15
+        elif pe <= 25:
+            pe_points = 8
+        else:
+            pe_points = 2
+        value_points += pe_points
+    elif pb is not None and pb > 0:
+        value_weight += 20
+        value_points += 18 if pb <= 1 else 13 if pb <= 2 else 7 if pb <= 4 else 2
+
+    if payout_ratio is not None:
+        value_weight += 15
+        value_points += 15 if 0 <= payout_ratio <= 70 else 10 if payout_ratio <= 90 else 3 if payout_ratio <= 110 else 0
+
+    if debt_to_equity is not None and not is_financial_sector(row.get("sector")):
+        value_weight += 10
+        value_points += 10 if debt_to_equity < 1 else 7 if debt_to_equity < 2 else 3 if debt_to_equity < 3 else 0
+
+    if value_weight == 0:
+        value_score = None
+        value_coverage = 0.0
+    else:
+        raw_value = value_points / value_weight * 100
+        value_coverage = min(value_weight / 100 * 100, 100.0)
+        value_score = round(raw_value * (0.70 + 0.30 * value_coverage / 100), 1)
+
+    minimum_yield = sector_yield_trigger(row.get("sector"), yield_min)
+    checks = {
+        "Score": total_score is not None and total_score >= score_min,
+        "Datenabdeckung": score_coverage is not None and score_coverage >= MIN_SCORE_COVERAGE_FOR_TRIGGER,
+        "Payout": payout_ratio is not None and 0 <= payout_ratio <= payout_max,
+        "Rendite": dividend_yield is not None and dividend_yield >= minimum_yield,
+        "Drawdown": drawdown is not None and drawdown <= -drawdown_trigger,
+    }
+    triggered = all(checks.values())
+
+    reasons = [
+        f"Score {'✓' if checks['Score'] else '✗'} ({format_number(total_score, 1)} / min. {score_min:.0f})",
+        f"Daten {'✓' if checks['Datenabdeckung'] else '✗'} ({format_number(score_coverage, 0)} %)",
+        f"Payout {'✓' if checks['Payout'] else '✗'} ({format_percent(payout_ratio, 1)} / max. {payout_max:.0f} %)",
+        f"Rendite {'✓' if checks['Rendite'] else '✗'} ({format_percent(dividend_yield, 1)} / min. {minimum_yield:.1f} %)",
+        f"Drawdown {'✓' if checks['Drawdown'] else '✗'} ({format_percent(drawdown, 1, signed=True)} / ≤ -{drawdown_trigger:.0f} %)",
+    ]
+
+    status = "ausgelöst" if triggered else "Daten unvollständig" if payout_ratio is None else "nicht ausgelöst"
+    return pd.Series({
+        "drawdown_1y_high_pct": drawdown,
+        "value_score": value_score,
+        "value_coverage": round(value_coverage, 1),
+        "value_trigger": triggered,
+        "value_status": status,
+        "value_reason": " | ".join(reasons),
+    })
+
+
+def enrich_with_scores(
+    metrics: pd.DataFrame,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
 ) -> pd.DataFrame:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    entries = []
+    if metrics is None or metrics.empty:
+        return empty_metrics_frame()
+    result = metrics.copy()
+    total_score = result.apply(compute_total_score, axis=1)
+    result = pd.concat([result, total_score], axis=1)
+    value = result.apply(
+        lambda row: compute_value_trigger_and_score(
+            row,
+            drawdown_trigger=drawdown_trigger,
+            payout_max=payout_max,
+            score_min=score_min,
+            yield_min=yield_min,
+        ),
+        axis=1,
+    )
+    return pd.concat([result, value], axis=1)
 
-    keywords = set()
-    if ticker:
-        keywords.add(ticker.lower())
 
-    if company_name:
-        name = company_name.lower()
-        for suf in [" ag", " se", " sa", " s.a.", " plc", " n.v.", " gmbh",
-                    " & co. kg", " kgaa", " kg"]:
-            if name.endswith(suf):
-                name = name[: -len(suf)]
-                break
-        name = name.strip()
-        if name:
-            keywords.add(name)
-            for part in name.split():
-                if len(part) > 2:
-                    keywords.add(part)
+# -----------------------------------------------------------------------------
+# Währungen und Portfolio
+# -----------------------------------------------------------------------------
+
+
+def currency_code(currency: Any) -> str:
+    value = str(currency or "EUR").strip()
+    aliases = {"GBp": "GBP", "GBX": "GBP", "p": "GBP", "USD": "USD", "EUR": "EUR"}
+    return aliases.get(value, value.upper())
+
+
+def currency_unit_multiplier(currency: Any) -> float:
+    return 0.01 if str(currency or "").strip() in {"GBp", "GBX", "p"} else 1.0
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fx_to_eur(currency: str) -> Optional[float]:
+    """Umrechnung von Kurswährung in EUR via Yahoo-FX-Paaren."""
+    raw_currency = str(currency or "EUR").strip()
+    code = currency_code(raw_currency)
+    multiplier = currency_unit_multiplier(raw_currency)
+    if code == "EUR":
+        return multiplier
+
+    pair_map = {
+        "USD": "EURUSD=X",
+        "GBP": "EURGBP=X",
+        "CHF": "EURCHF=X",
+        "JPY": "EURJPY=X",
+        "CAD": "EURCAD=X",
+        "AUD": "EURAUD=X",
+        "SEK": "EURSEK=X",
+        "NOK": "EURNOK=X",
+        "DKK": "EURDKK=X",
+    }
+    pair = pair_map.get(code)
+    if not pair:
+        return None
+
+    try:
+        history = yf.Ticker(pair).history(period="5d", auto_adjust=False)
+        close = pd.to_numeric(history.get("Close"), errors="coerce").dropna()
+        rate = safe_float(close.iloc[-1]) if not close.empty else None
+    except Exception:
+        rate = None
+    if rate in (None, 0):
+        return None
+    # EURUSD=X bedeutet USD je EUR. Für USD -> EUR wird invertiert.
+    return multiplier / rate
+
+
+def read_portfolio() -> pd.DataFrame:
+    if not PORTFOLIO_PATH.exists():
+        return pd.DataFrame(columns=["ticker_yahoo", "shares", "cost_basis", "currency", "purchase_date"])
+    try:
+        portfolio = pd.read_csv(PORTFOLIO_PATH)
+    except Exception as error:
+        raise RuntimeError(f"portfolio.csv konnte nicht gelesen werden: {error}") from error
+
+    required = {"ticker_yahoo", "shares", "cost_basis"}
+    missing = required - set(portfolio.columns)
+    if missing:
+        raise ValueError(f"portfolio.csv fehlt: {', '.join(sorted(missing))}")
+
+    portfolio = portfolio.copy()
+    portfolio["ticker_yahoo"] = portfolio["ticker_yahoo"].map(clean_ticker)
+    portfolio["shares"] = pd.to_numeric(portfolio["shares"], errors="coerce")
+    portfolio["cost_basis"] = pd.to_numeric(portfolio["cost_basis"], errors="coerce")
+    if "currency" not in portfolio.columns:
+        portfolio["currency"] = None
+    if "purchase_date" not in portfolio.columns:
+        portfolio["purchase_date"] = None
+    return portfolio.dropna(subset=["ticker_yahoo", "shares", "cost_basis"])
+
+
+def build_portfolio_view(metrics: pd.DataFrame, portfolio: pd.DataFrame) -> pd.DataFrame:
+    if metrics.empty or portfolio.empty:
+        return pd.DataFrame()
+
+    metric_columns = [
+        "ticker_yahoo", "name", "sector", "currency", "last_price", "dividend_yield",
+        "dividend_per_share", "total_score", "value_score", "value_trigger",
+    ]
+    available_columns = [column for column in metric_columns if column in metrics.columns]
+    result = portfolio.merge(metrics[available_columns], on="ticker_yahoo", how="left", suffixes=("", "_asset"))
+
+    asset_currency = result.get("currency_asset", result.get("currency", "EUR"))
+    result["asset_currency"] = asset_currency.fillna("EUR") if isinstance(asset_currency, pd.Series) else "EUR"
+    result["cost_currency"] = (
+        result["currency"].replace(r"^\s*$", pd.NA, regex=True).fillna(result["asset_currency"])
+        if "currency" in result.columns else result["asset_currency"]
+    )
+    result["fx_asset_to_eur"] = result["asset_currency"].map(fx_to_eur)
+    result["fx_cost_to_eur"] = result["cost_currency"].map(fx_to_eur)
+
+    result["market_value_local"] = result["shares"] * pd.to_numeric(result["last_price"], errors="coerce")
+    result["market_value_eur"] = result["market_value_local"] * result["fx_asset_to_eur"]
+    result["cost_value_eur"] = result["shares"] * result["cost_basis"] * result["fx_cost_to_eur"]
+    result["pnl_abs_eur"] = result["market_value_eur"] - result["cost_value_eur"]
+    result["pnl_pct"] = result["pnl_abs_eur"] / result["cost_value_eur"] * 100
+
+    result["dividend_income_local"] = result["shares"] * pd.to_numeric(result["dividend_per_share"], errors="coerce")
+    result["dividend_income_eur"] = result["dividend_income_local"] * result["fx_asset_to_eur"]
+    result["yield_on_cost"] = pd.to_numeric(result["dividend_per_share"], errors="coerce") / result["cost_basis"] * 100
+
+    total_value = result["market_value_eur"].sum(skipna=True)
+    result["weight_pct"] = result["market_value_eur"] / total_value * 100 if total_value > 0 else None
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Watchlist
+# -----------------------------------------------------------------------------
+
+
+def read_watchlist() -> pd.DataFrame:
+    columns = ["ticker_yahoo", "name", "sector", "added_at", "note"]
+    if not WATCHLIST_PATH.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        watchlist = pd.read_csv(WATCHLIST_PATH)
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in watchlist.columns:
+            watchlist[column] = ""
+    return watchlist[columns]
+
+
+def add_to_watchlist(ticker: str, name: str, sector: str) -> bool:
+    watchlist = read_watchlist()
+    ticker = clean_ticker(ticker)
+    if ticker in watchlist["ticker_yahoo"].astype(str).tolist():
+        return False
+    new_row = pd.DataFrame([{
+        "ticker_yahoo": ticker,
+        "name": name,
+        "sector": sector,
+        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "note": "",
+    }])
+    pd.concat([watchlist, new_row], ignore_index=True).to_csv(WATCHLIST_PATH, index=False)
+    return True
+
+
+def remove_from_watchlist(ticker: str) -> None:
+    watchlist = read_watchlist()
+    watchlist = watchlist[watchlist["ticker_yahoo"].astype(str) != clean_ticker(ticker)]
+    watchlist.to_csv(WATCHLIST_PATH, index=False)
+
+
+# -----------------------------------------------------------------------------
+# News und Sentiment
+# -----------------------------------------------------------------------------
+
+
+def company_aliases(company_name: str, ticker: str) -> list[str]:
+    """Wenige, möglichst präzise Suchbegriffe statt riskanter Einzelwortsuche."""
+    normalized = str(company_name or "").lower().strip()
+    normalized = re.sub(r"\b(ag|se|sa|s\.a\.|plc|n\.v\.|gmbh|kgaa|inc\.?|corp\.?|ltd\.?)$", "", normalized).strip()
+    aliases = {normalized, clean_ticker(ticker).split(".")[0].lower()}
+    # Nur lange Bestandteile aufnehmen; kurze Wortteile führen zu vielen False Positives.
+    aliases.update(part for part in normalized.split() if len(part) >= 5)
+    return sorted(alias for alias in aliases if len(alias) >= 3)
+
+
+def contains_alias(text: str, aliases: list[str]) -> bool:
+    lower_text = text.lower()
+    return any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lower_text) for alias in aliases)
+
+
+def simple_sentiment(text: str) -> tuple[int, str]:
+    lower_text = text.lower()
+    positive = sum(1 for word in POSITIVE_WORDS if word in lower_text)
+    negative = sum(1 for word in NEGATIVE_WORDS if word in lower_text)
+    score = positive - negative
+    label = "positiv" if score > 0 else "negativ" if score < 0 else "neutral"
+    return score, label
+
+
+def entry_datetime(entry: Any) -> Optional[datetime]:
+    raw = entry.get("published") or entry.get("updated")
+    if raw:
+        try:
+            parsed = dateparser.parse(raw)
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        except Exception:
+            pass
+    for field in ("published_parsed", "updated_parsed"):
+        parsed_struct = entry.get(field)
+        if parsed_struct:
+            try:
+                return datetime(
+                    parsed_struct.tm_year, parsed_struct.tm_mon, parsed_struct.tm_mday,
+                    parsed_struct.tm_hour, parsed_struct.tm_min, parsed_struct.tm_sec,
+                    tzinfo=timezone.utc,
+                )
+            except Exception:
+                continue
+    return None
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def fetch_news_for_ticker(ticker: str, company_name: str, days_back: int, max_items: int = 50) -> pd.DataFrame:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days_back))
+    aliases = company_aliases(company_name, ticker)
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
 
     for url in RSS_SOURCES:
         try:
             feed = feedparser.parse(url)
+            source_name = getattr(feed, "feed", {}).get("title", url)
         except Exception:
             continue
 
-        if not getattr(feed, "entries", None):
-            continue
-
-        for entry in feed.entries:
-            title = entry.get("title", "") or ""
-            summary = entry.get("summary", "") or ""
-            link = entry.get("link", "") or ""
-
-            published_raw = entry.get("published", None)
-            published = None
-
-            if published_raw:
-                try:
-                    published = dateparser.parse(published_raw)
-                except Exception:
-                    published = None
-
-            if published is None and hasattr(entry, "published_parsed"):
-                try:
-                    ts = entry.published_parsed
-                    published = datetime(
-                        ts.tm_year, ts.tm_mon, ts.tm_mday,
-                        ts.tm_hour, ts.tm_min, ts.tm_sec,
-                        tzinfo=timezone.utc,
-                    )
-                except Exception:
-                    published = None
-
-            if published is None:
+        for entry in getattr(feed, "entries", []):
+            title = str(entry.get("title", "") or "")
+            summary = str(entry.get("summary", "") or "")
+            link = str(entry.get("link", "") or "")
+            published = entry_datetime(entry)
+            if not title or published is None or published < cutoff:
                 continue
 
-            if published.tzinfo is None:
-                published = published.replace(tzinfo=timezone.utc)
-            else:
-                published = published.astimezone(timezone.utc)
-
-            if published < cutoff:
+            text = f"{title} {summary}"
+            if not contains_alias(text, aliases):
                 continue
-
-            text_full = f"{title} {summary}".lower()
-            if keywords and not any(k in text_full for k in keywords):
+            dedupe_key = (re.sub(r"\W+", "", title.lower()), link.split("?")[0])
+            if dedupe_key in seen:
                 continue
+            seen.add(dedupe_key)
 
-            sent_score = simple_sentiment(text_full)
-            sent_label = "positiv" if sent_score > 0 else "negativ" if sent_score < 0 else "neutral"
-
+            score, label = simple_sentiment(text)
             entries.append({
-                "published": published,
+                "published": published.replace(tzinfo=None),
                 "title": title,
                 "link": link,
-                "sentiment_score": sent_score,
-                "sentiment_label": sent_label,
+                "source": source_name,
+                "sentiment_score": score,
+                "sentiment_label": label,
             })
 
     if not entries:
-        return pd.DataFrame(columns=["published", "title", "link", "sentiment_score", "sentiment_label"])
+        return pd.DataFrame(columns=["published", "title", "link", "source", "sentiment_score", "sentiment_label"])
+    return pd.DataFrame(entries).sort_values("published", ascending=False).head(max_items).reset_index(drop=True)
 
+
+# -----------------------------------------------------------------------------
+# Charts und Tabellendarstellung
+# -----------------------------------------------------------------------------
+
+
+def colorize_change(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return ""
+    return "color: #16a34a; font-weight: 600" if number > 0 else "color: #dc2626; font-weight: 600" if number < 0 else ""
+
+
+def colorize_score(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return ""
+    return "color: #16a34a; font-weight: 700" if number >= 70 else "color: #d97706; font-weight: 700" if number >= 45 else "color: #dc2626; font-weight: 700"
+
+
+def colorize_value_trigger(value: Any) -> str:
+    if value is True:
+        return "background-color: #dcfce7; color: #166534; font-weight: 700"
+    if value is False:
+        return "color: #6b7280"
+    return ""
+
+
+def make_price_chart(
+    history: pd.DataFrame,
+    period_label: str,
+    show_smas: bool,
+    news: Optional[pd.DataFrame] = None,
+) -> Optional[alt.Chart]:
+    if history is None or history.empty or "Close" not in history.columns:
+        return None
+
+    frame = history.copy()
+    frame = ensure_datetime_index(frame)
+    frame["Kurs"] = pd.to_numeric(frame["Close"], errors="coerce")
+    frame = frame.dropna(subset=["Kurs"])
+    if frame.empty:
+        return None
+
+    # WICHTIG: SMA zuerst auf vollständiger Historie berechnen, dann Zeitraum filtern.
+    frame["SMA 20"] = frame["Kurs"].rolling(20, min_periods=20).mean()
+    frame["SMA 50"] = frame["Kurs"].rolling(50, min_periods=50).mean()
+    frame["SMA 200"] = frame["Kurs"].rolling(200, min_periods=200).mean()
+
+    days_by_period = {"2 Monate": 62, "6 Monate": 135, "1 Jahr": 260, "5 Jahre": 2000}
+    visible = frame.tail(days_by_period.get(period_label, 260)).copy().reset_index()
+    visible = visible.rename(columns={visible.columns[0]: "Datum"})
+
+    base = alt.Chart(visible).mark_line(strokeWidth=2).encode(
+        x=alt.X("Datum:T", title="Datum"),
+        y=alt.Y("Kurs:Q", title="Kurs", scale=alt.Scale(zero=False)),
+        tooltip=[alt.Tooltip("Datum:T", format="%d.%m.%Y"), alt.Tooltip("Kurs:Q", format=".2f")],
+    )
+    layers: list[alt.Chart] = [base]
+
+    if show_smas:
+        for sma_name in SMA_COLORS:
+            sma_frame = visible[["Datum", sma_name]].dropna().copy()
+            if sma_frame.empty:
+                continue
+            sma_frame["Linie"] = sma_name
+            layers.append(
+                alt.Chart(sma_frame).mark_line(strokeWidth=1.7).encode(
+                    x="Datum:T",
+                    y=alt.Y(f"{sma_name}:Q", title="Kurs", scale=alt.Scale(zero=False)),
+                    color=alt.Color(
+                        "Linie:N",
+                        scale=alt.Scale(domain=list(SMA_COLORS), range=list(SMA_COLORS.values())),
+                        legend=alt.Legend(title="Durchschnitte", orient="bottom"),
+                    ),
+                    tooltip=[alt.Tooltip("Datum:T", format="%d.%m.%Y"), alt.Tooltip(f"{sma_name}:Q", format=".2f")],
+                )
+            )
+
+    if news is not None and not news.empty and "published" in news.columns:
+        event_frame = news.copy()
+        event_frame["Datum"] = pd.to_datetime(event_frame["published"], errors="coerce").dt.normalize()
+        event_frame = event_frame.dropna(subset=["Datum"])
+        event_frame = event_frame[event_frame["Datum"].between(visible["Datum"].min(), visible["Datum"].max())]
+        if not event_frame.empty:
+            price_lookup = visible[["Datum", "Kurs"]].sort_values("Datum")
+            event_frame = pd.merge_asof(
+                event_frame.sort_values("Datum"), price_lookup, on="Datum", direction="nearest"
+            )
+            layers.append(
+                alt.Chart(event_frame).mark_point(filled=True, size=65).encode(
+                    x="Datum:T",
+                    y=alt.Y("Kurs:Q", scale=alt.Scale(zero=False)),
+                    color=alt.Color(
+                        "sentiment_label:N",
+                        scale=alt.Scale(domain=["positiv", "neutral", "negativ"], range=["#16a34a", "#64748b", "#dc2626"]),
+                        legend=alt.Legend(title="News", orient="bottom"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("Datum:T", format="%d.%m.%Y"),
+                        "title:N", "source:N", "sentiment_label:N", "link:N",
+                    ],
+                )
+            )
+
+    return alt.layer(*layers).resolve_scale(y="shared").properties(height=360)
+
+
+def overview_styler(df: pd.DataFrame) -> Any:
+    formats = {
+        "last_price": "{:.2f}", "change_1d": "{:+.2f}%", "change_5d": "{:+.2f}%",
+        "change_1y": "{:+.2f}%", "vol_1y": "{:.1f}%", "total_score": "{:.1f}",
+        "score_coverage": "{:.0f}%", "value_score": "{:.1f}",
+        "drawdown_1y_high_pct": "{:+.1f}%", "dividend_yield": "{:.2f}%",
+    }
     return (
-        pd.DataFrame(entries)
-        .sort_values("published", ascending=False)
-        .head(max_items)
-        .reset_index(drop=True)
+        df.style.format({key: value for key, value in formats.items() if key in df.columns}, na_rep="–")
+        .map(colorize_change, subset=[column for column in ["change_1d", "change_5d", "change_1y"] if column in df.columns])
+        .map(colorize_score, subset=[column for column in ["total_score"] if column in df.columns])
+        .map(colorize_value_trigger, subset=[column for column in ["value_trigger"] if column in df.columns])
     )
 
 
-# -----------------------------
-# Graph
-# -----------------------------
-
-def build_graph(df: pd.DataFrame) -> nx.Graph:
-    G = nx.Graph()
-    for _, row in df.iterrows():
-        ticker = row["ticker_yahoo"]
-        sector = row.get("sector", None)
-        price = row.get("last_price", None)
-
-        label_price = "n/a" if pd.isna(price) else f"{price:.2f}"
-        label = f"{ticker}\n{label_price}"
-
-        G.add_node(ticker, label=label, sector=sector)
-
-    for sector in df["sector"].dropna().unique():
-        same_sector = df[df["sector"] == sector]["ticker_yahoo"].tolist()
-        for i in range(len(same_sector)):
-            for j in range(i + 1, len(same_sector)):
-                G.add_edge(same_sector[i], same_sector[j], relation="same_sector")
-
-    return G
-
-def draw_graph(G: nx.Graph):
-    if len(G.nodes) == 0:
-        return None
-
-    pos = nx.circular_layout(G)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    nx.draw_networkx_nodes(G, pos, ax=ax)
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3)
-    nx.draw_networkx_labels(G, pos, labels={n: n for n in G.nodes()}, font_size=8, ax=ax)
-    ax.set_axis_off()
-    fig.tight_layout()
-    return fig
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
 
 
-# -----------------------------
-# Score & Styling
-# -----------------------------
+def show_header() -> None:
+    st.title("Aktien Explorer")
+    st.caption(
+        f"Version {APP_VERSION} · Fundamentaldaten, Value-Scanner, Portfolio und News. "
+        "Keine Anlageberatung – Daten vor Entscheidungen immer selbst prüfen."
+    )
 
-def compute_total_score(row: pd.Series) -> Optional[float]:
-    score = 0.0
-    max_score = 0.0
 
-    roe = row.get("roe")
-    if pd.notna(roe):
-        max_score += 25
-        score += 25 if roe >= 20 else 20 if roe >= 15 else 15 if roe >= 10 else 10 if roe >= 5 else 0
+def render_overview(df: pd.DataFrame) -> None:
+    st.subheader("Überblick")
+    if df.empty:
+        st.info("Keine Daten für die aktuelle Filtereinstellung.")
+        return
 
-    net_margin = row.get("net_margin")
-    if pd.notna(net_margin):
-        max_score += 20
-        score += 20 if net_margin >= 20 else 16 if net_margin >= 15 else 12 if net_margin >= 10 else 8 if net_margin >= 5 else 0
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Unternehmen", f"{len(df):,}".replace(",", "."))
+    metric_columns[1].metric("Trigger", int(df["value_trigger"].fillna(False).sum()))
+    metric_columns[2].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
+    metric_columns[3].metric("Ø 1J-Performance", format_percent(df["change_1y"].mean(), 1, signed=True))
 
-    div_yield = row.get("dividend_yield")
-    if pd.notna(div_yield):
-        max_score += 20
-        score += 20 if 2 <= div_yield <= 6 else 10 if 1 <= div_yield < 2 else 8 if 6 < div_yield <= 10 else 0
+    columns = [
+        "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d", "change_5d",
+        "change_1y", "vol_1y", "dividend_yield", "total_score", "score_coverage", "value_score",
+        "drawdown_1y_high_pct", "value_trigger",
+    ]
+    visible_columns = [column for column in columns if column in df.columns]
+    st.dataframe(overview_styler(df[visible_columns]), use_container_width=True, hide_index=True)
 
-    dte = row.get("debt_to_equity")
-    if pd.notna(dte):
-        max_score += 15
-        score += 15 if dte < 0.5 else 12 if dte < 1.0 else 8 if dte < 2.0 else 4 if dte < 3.0 else 0
 
-    vol_1y = row.get("vol_1y")
-    if pd.notna(vol_1y):
-        max_score += 20
-        score += 20 if vol_1y <= 20 else 15 if vol_1y <= 30 else 8 if vol_1y <= 40 else 0
+def render_fundamentals(df: pd.DataFrame) -> None:
+    st.subheader("Fundamentaldaten")
+    columns = [
+        "name", "ticker_yahoo", "currency", "market_cap", "pe_ratio", "forward_pe", "pb_ratio",
+        "ps_ratio", "ev_ebitda", "net_margin", "operating_margin", "roe", "roa", "dividend_yield",
+        "dividend_per_share", "payout_ratio", "dividend_growth_5y", "dividend_frequency",
+        "debt_to_equity", "net_debt_ebitda", "score_raw", "score_coverage", "total_score",
+    ]
+    visible_columns = [column for column in columns if column in df.columns]
+    formats = {
+        "market_cap": "{:.0f}", "pe_ratio": "{:.2f}", "forward_pe": "{:.2f}", "pb_ratio": "{:.2f}",
+        "ps_ratio": "{:.2f}", "ev_ebitda": "{:.2f}", "net_margin": "{:.2f}%",
+        "operating_margin": "{:.2f}%", "roe": "{:.2f}%", "roa": "{:.2f}%", "dividend_yield": "{:.2f}%",
+        "dividend_per_share": "{:.2f}", "payout_ratio": "{:.2f}%", "dividend_growth_5y": "{:.2f}%",
+        "debt_to_equity": "{:.2f}x", "net_debt_ebitda": "{:.2f}x", "score_raw": "{:.1f}",
+        "score_coverage": "{:.0f}%", "total_score": "{:.1f}",
+    }
+    styled = (
+        df[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
+        .map(colorize_score, subset=["total_score"])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption("Market Cap ist in der Originalwährung der Aktie. Score und Value-Score sind heuristische Recherchehilfen.")
 
-    if max_score == 0:
-        return None
-    return round(score / max_score * 100.0, 1)
 
-def colorize_change(val):
-    if pd.isna(val):
-        return ""
-    color = "green" if val > 0 else "red" if val < 0 else "black"
-    return f"color: {color}"
+def render_value_watchlist(df: pd.DataFrame) -> None:
+    st.subheader("Dividenden-Value-Scanner")
+    st.caption("Ein Trigger verlangt ausreichend Score-Daten, kontrollierte Ausschüttungsquote, Mindest-Rendite und klaren Drawdown.")
+    columns = [
+        "name", "ticker_yahoo", "sector", "total_score", "score_coverage", "value_score", "value_coverage",
+        "value_status", "value_trigger", "dividend_yield", "payout_ratio", "pe_ratio", "pb_ratio",
+        "drawdown_1y_high_pct", "value_reason",
+    ]
+    visible_columns = [column for column in columns if column in df.columns]
+    result = df.sort_values(["value_trigger", "value_score"], ascending=[False, False], na_position="last")
+    formats = {
+        "total_score": "{:.1f}", "score_coverage": "{:.0f}%", "value_score": "{:.1f}",
+        "value_coverage": "{:.0f}%", "dividend_yield": "{:.2f}%", "payout_ratio": "{:.2f}%",
+        "pe_ratio": "{:.2f}", "pb_ratio": "{:.2f}", "drawdown_1y_high_pct": "{:+.1f}%",
+    }
+    styled = (
+        result[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
+        .map(colorize_score, subset=["total_score"])
+        .map(colorize_value_trigger, subset=["value_trigger"])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-def colorize_score(val):
-    if pd.isna(val):
-        return ""
-    color = "green" if val >= 70 else "orange" if val >= 40 else "red"
-    return f"color: {color}"
 
-def colorize_value_trigger(val):
-    if pd.isna(val):
-        return ""
-    if val is True:
-        return "color: green; font-weight: 700"
-    if val is False:
-        return "color: #666"
-    return ""
+def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Einzelanalyse & Chart")
+    ticker = st.selectbox("Aktie auswählen", df["ticker_yahoo"].tolist(), key="analysis_ticker")
+    row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
 
-def safe_float(x) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return None
-        return float(x)
-    except Exception:
-        return None
+    columns = st.columns(5)
+    columns[0].metric("Letzter Kurs", f"{format_number(row.get('last_price'), 2)} {row.get('currency', '')}")
+    columns[1].metric("Volatilität 1J", format_percent(row.get("vol_1y"), 1))
+    columns[2].metric("Qualitäts-Score", format_number(row.get("total_score"), 1))
+    columns[3].metric("Datenabdeckung", format_percent(row.get("score_coverage"), 0))
+    columns[4].metric("Value-Score", format_number(row.get("value_score"), 1))
 
-def sector_yield_trigger(sector: Optional[str]) -> float:
-    if not sector:
-        return YIELD_TRIGGER_BY_SECTOR["_default"]
-    return YIELD_TRIGGER_BY_SECTOR.get(sector, YIELD_TRIGGER_BY_SECTOR["_default"])
+    left, right = st.columns([2, 1])
+    with right:
+        st.markdown("**Score-Komponenten**")
+        st.caption(str(row.get("score_components", "–")))
+        st.markdown("**Value-Check**")
+        st.caption(str(row.get("value_reason", "–")))
+        if st.button("Zur Watchlist hinzufügen", key=f"watch_{ticker}"):
+            if add_to_watchlist(ticker, str(row.get("name", ticker)), str(row.get("sector", "Unbekannt"))):
+                st.success(f"{ticker} wurde gespeichert.")
+            else:
+                st.info(f"{ticker} ist bereits auf der Watchlist.")
 
-def compute_value_trigger_and_score(row: pd.Series,
-                                    drawdown_trigger: float,
-                                    payout_max: float,
-                                    score_min: float) -> pd.Series:
-    """
-    Erzeugt:
-      - drawdown_1y_high_pct (negativ = unter Hoch)
-      - value_trigger (bool)
-      - value_score (0..100)
-      - value_reason (string)
-    """
-    last_price = safe_float(row.get("last_price"))
-    high_52w = safe_float(row.get("high_52w"))
-    div_yield = safe_float(row.get("dividend_yield"))
-    payout = safe_float(row.get("payout_ratio"))
-    total_score = safe_float(row.get("total_score"))
-    pe = safe_float(row.get("pe_ratio"))
-    sector = row.get("sector")
-
-    # Drawdown vom 52W-Hoch
-    dd = None
-    if last_price and high_52w and high_52w != 0:
-        dd = (last_price / high_52w - 1.0) * 100.0  # negativ bei drawdown
-
-    # Triggerbedingungen
-    reasons = []
-    ok_score = (total_score is not None and total_score >= score_min)
-    ok_payout = (payout is None) or (payout < payout_max)  # fehlende payout_ratio nicht bestrafen
-    y_trigger = sector_yield_trigger(sector)
-    ok_yield = (div_yield is not None and div_yield >= max(ABSOLUTE_MIN_YIELD_FOR_VALUE, y_trigger))
-    ok_drawdown = (dd is not None and abs(dd) >= drawdown_trigger and dd < 0)
-
-    if ok_score:
-        reasons.append(f"Score≥{score_min:.0f}")
-    else:
-        reasons.append(f"Score<{score_min:.0f}")
-
-    if ok_payout:
-        reasons.append(f"Payout<{payout_max:.0f}% (oder n/a)")
-    else:
-        reasons.append(f"Payout≥{payout_max:.0f}%")
-
-    if ok_yield:
-        reasons.append(f"Yield≥{max(ABSOLUTE_MIN_YIELD_FOR_VALUE, y_trigger):.1f}%")
-    else:
-        reasons.append(f"Yield<{max(ABSOLUTE_MIN_YIELD_FOR_VALUE, y_trigger):.1f}%")
-
-    if ok_drawdown:
-        reasons.append(f"DD≥{drawdown_trigger:.0f}%")
-    else:
-        reasons.append(f"DD<{drawdown_trigger:.0f}%")
-
-    # Gesamttrigger: ""
-    value_trigger = bool(ok_score and ok_payout and ok_yield and ok_drawdown)
-
-    # Value-Score (0..100): Kombi aus Drawdown, Yield, PE (wenn vorhanden)
-    # - Drawdown: bis 50% -> 0..60 Punkte
-    # - Yield: bis 12% -> 0..25 Punkte
-    # - PE: günstig -> 0..15 Punkte (wenn PE fehlt -> 7 Punkte neutral)
-    val_score = 0.0
-
-    # Drawdown Anteil
-    if dd is not None and dd < 0:
-        dd_abs = min(abs(dd), 50.0)
-        val_score += (dd_abs / 50.0) * 60.0
-
-    # Yield Anteil
-    if div_yield is not None:
-        y = min(div_yield, 12.0)
-        val_score += (y / 12.0) * 25.0
-
-    # PE Anteil (heuristisch)
-    if pe is None:
-        val_score += 7.0
-    else:
-        # 6..18 ist "günstig bis ok" => max Punkte; >30 => 0
-        if pe <= 10:
-            val_score += 15.0
-        elif pe <= 18:
-            val_score += 10.0
-        elif pe <= 30:
-            val_score += 5.0
+    with left:
+        period = st.selectbox("Chart-Zeitraum", ["2 Monate", "6 Monate", "1 Jahr", "5 Jahre"], index=2)
+        show_smas = st.checkbox("SMA 20 / 50 / 200 anzeigen", value=True)
+        news_key = f"news::{ticker}"
+        news = st.session_state.get(news_key)
+        chart = make_price_chart(histories.get(ticker, pd.DataFrame()), period, show_smas, news)
+        if chart is None:
+            st.info("Für diese Aktie sind keine Kursdaten verfügbar.")
         else:
-            val_score += 0.0
-
-    val_score = round(min(max(val_score, 0.0), 100.0), 1)
-    reason_str = " | ".join(reasons)
-
-    return pd.Series({
-        "drawdown_1y_high_pct": dd,
-        "value_trigger": value_trigger,
-        "value_score": val_score,
-        "value_reason": reason_str,
-    })
+            st.altair_chart(chart, use_container_width=True)
+            if news is not None and not news.empty:
+                st.caption("Punkte im Chart stehen für die zuletzt geladenen News zu dieser Aktie.")
 
 
-SMA_COLORS = {
-    "SMA20": "#ff4d4d",
-    "SMA50": "#ff9dbb",
-    "SMA200": "#2ec4b6",
-}
+def render_sector_view(df: pd.DataFrame) -> None:
+    st.subheader("Sektor-Übersicht")
+    sector_stats = (
+        df.groupby("sector", dropna=False)
+        .agg(
+            Unternehmen=("ticker_yahoo", "count"),
+            Performance_1J=("change_1y", "mean"),
+            Qualitäts_Score=("total_score", "mean"),
+            Value_Score=("value_score", "mean"),
+            Trigger=("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
+        )
+        .reset_index()
+        .sort_values("Value_Score", ascending=False, na_position="last")
+    )
+    st.dataframe(
+        sector_stats.style.format(
+            {"Performance_1J": "{:+.2f}%", "Qualitäts_Score": "{:.1f}", "Value_Score": "{:.1f}"},
+            na_rep="–",
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    chart = alt.Chart(sector_stats.dropna(subset=["Performance_1J"])).mark_bar().encode(
+        x=alt.X("Performance_1J:Q", title="Ø Performance 1 Jahr (%)"),
+        y=alt.Y("sector:N", sort="-x", title="Sektor"),
+        tooltip=["sector:N", "Unternehmen:Q", alt.Tooltip("Performance_1J:Q", format=".2f")],
+    ).properties(height=max(220, 30 * len(sector_stats)))
+    st.altair_chart(chart, use_container_width=True)
 
 
-# -----------------------------
-# Portfolio
-# -----------------------------
+def render_news(df: pd.DataFrame) -> None:
+    st.subheader("News & Ereignisse")
+    st.caption("RSS-News werden per Unternehmensalias zugeordnet. Das Sentiment ist eine einfache deutsch/englische Heuristik, kein Signal.")
+    ticker = st.selectbox("Aktie für News", df["ticker_yahoo"].tolist(), key="news_ticker")
+    days_back = st.slider("Zeitraum", min_value=3, max_value=90, value=30, step=1, key="news_days")
+    row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+    key = f"news::{ticker}"
 
-def build_portfolio_view(df_with_metrics: pd.DataFrame, portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    if df_with_metrics is None or df_with_metrics.empty:
-        return pd.DataFrame()
-    if portfolio_df is None or portfolio_df.empty:
-        return pd.DataFrame()
+    if st.button("News aktualisieren", key=f"refresh_news_{ticker}"):
+        with st.spinner("RSS-Feeds werden durchsucht …"):
+            st.session_state[key] = fetch_news_for_ticker(
+                ticker=ticker,
+                company_name=str(row.get("name", ticker)),
+                days_back=days_back,
+            )
 
-    required_cols = {"ticker_yahoo", "shares", "cost_basis"}
-    if not required_cols.issubset(set(portfolio_df.columns)):
-        missing = required_cols - set(portfolio_df.columns)
-        st.error(f"Im Portfolio fehlen Spalten: {missing}")
-        return pd.DataFrame()
+    news = st.session_state.get(key)
+    if news is None:
+        st.info("Noch keine News geladen.")
+    elif news.empty:
+        st.info("In den hinterlegten RSS-Feeds wurden keine passenden aktuellen Einträge gefunden.")
+    else:
+        show_columns = ["published", "title", "source", "sentiment_label", "sentiment_score", "link"]
+        st.dataframe(news[show_columns], use_container_width=True, hide_index=True)
+        st.download_button(
+            "News als CSV herunterladen",
+            data=news.to_csv(index=False).encode("utf-8"),
+            file_name=f"news_{ticker.lower()}.csv",
+            mime="text/csv",
+            key=f"download_news_{ticker}",
+        )
 
-    df_metrics = df_with_metrics.copy()
-    port = portfolio_df.copy()
 
-    df_metrics["ticker_yahoo"] = df_metrics["ticker_yahoo"].astype(str).str.strip()
-    port["ticker_yahoo"] = port["ticker_yahoo"].astype(str).str.strip()
+def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Portfolio")
+    st.caption("portfolio.csv: ticker_yahoo, shares, cost_basis, currency (optional), purchase_date (optional)")
+    try:
+        portfolio = read_portfolio()
+    except Exception as error:
+        st.error(str(error))
+        return
 
-    known_tickers = set(df_metrics["ticker_yahoo"].unique())
-    portfolio_tickers = set(port["ticker_yahoo"].unique())
+    if portfolio.empty:
+        st.info("Keine portfolio.csv gefunden. Lege die Datei neben app.py an und nutze die Beispielstruktur aus dem Kopf des Codes.")
+        return
+
+    portfolio_tickers = set(portfolio["ticker_yahoo"].map(clean_ticker))
+    known_tickers = set(metrics["ticker_yahoo"].map(clean_ticker))
     missing_tickers = sorted(portfolio_tickers - known_tickers)
 
     if missing_tickers:
-        st.info(f"Zusätzliche Ticker werden für das Portfolio nachgeladen: {', '.join(missing_tickers)}")
-        extra_metrics_dict = fetch_metrics(missing_tickers)
+        st.warning("Diese Portfolio-Ticker liegen außerhalb der aktuellen Indexanalyse: " + ", ".join(missing_tickers))
+        if st.button("Fehlende Portfolio-Ticker laden", key="load_portfolio_extras"):
+            companies = pd.DataFrame({
+                "name": missing_tickers,
+                "ticker_yahoo": missing_tickers,
+                "sector": "Unbekannt",
+            })
+            with st.spinner("Zusätzliche Portfolio-Daten werden geladen …"):
+                extra_metrics, extra_histories, extra_errors = collect_metrics(companies)
+            st.session_state["portfolio_extra_metrics"] = extra_metrics
+            st.session_state["portfolio_extra_histories"] = extra_histories
+            if extra_errors:
+                st.warning(" | ".join(extra_errors[:10]))
+            st.rerun()
 
-        extra_rows = []
-        for t in missing_tickers:
-            m = extra_metrics_dict.get(t, {})
-            row = {"ticker_yahoo": t}
-            for k, v in m.items():
-                if k == "history":
-                    continue
-                row[k] = v
-            row.setdefault("name", t)
-            row.setdefault("sector", None)
-            extra_rows.append(row)
+    extras = st.session_state.get("portfolio_extra_metrics", empty_metrics_frame())
+    combined = pd.concat([metrics, extras], ignore_index=True).drop_duplicates(subset=["ticker_yahoo"], keep="first")
+    portfolio_view = build_portfolio_view(combined, portfolio)
 
-        if extra_rows:
-            df_extra = pd.DataFrame(extra_rows)
-            df_metrics = pd.concat([df_metrics, df_extra], ignore_index=True)
+    total_value = portfolio_view["market_value_eur"].sum(skipna=True)
+    total_cost = portfolio_view["cost_value_eur"].sum(skipna=True)
+    total_pnl = portfolio_view["pnl_abs_eur"].sum(skipna=True)
+    total_income = portfolio_view["dividend_income_eur"].sum(skipna=True)
 
-        if "total_score" not in df_metrics.columns:
-            df_metrics["total_score"] = df_metrics.apply(compute_total_score, axis=1)
-        else:
-            mask = df_metrics["total_score"].isna()
-            if mask.any():
-                df_metrics.loc[mask, "total_score"] = df_metrics.loc[mask].apply(compute_total_score, axis=1)
+    columns = st.columns(4)
+    columns[0].metric("Marktwert", f"{format_number(total_value, 0)} EUR")
+    columns[1].metric("Einstandswert", f"{format_number(total_cost, 0)} EUR")
+    columns[2].metric("Gewinn / Verlust", f"{format_number(total_pnl, 0)} EUR", delta=format_percent(total_pnl / total_cost * 100 if total_cost else None, 1, signed=True))
+    columns[3].metric("Dividende p.a. (Schätzung)", f"{format_number(total_income, 0)} EUR")
 
-    merged = port.merge(df_metrics, on="ticker_yahoo", how="left", suffixes=("", "_yahoo"))
-
-    merged["shares"] = merged["shares"].astype(float)
-    merged["cost_basis"] = merged["cost_basis"].astype(float)
-
-    merged["market_value"] = merged["shares"] * merged["last_price"]
-    merged["cost_value"] = merged["shares"] * merged["cost_basis"]
-
-    merged["pnl_abs"] = merged["market_value"] - merged["cost_value"]
-    merged["pnl_pct"] = merged["pnl_abs"] / merged["cost_value"] * 100.0
-
-    total_mv = merged["market_value"].sum(skipna=True)
-    merged["weight_pct"] = (merged["market_value"] / total_mv * 100.0) if total_mv > 0 else 0.0
-
-    merged["dividend_income_est"] = (
-        merged["market_value"] * merged["dividend_yield"].fillna(0) / 100.0
-        if "dividend_yield" in merged.columns else 0.0
+    visible_columns = [
+        "ticker_yahoo", "name", "shares", "cost_basis", "cost_currency", "asset_currency", "last_price",
+        "market_value_eur", "cost_value_eur", "pnl_abs_eur", "pnl_pct", "weight_pct", "dividend_income_eur",
+        "yield_on_cost", "total_score", "value_score", "value_trigger",
+    ]
+    visible_columns = [column for column in visible_columns if column in portfolio_view.columns]
+    formats = {
+        "shares": "{:.4f}", "cost_basis": "{:.2f}", "last_price": "{:.2f}",
+        "market_value_eur": "{:.2f}", "cost_value_eur": "{:.2f}", "pnl_abs_eur": "{:+.2f}",
+        "pnl_pct": "{:+.2f}%", "weight_pct": "{:.2f}%", "dividend_income_eur": "{:.2f}",
+        "yield_on_cost": "{:.2f}%", "total_score": "{:.1f}", "value_score": "{:.1f}",
+    }
+    styled = (
+        portfolio_view[visible_columns].style.format({key: value for key, value in formats.items() if key in visible_columns}, na_rep="–")
+        .map(colorize_change, subset=[column for column in ["pnl_abs_eur", "pnl_pct"] if column in visible_columns])
+        .map(colorize_score, subset=[column for column in ["total_score"] if column in visible_columns])
+        .map(colorize_value_trigger, subset=[column for column in ["value_trigger"] if column in visible_columns])
     )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption("EUR-Werte verwenden aktuelle Yahoo-FX-Kurse. Fehlt eine Umrechnung, bleibt die Position teilweise leer.")
 
-    return merged
+
+def render_watchlist(metrics: pd.DataFrame) -> None:
+    st.subheader("Eigene Watchlist")
+    watchlist = read_watchlist()
+    if watchlist.empty:
+        st.info("Noch keine Titel gespeichert. Nutze in der Einzelanalyse den Button „Zur Watchlist hinzufügen“.")
+        return
+
+    merged = watchlist.merge(metrics, on="ticker_yahoo", how="left", suffixes=("", "_market"))
+    visible_columns = [
+        "ticker_yahoo", "name", "sector", "added_at", "note", "last_price", "currency", "change_1y",
+        "dividend_yield", "total_score", "value_score", "value_trigger",
+    ]
+    visible_columns = [column for column in visible_columns if column in merged.columns]
+    st.dataframe(overview_styler(merged[visible_columns]), use_container_width=True, hide_index=True)
+
+    ticker_to_remove = st.selectbox("Titel von Watchlist entfernen", merged["ticker_yahoo"].tolist(), key="remove_watchlist_ticker")
+    if st.button("Aus Watchlist entfernen", key="remove_watchlist_button"):
+        remove_from_watchlist(ticker_to_remove)
+        st.success(f"{ticker_to_remove} wurde entfernt.")
+        st.rerun()
 
 
-# -----------------------------
-# Streamlit App
-# -----------------------------
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
+    show_header()
 
-def main():
-    st.title("Aktien Explorer – Mini-Tool mit Fundamentaldaten + Schnäppchen Watchlist")
+    # ----- Sidebar: Daten, Filter und Scanner-Parameter -----
+    with st.sidebar:
+        st.header("Analyse-Einstellungen")
+        index_name = st.selectbox("Index", ["DAX 40", "S&P 500"])
+        st.caption("Tipp: Lege optional data/indices/dax40.csv oder sp500.csv an, um Wikipedia als Quelle zu ersetzen.")
 
-    index_name = st.sidebar.selectbox("Index auswählen", ["DAX 40", "S&P 500"])
+        try:
+            constituents = load_index_constituents(index_name)
+        except Exception as error:
+            st.error(f"Index konnte nicht geladen werden: {error}")
+            st.stop()
 
-    # Value-Trigger Settings im Sidebar
-    st.sidebar.header("Schnäppchen-Scanner")
-    drawdown_trigger = st.sidebar.slider("Trigger: % unter 52W-Hoch", 10, 60, int(DEFAULT_DRAWDOWN_TRIGGER), 5)
-    payout_max = st.sidebar.slider("Max. Payout-Ratio (%)", 50, 120, int(DEFAULT_PAYOUT_MAX), 5)
-    score_min = st.sidebar.slider("Min. Total Score", 0, 100, int(DEFAULT_SCORE_MIN), 5)
-    st.sidebar.caption("Ein 'Schnäppchen' ist: Score ok + Payout ok + Yield hoch + klarer Drawdown vom Hoch.")
+        sector_options = ["Alle"] + sorted(constituents["sector"].dropna().astype(str).unique().tolist())
+        selected_sector = st.selectbox("Sektor", sector_options)
+        query = st.text_input("Name oder Ticker suchen").strip()
 
-    df = load_index_constituents(index_name)
-    if df.empty:
+        filtered_constituents = constituents.copy()
+        if selected_sector != "Alle":
+            filtered_constituents = filtered_constituents[filtered_constituents["sector"] == selected_sector]
+        if query:
+            mask = (
+                filtered_constituents["name"].astype(str).str.contains(query, case=False, na=False)
+                | filtered_constituents["ticker_yahoo"].astype(str).str.contains(query, case=False, na=False)
+            )
+            filtered_constituents = filtered_constituents[mask]
+
+        maximum = min(150 if index_name == "S&P 500" else len(filtered_constituents), len(filtered_constituents))
+        if maximum <= 0:
+            st.error("Der Filter enthält keine Unternehmen.")
+            st.stop()
+        default_count = min(40 if index_name == "S&P 500" else 40, maximum)
+        max_stocks = st.slider("Max. Unternehmen laden", min_value=1, max_value=maximum, value=default_count, step=1)
+
+        st.divider()
+        st.header("Dividenden-Value-Scanner")
+        drawdown_trigger = st.slider("Min. Drawdown vom 52W-Hoch", 10, 60, int(DEFAULT_DRAWDOWN_TRIGGER), 5)
+        payout_max = st.slider("Max. Payout Ratio", 40, 120, int(DEFAULT_PAYOUT_MAX), 5)
+        score_min = st.slider("Min. Qualitäts-Score", 0, 100, int(DEFAULT_SCORE_MIN), 5)
+        yield_min = st.slider("Min. Dividendenrendite", 1.0, 10.0, float(DEFAULT_YIELD_MIN), 0.5)
+
+        st.divider()
+        reload_clicked = st.button("Daten laden / aktualisieren", type="primary", use_container_width=True)
+        if st.button("Zwischenspeicher leeren", use_container_width=True):
+            load_index_constituents.clear()
+            download_price_histories.clear()
+            fetch_ticker_info.clear()
+            fetch_dividends.clear()
+            fetch_news_for_ticker.clear()
+            fx_to_eur.clear()
+            st.session_state.pop("metrics_raw", None)
+            st.session_state.pop("histories", None)
+            st.success("Zwischenspeicher wurde geleert.")
+            st.rerun()
+
+    selected_constituents = filtered_constituents.head(max_stocks).reset_index(drop=True)
+    selected_tickers = tuple(selected_constituents["ticker_yahoo"].map(clean_ticker))
+
+    # Rohdaten sind unabhängig von den Sliderwerten. Die Score-Berechnung läuft
+    # bei jeder UI-Änderung neu und braucht keinen erneuten Datenabruf.
+    loaded_tickers = tuple(st.session_state.get("loaded_tickers", ()))
+    if reload_clicked or loaded_tickers != selected_tickers:
+        with st.spinner(f"Lade Daten für {len(selected_constituents)} Unternehmen …"):
+            raw_metrics, histories, errors = collect_metrics(selected_constituents)
+        st.session_state["metrics_raw"] = raw_metrics
+        st.session_state["histories"] = histories
+        st.session_state["loaded_tickers"] = selected_tickers
+        st.session_state["last_refresh"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+        if errors:
+            st.warning("Einige Daten konnten nicht vollständig geladen werden: " + " | ".join(errors[:8]))
+
+    raw_metrics = st.session_state.get("metrics_raw")
+    histories = st.session_state.get("histories", {})
+
+    if raw_metrics is None or raw_metrics.empty:
+        st.info("Wähle links einen Index und klicke auf „Daten laden / aktualisieren“.")
         st.stop()
 
-    # --- Filter ---
-    st.sidebar.header("Filter")
-    sector_options = ["Alle"] + sorted(df["sector"].dropna().unique().tolist())
-    selected_sector = st.sidebar.selectbox("Sektor", sector_options)
-    search_text = st.sidebar.text_input("Suche nach Firmenname oder Ticker (optional)").strip()
-
-    st.subheader("Schritt 1: Kurse, Performance & Fundamentaldaten laden")
-
-    max_stocks = st.sidebar.slider(
-        "Max. Anzahl Unternehmen für Analyse",
-        min_value=20,
-        max_value=min(500, len(df)),
-        value=min(80, len(df)),
-        step=20,
-        help="Je mehr Unternehmen, desto länger dauert der Datenabruf über yfinance."
+    data = enrich_with_scores(
+        raw_metrics,
+        drawdown_trigger=float(drawdown_trigger),
+        payout_max=float(payout_max),
+        score_min=float(score_min),
+        yield_min=float(yield_min),
     )
 
-    key_df = f"df_with_metrics__{index_name}"
-    key_metrics = f"metrics__{index_name}"
+    last_refresh = st.session_state.get("last_refresh", "–")
+    st.caption(f"Aktualisiert: {last_refresh} · {len(data)} Unternehmen analysiert · Basiswährung Portfolio: {BASE_CURRENCY}")
 
-    if st.button("Daten laden / aktualisieren", key=f"btn_reload_{index_name}"):
-        tickers = df["ticker_yahoo"].tolist()[:max_stocks]
-        df = df[df["ticker_yahoo"].isin(tickers)].reset_index(drop=True)
-
-        with st.spinner("Lade Daten über yfinance ..."):
-            metrics = fetch_metrics(tickers)
-
-        def map_metric(col_name: str):
-            return df["ticker_yahoo"].map(lambda t: metrics.get(t, {}).get(col_name))
-
-        # Kurs & Performance
-        df["last_price"] = map_metric("last_price")
-        df["change_1d"] = map_metric("change_1d")
-        df["change_5d"] = map_metric("change_5d")
-        df["change_1y"] = map_metric("change_1y")
-        df["vol_30d"] = map_metric("vol_30d")
-        df["vol_1y"] = map_metric("vol_1y")
-        df["high_52w"] = map_metric("high_52w")
-        df["low_52w"] = map_metric("low_52w")
-
-        # Bewertung & Profitabilität
-        df["market_cap"] = map_metric("market_cap")
-        df["pe_ratio"] = map_metric("pe_ratio")
-        df["forward_pe"] = map_metric("forward_pe")
-        df["pb_ratio"] = map_metric("pb_ratio")
-        df["ps_ratio"] = map_metric("ps_ratio")
-        df["ev_ebitda"] = map_metric("ev_ebitda")
-        df["net_margin"] = map_metric("net_margin")
-        df["operating_margin"] = map_metric("operating_margin")
-        df["roe"] = map_metric("roe")
-        df["roa"] = map_metric("roa")
-
-        # Dividende & Verschuldung
-        df["dividend_yield"] = map_metric("dividend_yield")
-        df["dividend_per_share"] = map_metric("dividend_per_share")
-        df["payout_ratio"] = map_metric("payout_ratio")
-        df["dividend_growth_5y"] = map_metric("dividend_growth_5y")
-        df["dividend_frequency"] = map_metric("dividend_frequency")
-        df["debt_to_equity"] = map_metric("debt_to_equity")
-        df["net_debt_ebitda"] = map_metric("net_debt_ebitda")
-
-        # Total Score
-        df["total_score"] = df.apply(compute_total_score, axis=1)
-
-        # Value / Schnäppchen Scanner
-        value_cols = df.apply(
-            lambda r: compute_value_trigger_and_score(r, drawdown_trigger, payout_max, score_min),
-            axis=1
-        )
-        df = pd.concat([df, value_cols], axis=1)
-
-        st.session_state[key_metrics] = metrics
-        st.session_state[key_df] = df.copy()
-        st.success("Daten aktualisiert!")
-
-    else:
-        if key_df in st.session_state:
-            df = st.session_state[key_df]
-        else:
-            for col in [
-                "last_price", "change_1d", "change_5d", "change_1y",
-                "vol_30d", "vol_1y", "high_52w", "low_52w",
-                "market_cap", "pe_ratio", "forward_pe",
-                "pb_ratio", "ps_ratio", "ev_ebitda", "net_margin",
-                "operating_margin", "roe", "roa", "dividend_yield",
-                "dividend_per_share", "payout_ratio", "dividend_growth_5y",
-                "dividend_frequency", "debt_to_equity", "net_debt_ebitda",
-                "total_score", "drawdown_1y_high_pct", "value_trigger",
-                "value_score", "value_reason"
-            ]:
-                if col not in df.columns:
-                    df[col] = None
-
-    # --- Filter anwenden ---
-    df_view = df.copy()
-    if selected_sector != "Alle":
-        df_view = df_view[df_view["sector"] == selected_sector]
-
-    if search_text:
-        mask = (
-            df_view["name"].astype(str).str.contains(search_text, case=False, na=False)
-            | df_view["ticker_yahoo"].astype(str).str.contains(search_text, case=False, na=False)
-        )
-        df_view = df_view[mask]
-
-    # --- Tabs ---
-    tab_overview, tab_funda, tab_risk, tab_sector, tab_news, tab_portfolio, tab_value = st.tabs(
-        ["Überblick", "Fundamentaldaten", "Risiko-Panel", "Sektor-Übersicht", "News & Events", "Portfolio", "Schnäppchen Watchlist"]
-    )
-
-    with tab_overview:
-        st.subheader("Überblick: Kurs & Performance")
-        overview_cols = [
-            "name", "ticker_yahoo", "sector", "last_price",
-            "change_1d", "change_5d", "change_1y",
-            "vol_1y", "total_score",
-            "drawdown_1y_high_pct", "value_score", "value_trigger"
-        ]
-        styled_overview = (
-            df_view[overview_cols]
-            .style.format(
-                {
-                    "last_price": "{:.2f}",
-                    "change_1d": "{:+.2f}%",
-                    "change_5d": "{:+.2f}%",
-                    "change_1y": "{:+.2f}%",
-                    "vol_1y": "{:.2f}%",
-                    "total_score": "{:.1f}",
-                    "drawdown_1y_high_pct": "{:+.1f}%",
-                    "value_score": "{:.1f}",
-                },
-                na_rep="–",
-            )
-            .applymap(colorize_change, subset=["change_1d", "change_5d", "change_1y"])
-            .applymap(colorize_score, subset=["total_score"])
-            .applymap(colorize_value_trigger, subset=["value_trigger"])
-        )
-        st.dataframe(styled_overview, use_container_width=True)
-
-    with tab_funda:
-        st.subheader("Fundamentaldaten")
-        df_funda = df_view.copy()
-        df_funda["market_cap_billion"] = df_funda["market_cap"] / 1e9
-
-        funda_cols = [
-            "name", "ticker_yahoo", "total_score", "value_score", "value_trigger",
-            "market_cap_billion", "pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda",
-            "net_margin", "operating_margin", "roe", "roa",
-            "dividend_yield", "dividend_per_share", "payout_ratio",
-            "dividend_growth_5y", "dividend_frequency",
-            "debt_to_equity", "net_debt_ebitda",
-            "high_52w", "low_52w", "drawdown_1y_high_pct",
-        ]
-
-        styled_funda = (
-            df_funda[funda_cols]
-            .style.format(
-                {
-                    "market_cap_billion": "{:.1f}",
-                    "pe_ratio": "{:.2f}",
-                    "forward_pe": "{:.2f}",
-                    "pb_ratio": "{:.2f}",
-                    "ps_ratio": "{:.2f}",
-                    "ev_ebitda": "{:.2f}",
-                    "net_margin": "{:.2f}%",
-                    "operating_margin": "{:.2f}%",
-                    "roe": "{:.2f}%",
-                    "roa": "{:.2f}%",
-                    "dividend_yield": "{:.2f}%",
-                    "dividend_per_share": "{:.2f}",
-                    "payout_ratio": "{:.2f}%",
-                    "dividend_growth_5y": "{:.2f}%",
-                    "debt_to_equity": "{:.2f}x",
-                    "net_debt_ebitda": "{:.2f}",
-                    "total_score": "{:.1f}",
-                    "value_score": "{:.1f}",
-                    "high_52w": "{:.2f}",
-                    "low_52w": "{:.2f}",
-                    "drawdown_1y_high_pct": "{:+.1f}%",
-                },
-                na_rep="–",
-            )
-            .applymap(colorize_score, subset=["total_score"])
-            .applymap(colorize_value_trigger, subset=["value_trigger"])
-        )
-        st.dataframe(styled_funda, use_container_width=True)
-
-    with tab_value:
-        st.subheader("Schnäppchen Watchlist")
-        if df_view.empty:
-            st.info("Keine Firmen für diese Filtereinstellung.")
-        else:
-            # Nur Trigger-Werte anzeigen
-            watch = df_view.copy()
-            watch = watch.sort_values(["value_trigger", "value_score"], ascending=[False, False])
-
-            cols = [
-                "name", "ticker_yahoo", "sector",
-                "total_score", "value_score", "value_trigger",
-                "dividend_yield", "payout_ratio", "pe_ratio",
-                "drawdown_1y_high_pct",
-                "value_reason"
-            ]
-            st.dataframe(
-                watch[cols].style.format(
-                    {
-                        "total_score": "{:.1f}",
-                        "value_score": "{:.1f}",
-                        "dividend_yield": "{:.2f}%",
-                        "payout_ratio": "{:.2f}%",
-                        "pe_ratio": "{:.2f}",
-                        "drawdown_1y_high_pct": "{:+.1f}%",
-                    },
-                    na_rep="–",
-                ).applymap(colorize_score, subset=["total_score"])
-                 .applymap(colorize_value_trigger, subset=["value_trigger"]),
-                use_container_width=True
-            )
-
-            st.caption("Tipp: Sortiere hier nach value_score, dann siehst du schnell die stärksten 'Schnäppchen-Setups'.")
-
-    with tab_risk:
-        st.subheader("Risiko-Panel für einzelne Aktie")
-        if df_view.empty:
-            st.info("Keine Firmen für diese Filtereinstellung.")
-        else:
-            ticker_choice = st.selectbox("Ticker auswählen", options=df_view["ticker_yahoo"].tolist())
-            row = df_view[df_view["ticker_yahoo"] == ticker_choice].iloc[0]
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Volatilität 1J", f"{row['vol_1y']:.1f}%" if pd.notna(row["vol_1y"]) else "–")
-            col2.metric("Debt/Equity (x)", f"{row['debt_to_equity']:.2f}x" if pd.notna(row["debt_to_equity"]) else "–")
-            col3.metric("Gesamt-Score", f"{row['total_score']:.1f}" if pd.notna(row["total_score"]) else "–")
-            col4.metric("Value-Score", f"{row['value_score']:.1f}" if pd.notna(row["value_score"]) else "–")
-
-            st.write("**Value-Reason:**")
-            st.code(str(row.get("value_reason", "")))
-
-    with tab_sector:
-        st.subheader("Sektor-Übersicht")
-        if df_view.empty:
-            st.info("Keine Firmen für diese Filtereinstellung.")
-        else:
-            sector_stats = (
-                df_view.groupby("sector")
-                .agg(
-                    anzahl=("ticker_yahoo", "count"),
-                    avg_change_1y=("change_1y", "mean"),
-                    avg_score=("total_score", "mean"),
-                    avg_value=("value_score", "mean"),
-                    value_hits=("value_trigger", lambda s: int(pd.Series(s).fillna(False).sum())),
-                )
-                .sort_values("avg_value", ascending=False)
-            )
-            st.dataframe(
-                sector_stats.style.format(
-                    {"avg_change_1y": "{:+.2f}%", "avg_score": "{:.1f}", "avg_value": "{:.1f}"},
-                    na_rep="–"
-                ),
-                use_container_width=True
-            )
-
-    with tab_news:
-        st.subheader("News & Events")
-        if df_view.empty:
-            st.info("Keine Firmen für diese Filtereinstellung.")
-        else:
-            news_ticker = st.selectbox("Ticker für News auswählen", options=df_view["ticker_yahoo"].tolist(), key="news_ticker_select")
-            days_back = st.slider("Zeitraum (Tage)", min_value=3, max_value=90, value=30, step=1)
-
-            if st.button("News laden", key="load_news_button"):
-                row_news = df_view[df_view["ticker_yahoo"] == news_ticker].iloc[0]
-                company_name = row_news["name"]
-                news_df = fetch_news_for_ticker(news_ticker, company_name=company_name, days_back=days_back, max_items=50)
-                st.session_state["news_df"] = news_df
-
-            news_df = st.session_state.get("news_df")
-
-            if news_df is None or news_df.empty:
-                st.info("Noch keine News geladen oder keine Einträge im Feed.")
-            else:
-                st.dataframe(news_df[["published", "title", "sentiment_label", "link"]], use_container_width=True)
-
-    with tab_portfolio:
-        st.subheader("Dein Portfolio")
-        if key_df not in st.session_state:
-            st.info("Bitte zuerst oben auf **'Daten laden / aktualisieren'** klicken.")
-        else:
-            df_metrics_full = st.session_state[key_df]
-
-            try:
-                portfolio_df = pd.read_csv("portfolio.csv")
-                st.success("Portfolio aus 'portfolio.csv' geladen.")
-            except FileNotFoundError:
-                st.error("❌ Datei 'portfolio.csv' nicht im Projektordner gefunden.")
-                portfolio_df = None
-            except Exception as e_port:
-                st.error(f"❌ Fehler beim Laden der Portfolio-Datei: {e_port}")
-                portfolio_df = None
-
-            if portfolio_df is not None and not portfolio_df.empty:
-                st.dataframe(portfolio_df, use_container_width=True)
-                port_view = build_portfolio_view(df_metrics_full, portfolio_df)
-                st.dataframe(port_view, use_container_width=True)
-
-    # --- Mini-Chart / Sparkline ---
-    st.subheader("Schritt 3: Mini-Kurscharts (Sparkline)")
-
-    metrics_store = st.session_state.get(key_metrics, {})
-    if metrics_store:
-        available_tickers = df_view["ticker_yahoo"].tolist()
-        if available_tickers:
-            selected_ticker = st.selectbox("Wähle einen Ticker für den Mini-Chart:", options=available_tickers)
-            period_choice = st.selectbox("Zeitraum", options=["2 Monate", "6 Monate", "1 Jahr", "5 Jahre"], index=0)
-            show_smas = st.checkbox("SMA 20/50/200 anzeigen", value=True)
-
-            base_series = metrics_store.get(selected_ticker, {}).get("history", None)
-
-            series = base_series
-            if period_choice == "5 Jahre":
-                try:
-                    t = yf.Ticker(selected_ticker)
-                    hist5 = t.history(period="5y")
-                    if not hist5.empty:
-                        series = hist5["Close"]
-                except Exception:
-                    pass
-
-            if series is not None and not series.empty:
-                if period_choice == "2 Monate":
-                    series_window = series.tail(min(60, len(series)))
-                elif period_choice == "6 Monate":
-                    series_window = series.tail(min(130, len(series)))
-                elif period_choice == "1 Jahr":
-                    series_window = series.tail(min(252, len(series)))
-                else:
-                    series_window = series
-
-                spark = series_window.to_frame(name="Kurs")
-                spark.index.name = "Datum"
-
-                if show_smas:
-                    spark["SMA20"] = spark["Kurs"].rolling(window=20).mean()
-                    spark["SMA50"] = spark["Kurs"].rolling(window=50).mean()
-                    spark["SMA200"] = spark["Kurs"].rolling(window=200).mean()
-
-                chart_df = spark.reset_index()
-                chart_df = chart_df.rename(columns={chart_df.columns[0]: "Datum"})
-
-                base_chart = alt.Chart(chart_df).mark_line(strokeWidth=1.8).encode(
-                    x=alt.X("Datum:T", title="Datum"),
-                    y=alt.Y("Kurs:Q", title="Preis"),
-                    tooltip=["Datum", "Kurs"],
-                )
-
-                sma_layers = []
-                for sma in ["SMA20", "SMA50", "SMA200"]:
-                    if sma in chart_df.columns:
-                        tmp = chart_df[["Datum", sma]].dropna().copy()
-                        tmp["SMA_Type"] = sma
-                        sma_layers.append(
-                            alt.Chart(tmp).mark_line(strokeWidth=2).encode(
-                                x="Datum:T",
-                                y=alt.Y(f"{sma}:Q", title="Preis"),
-                                color=alt.Color(
-                                    "SMA_Type:N",
-                                    scale=alt.Scale(domain=list(SMA_COLORS.keys()), range=list(SMA_COLORS.values())),
-                                    legend=alt.Legend(title="Gleitende Durchschnitte", orient="bottom"),
-                                ),
-                                tooltip=["Datum", sma],
-                            )
-                        )
-
-                final_chart = alt.layer(base_chart, *sma_layers).resolve_scale(y="shared").properties(height=300)
-                st.altair_chart(final_chart, use_container_width=True)
-            else:
-                st.info("Für diesen Ticker ist keine Kurs-Historie verfügbar.")
-    else:
-        st.info("Bitte zuerst oben auf **'Daten laden / aktualisieren'** klicken.")
-
-    # --- Graph-Ansicht ---
-    st.subheader("Schritt 4: Graph-Ansicht (Mindmap-light)")
-    if df_view.empty:
-        st.info("Keine Firmen für diese Filtereinstellung gefunden.")
-    else:
-        G = build_graph(df_view)
-        fig = draw_graph(G)
-        if fig is not None:
-            st.pyplot(fig)
-        else:
-            st.info("Graph konnte nicht gezeichnet werden (keine Knoten).")
+    tabs = st.tabs([
+        "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren", "News", "Portfolio", "Watchlist", "Value-Scanner",
+    ])
+    with tabs[0]:
+        render_overview(data)
+    with tabs[1]:
+        render_fundamentals(data)
+    with tabs[2]:
+        render_risk_and_chart(data, histories)
+    with tabs[3]:
+        render_sector_view(data)
+    with tabs[4]:
+        render_news(data)
+    with tabs[5]:
+        render_portfolio(data, histories)
+    with tabs[6]:
+        render_watchlist(data)
+    with tabs[7]:
+        render_value_watchlist(data)
 
 
 if __name__ == "__main__":

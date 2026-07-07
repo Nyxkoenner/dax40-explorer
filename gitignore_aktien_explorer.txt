@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.cache/
+.streamlit/secrets.toml
+.idea/
+*.py[cod]
+portfolio.csv
+data/watchlist.csv
