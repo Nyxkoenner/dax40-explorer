@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -783,8 +783,18 @@ def dividend_yield_history_metrics(
         return None, None
 
     current_year = datetime.now().year
-    annual_div = frame[frame["date"].dt.year < current_year].groupby(frame["date"].dt.year)["amount"].sum()
-    annual_price = close[close.index.year < current_year].groupby(close.index.year).mean()
+
+    # Wichtig: Erst filtern, dann mit einer gleich langen Gruppierungsachse gruppieren.
+    # Sonst erzeugt Pandas bei aktuellen Versionen den Fehler
+    # "Grouper and axis must be same length".
+    div_past = frame[frame["date"].dt.year < current_year].copy()
+    price_past = close[close.index.year < current_year].copy()
+
+    if div_past.empty or price_past.empty:
+        return None, None
+
+    annual_div = div_past.groupby(div_past["date"].dt.year)["amount"].sum().sort_index()
+    annual_price = price_past.groupby(price_past.index.year).mean().sort_index()
     common_years = sorted(set(annual_div.index).intersection(set(annual_price.index)))
     if not common_years:
         return None, None
@@ -3359,7 +3369,7 @@ def render_value_trigger_explanation(
 def render_special_situation_scanner(df: pd.DataFrame) -> None:
     st.subheader("Sondersituation / Deep Value")
     st.caption(
-        "Dieser Scanner sucht nach  Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
+        "Dieser Scanner sucht nach Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
         "und trotzdem positive Cashflows. Das ist ein Research-Hinweis, keine Kaufempfehlung."
     )
 
