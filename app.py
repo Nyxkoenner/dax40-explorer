@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.6"
+APP_VERSION = "3.7"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -295,11 +295,14 @@ def empty_metrics_frame() -> pd.DataFrame:
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d",
         "change_5d", "change_1y", "total_return_1y", "vol_30d", "vol_1y",
-        "max_drawdown_1y", "high_52w", "low_52w", "market_cap", "pe_ratio",
+        "max_drawdown_1y", "drawdown_3y_high_pct", "drawdown_5y_high_pct",
+        "high_52w", "low_52w", "market_cap", "pe_ratio",
         "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda", "net_margin",
         "operating_margin", "roe", "roa", "dividend_yield", "dividend_per_share",
         "payout_ratio", "dividend_growth_5y", "dividend_frequency",
-        "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
+        "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct",
+        "operating_cashflow", "free_cashflow", "shares_outstanding",
+        "cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
     ]
     return pd.DataFrame(columns=columns)
 
@@ -633,6 +636,7 @@ def fetch_ticker_info(ticker: str) -> dict[str, Any]:
         "profitMargins", "operatingMargins", "returnOnEquity",
         "returnOnAssets", "dividendYield", "dividendRate", "payoutRatio",
         "debtToEquity", "totalDebt", "totalCash", "ebitda",
+        "operatingCashflow", "freeCashflow", "sharesOutstanding",
         "currency", "financialCurrency", "beta",
 
         # Unternehmensprofil und Management
@@ -751,6 +755,57 @@ def trailing_dividend_per_share(dividend_frame: pd.DataFrame) -> Optional[float]
     return safe_float(result) if result > 0 else None
 
 
+def dividend_yield_history_metrics(
+    dividend_frame: pd.DataFrame,
+    history: pd.DataFrame,
+    current_yield: Any,
+) -> tuple[Optional[float], Optional[float]]:
+    """Vergleicht die aktuelle Dividendenrendite grob mit der eigenen 5J-Historie.
+
+    Für jedes abgeschlossene Kalenderjahr wird die Jahressumme der Dividenden
+    durch den durchschnittlichen Schlusskurs desselben Jahres geteilt. Das ist
+    keine perfekte Total-Return-Rechnung, gibt aber eine nützliche Einordnung:
+    Ist die heutige Rendite ungewöhnlich hoch im Vergleich zur eigenen Historie?
+    """
+    if dividend_frame is None or dividend_frame.empty or history is None or history.empty or "Close" not in history.columns:
+        return None, None
+
+    frame = dividend_frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    frame = frame.dropna(subset=["date", "amount"])
+    if frame.empty:
+        return None, None
+
+    prices = ensure_datetime_index(history.copy())
+    close = pd.to_numeric(prices["Close"], errors="coerce").dropna()
+    if close.empty:
+        return None, None
+
+    current_year = datetime.now().year
+    annual_div = frame[frame["date"].dt.year < current_year].groupby(frame["date"].dt.year)["amount"].sum()
+    annual_price = close[close.index.year < current_year].groupby(close.index.year).mean()
+    common_years = sorted(set(annual_div.index).intersection(set(annual_price.index)))
+    if not common_years:
+        return None, None
+
+    common_years = common_years[-5:]
+    yields = []
+    for year in common_years:
+        price = safe_float(annual_price.loc[year])
+        div = safe_float(annual_div.loc[year])
+        if price not in (None, 0) and div is not None and div > 0:
+            yields.append(div / price * 100)
+
+    if not yields:
+        return None, None
+
+    avg_yield = sum(yields) / len(yields)
+    current = safe_float(current_yield)
+    vs_avg = None if current is None or avg_yield == 0 else (current / avg_yield - 1) * 100
+    return avg_yield, vs_avg
+
+
 def metrics_from_ticker(
     ticker: str,
     name: str,
@@ -773,6 +828,8 @@ def metrics_from_ticker(
         "vol_30d": None,
         "vol_1y": None,
         "max_drawdown_1y": None,
+        "drawdown_3y_high_pct": None,
+        "drawdown_5y_high_pct": None,
         "high_52w": None,
         "low_52w": None,
         "market_cap": safe_float(info.get("marketCap")),
@@ -790,6 +847,12 @@ def metrics_from_ticker(
         "payout_ratio": to_percent(info.get("payoutRatio")),
         "dividend_growth_5y": calc_dividend_growth_5y(dividends),
         "dividend_frequency": infer_dividend_frequency(dividends),
+        "dividend_yield_5y_avg": None,
+        "dividend_yield_vs_5y_avg_pct": None,
+        "operating_cashflow": safe_float(info.get("operatingCashflow")),
+        "free_cashflow": safe_float(info.get("freeCashflow")),
+        "shares_outstanding": safe_float(info.get("sharesOutstanding")),
+        "cashflow_dividend_coverage": None,
         "debt_to_equity": None,
         "net_debt_ebitda": None,
         "beta": safe_float(info.get("beta")),
@@ -823,6 +886,17 @@ def metrics_from_ticker(
                 record["vol_1y"] = float(returns.std() * (252 ** 0.5) * 100)
                 cumulative = (1 + returns).cumprod()
                 record["max_drawdown_1y"] = float((cumulative / cumulative.cummax() - 1).min() * 100)
+
+            if last_price := safe_float(close.iloc[-1]):
+                for years, column in ((3, "drawdown_3y_high_pct"), (5, "drawdown_5y_high_pct")):
+                    window = close.tail(int(252 * years) + 5)
+                    high_value = safe_float(window.max()) if not window.empty else None
+                    if high_value not in (None, 0):
+                        record[column] = (last_price / high_value - 1) * 100
+
+        avg_yield, yield_vs_avg = dividend_yield_history_metrics(dividends, history, record.get("dividend_yield"))
+        record["dividend_yield_5y_avg"] = avg_yield
+        record["dividend_yield_vs_5y_avg_pct"] = yield_vs_avg
 
         if "Adj Close" in history.columns:
             adjusted = pd.to_numeric(history["Adj Close"], errors="coerce").dropna()
@@ -1110,6 +1184,216 @@ def enrich_with_scores(
         axis=1,
     )
     return pd.concat([result, value], axis=1)
+
+
+def load_recent_sentiment_map(days_back: int = 120) -> dict[str, dict[str, Any]]:
+    """Liest gespeicherte News-/Event-Sentiments als Zusatzsignal für den Deep-Value-Scanner.
+
+    Falls noch keine News für einen Ticker geladen wurden, bleibt das Signal leer.
+    Der Scanner funktioniert dann weiterhin, erhält aber keine Punkte für das News-Sentiment.
+    """
+    try:
+        if not EVENTS_PATH.exists():
+            return {}
+        events = pd.read_csv(EVENTS_PATH)
+    except Exception:
+        return {}
+    if events.empty or "ticker_yahoo" not in events.columns:
+        return {}
+
+    events["ticker_yahoo"] = events["ticker_yahoo"].map(clean_ticker)
+    events["date"] = pd.to_datetime(events.get("date"), errors="coerce")
+    cutoff = pd.Timestamp(datetime.now() - timedelta(days=days_back))
+    events = events[events["date"].notna() & (events["date"] >= cutoff)]
+    if events.empty:
+        return {}
+
+    if "sentiment_score" not in events.columns:
+        events["sentiment_score"] = 0
+    events["sentiment_score"] = pd.to_numeric(events["sentiment_score"], errors="coerce").fillna(0)
+
+    result: dict[str, dict[str, Any]] = {}
+    for ticker, group in events.groupby("ticker_yahoo"):
+        scores = group["sentiment_score"]
+        result[ticker] = {
+            "count": int(len(group)),
+            "negative_count": int((scores < 0).sum()),
+            "positive_count": int((scores > 0).sum()),
+            "avg_sentiment": float(scores.mean()) if len(scores) else 0.0,
+        }
+    return result
+
+
+def compute_special_situation_score(row: pd.Series, sentiment_info: Optional[dict[str, Any]] = None) -> pd.Series:
+    """BAT-/Deep-Value-Pattern: hohe Rendite + großer Drawdown + Cashflow-Stabilität.
+
+    Das ist bewusst kein Kaufsignal. Es ist ein Warn-/Research-Trigger für Fälle,
+    bei denen Standardkennzahlen wie KGV oder Payout Ratio durch Sondereffekte
+    verzerrt sein können.
+    """
+    sentiment_info = sentiment_info or {}
+
+    dividend_yield = safe_float(row.get("dividend_yield"))
+    dd_3y = safe_float(row.get("drawdown_3y_high_pct"))
+    dd_5y = safe_float(row.get("drawdown_5y_high_pct"))
+    dd_1y = safe_float(row.get("drawdown_1y_high_pct"))
+    drawdown_candidates = [value for value in [dd_5y, dd_3y, dd_1y] if value is not None]
+    deepest_drawdown = min(drawdown_candidates) if drawdown_candidates else None
+
+    operating_cashflow = safe_float(row.get("operating_cashflow"))
+    free_cashflow = safe_float(row.get("free_cashflow"))
+    cashflow_positive = (free_cashflow is not None and free_cashflow > 0) or (operating_cashflow is not None and operating_cashflow > 0)
+    coverage = safe_float(row.get("cashflow_dividend_coverage"))
+    net_debt_ebitda = safe_float(row.get("net_debt_ebitda"))
+    pe = safe_float(row.get("pe_ratio"))
+    payout = safe_float(row.get("payout_ratio"))
+    yield_vs_avg = safe_float(row.get("dividend_yield_vs_5y_avg_pct"))
+
+    score = 0.0
+    reasons: list[str] = []
+    checks: list[str] = []
+
+    # 1) Dividendenrendite
+    if dividend_yield is not None:
+        if dividend_yield >= 7:
+            points = 20
+        elif dividend_yield >= 5:
+            points = 15
+        elif dividend_yield >= 3.5:
+            points = 9
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Rendite {points:.0f}/20 ({format_percent(dividend_yield, 1)})")
+        if yield_vs_avg is not None and yield_vs_avg >= 25:
+            checks.append(f"Rendite liegt {format_percent(yield_vs_avg, 0, signed=True)} über dem eigenen 5J-Schnitt")
+    else:
+        reasons.append("Rendite 0/20 (keine Daten)")
+
+    # 2) Drawdown vom 3J-/5J-Hoch
+    if deepest_drawdown is not None:
+        drawdown_abs = abs(min(deepest_drawdown, 0))
+        if drawdown_abs >= 35:
+            points = 20
+        elif drawdown_abs >= 25:
+            points = 15
+        elif drawdown_abs >= 15:
+            points = 8
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Drawdown {points:.0f}/20 ({format_percent(deepest_drawdown, 1, signed=True)})")
+    else:
+        reasons.append("Drawdown 0/20 (keine Daten)")
+
+    # 3) Cashflow positiv
+    if cashflow_positive:
+        score += 15
+        source = "Free Cashflow" if free_cashflow is not None and free_cashflow > 0 else "operativer Cashflow"
+        reasons.append(f"Cashflow 15/15 ({source} positiv)")
+    else:
+        reasons.append("Cashflow 0/15 (nicht positiv oder keine Daten)")
+
+    # 4) Dividende durch Cashflow gedeckt
+    if coverage is not None:
+        if coverage >= 1.2:
+            points = 15
+        elif coverage >= 1.0:
+            points = 11
+        elif coverage >= 0.8:
+            points = 5
+        else:
+            points = 0
+        score += points
+        reasons.append(f"FCF/Dividende {points:.0f}/15 ({format_number(coverage, 2)}x)")
+    elif payout is not None and 0 <= payout <= 90:
+        score += 6
+        reasons.append(f"FCF/Dividende 6/15 (Payout ersatzweise {format_percent(payout, 0)})")
+    else:
+        reasons.append("FCF/Dividende 0/15 (keine belastbare Deckung)")
+
+    # 5) Leverage kontrollierbar
+    if net_debt_ebitda is not None:
+        if net_debt_ebitda < 3.5:
+            points = 10
+        elif net_debt_ebitda < 5:
+            points = 5
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Leverage {points:.0f}/10 ({format_number(net_debt_ebitda, 2)}x Net Debt/EBITDA)")
+    else:
+        reasons.append("Leverage 0/10 (keine Daten)")
+
+    # 6) KGV niedrig oder durch Sondereffekt möglicherweise verzerrt
+    eps_distortion_possible = pe is not None and pe <= 0 and cashflow_positive
+    if pe is not None:
+        if 0 < pe <= 12:
+            points = 10
+            detail = f"KGV {format_number(pe, 1)}"
+        elif 0 < pe <= 18:
+            points = 6
+            detail = f"KGV {format_number(pe, 1)}"
+        elif eps_distortion_possible:
+            points = 8
+            detail = "negatives KGV, aber Cashflow positiv"
+            checks.append("Reported EPS könnte durch Sondereffekt verzerrt sein")
+        else:
+            points = 0
+            detail = f"KGV {format_number(pe, 1)}"
+        score += points
+        reasons.append(f"Bewertung/Sondereffekt {points:.0f}/10 ({detail})")
+    else:
+        reasons.append("Bewertung/Sondereffekt 0/10 (keine KGV-Daten)")
+
+    # 7) Negatives News-Sentiment ohne Cashflow-Kollaps
+    negative_count = int(sentiment_info.get("negative_count", 0) or 0)
+    avg_sentiment = safe_float(sentiment_info.get("avg_sentiment"))
+    if cashflow_positive and (negative_count > 0 or (avg_sentiment is not None and avg_sentiment < 0)):
+        score += 10
+        reasons.append(f"News-Kontrast 10/10 ({negative_count} negative Treffer, Cashflow positiv)")
+    elif cashflow_positive and sentiment_info.get("count"):
+        score += 3
+        reasons.append("News-Kontrast 3/10 (News geladen, aber nicht klar negativ)")
+    else:
+        reasons.append("News-Kontrast 0/10 (keine negativen News oder News nicht geladen)")
+
+    trigger = bool(
+        score >= 70
+        and dividend_yield is not None and dividend_yield >= 5
+        and deepest_drawdown is not None and deepest_drawdown <= -25
+        and cashflow_positive
+    )
+
+    status = "Sondersituation prüfen" if trigger else "Beobachten" if score >= 55 else "kein BAT-Muster"
+    if cashflow_positive:
+        checks.append("Cashflow weiterhin positiv")
+    if coverage is not None and coverage >= 1:
+        checks.append("Dividende grob durch Free Cashflow gedeckt")
+    if net_debt_ebitda is not None and net_debt_ebitda < 3.5:
+        checks.append("Leverage unter 3,5x")
+
+    return pd.Series({
+        "special_situation_score": round(min(max(score, 0), 100), 1),
+        "special_situation_trigger": trigger,
+        "special_situation_status": status,
+        "special_situation_reason": " | ".join(reasons),
+        "special_situation_checks": " | ".join(checks) if checks else "Keine besonderen Zusatzhinweise",
+        "deepest_drawdown_3_5y_pct": deepest_drawdown,
+    })
+
+
+def enrich_with_special_situations(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    sentiment_map = load_recent_sentiment_map(days_back=120)
+    scored = df.apply(
+        lambda row: compute_special_situation_score(
+            row, sentiment_map.get(clean_ticker(row.get("ticker_yahoo")), {})
+        ),
+        axis=1,
+    )
+    return pd.concat([df.copy(), scored], axis=1)
 
 
 # -----------------------------------------------------------------------------
@@ -2642,12 +2926,26 @@ def format_value_trigger(value: Any) -> str:
     return "✓ erfüllt" if bool(value) else "✗ offen"
 
 
+def format_special_trigger(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "–"
+    return "⚠ prüfen" if bool(value) else "–"
+
+
 def colorize_value_trigger(value: Any) -> str:
     """Hebt nur wirklich ausgelöste Trigger grün hervor."""
     if value is None or pd.isna(value):
         return "color: #6b7280"
     if bool(value):
         return "background-color: #dcfce7; color: #166534; font-weight: 700"
+    return "color: #9ca3af"
+
+
+def colorize_special_trigger(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "color: #6b7280"
+    if bool(value):
+        return "background-color: #fef3c7; color: #92400e; font-weight: 700"
     return "color: #9ca3af"
 
 
@@ -2834,17 +3132,19 @@ def render_overview(df: pd.DataFrame) -> None:
         st.info("Keine Daten für die aktuelle Filtereinstellung.")
         return
 
-    metric_columns = st.columns(5)
+    metric_columns = st.columns(6)
     metric_columns[0].metric("Unternehmen", f"{len(df):,}".replace(",", "."))
-    metric_columns[1].metric("Trigger erfüllt", int(df["value_trigger"].fillna(False).sum()))
-    metric_columns[2].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
-    metric_columns[3].metric("Ø Kursrendite 1J", format_percent(df["change_1y"].mean(), 1, signed=True))
-    metric_columns[4].metric("Ø Gesamtrendite 1J*", format_percent(df["total_return_1y"].mean(), 1, signed=True))
+    metric_columns[1].metric("Value-Trigger", int(df["value_trigger"].fillna(False).sum()))
+    metric_columns[2].metric("Deep-Value prüfen", int(df.get("special_situation_trigger", pd.Series(dtype=bool)).fillna(False).sum()))
+    metric_columns[3].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
+    metric_columns[4].metric("Ø Kursrendite 1J", format_percent(df["change_1y"].mean(), 1, signed=True))
+    metric_columns[5].metric("Ø Gesamtrendite 1J*", format_percent(df["total_return_1y"].mean(), 1, signed=True))
 
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d", "change_5d",
         "change_1y", "total_return_1y", "vol_1y", "max_drawdown_1y", "dividend_yield",
-        "total_score", "score_coverage", "value_score", "drawdown_1y_high_pct", "value_trigger",
+        "total_score", "score_coverage", "value_score", "special_situation_score",
+        "special_situation_trigger", "drawdown_1y_high_pct", "drawdown_3y_high_pct", "value_trigger",
     ]
     visible_columns = [column for column in columns if column in df.columns]
     display = df[visible_columns].rename(
@@ -2864,7 +3164,10 @@ def render_overview(df: pd.DataFrame) -> None:
             "total_score": "Qualitäts-Score",
             "score_coverage": "Datenabdeckung",
             "value_score": "Value-Score",
+            "special_situation_score": "Deep-Value-Score",
+            "special_situation_trigger": "Deep-Value",
             "drawdown_1y_high_pct": "Drawdown vom 52W-Hoch",
+            "drawdown_3y_high_pct": "Drawdown vom 3J-Hoch",
             "value_trigger": "Value-Trigger",
         }
     )
@@ -2880,19 +3183,23 @@ def render_overview(df: pd.DataFrame) -> None:
         "Qualitäts-Score": lambda value: format_number(value, 1),
         "Datenabdeckung": lambda value: format_percent(value, 0),
         "Value-Score": lambda value: format_number(value, 1),
+        "Deep-Value-Score": lambda value: format_number(value, 1),
+        "Deep-Value": format_special_trigger,
         "Drawdown vom 52W-Hoch": lambda value: format_percent(value, 1, signed=True),
+        "Drawdown vom 3J-Hoch": lambda value: format_percent(value, 1, signed=True),
         "Value-Trigger": format_value_trigger,
     }
     styled = (
         display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
         .map(colorize_change, subset=[column for column in ["Veränderung 1T", "Veränderung 5T", "Kursrendite 1J", "Gesamtrendite 1J*"] if column in display.columns])
-        .map(colorize_score, subset=[column for column in ["Qualitäts-Score"] if column in display.columns])
+        .map(colorize_score, subset=[column for column in ["Qualitäts-Score", "Deep-Value-Score"] if column in display.columns])
+        .map(colorize_special_trigger, subset=[column for column in ["Deep-Value"] if column in display.columns])
         .map(colorize_value_trigger, subset=[column for column in ["Value-Trigger"] if column in display.columns])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
         "Value-Score und Value-Trigger sind verschieden: Der Score ordnet Kandidaten ein; der Trigger ist ein strenger Filter, "
-        "bei dem alle Regeln erfüllt sein müssen. Details stehen im Tab „Value-Scanner“."
+        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach BAT-ähnlichen Sondersituationen."
     )
     st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
@@ -2926,6 +3233,11 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "payout_ratio": "Ausschüttungsquote",
         "dividend_growth_5y": "Dividendenwachstum 5J",
         "dividend_frequency": "Ausschüttungsrhythmus",
+        "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
+        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt",
+        "free_cashflow": "Free Cashflow",
+        "operating_cashflow": "Operativer Cashflow",
+        "cashflow_dividend_coverage": "FCF/Dividende",
         "debt_to_equity": "Debt/Equity",
         "net_debt_ebitda": "Netto-Schulden/EBITDA",
         "beta": "Beta",
@@ -2950,6 +3262,11 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "Dividende je Aktie": lambda value: format_number(value, 2),
         "Ausschüttungsquote": lambda value: format_percent(value, 2),
         "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
+        "Ø Div.-Rendite 5J": lambda value: format_percent(value, 2),
+        "Rendite vs. 5J-Schnitt": lambda value: format_percent(value, 0, signed=True),
+        "Free Cashflow": human_market_cap,
+        "Operativer Cashflow": human_market_cap,
+        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
         "Debt/Equity": lambda value: f"{format_number(value, 2)}x",
         "Netto-Schulden/EBITDA": lambda value: f"{format_number(value, 2)}x",
         "Beta": lambda value: format_number(value, 2),
@@ -3037,6 +3354,128 @@ def render_value_trigger_explanation(
         else:
             st.info("Der Value-Trigger ist noch nicht erfüllt. In der Tabelle siehst du, welches Kriterium fehlt oder welche Kennzahl nicht vorliegt.")
         st.caption(str(row.get("value_reason", "")))
+
+
+def render_special_situation_scanner(df: pd.DataFrame) -> None:
+    st.subheader("Sondersituation / Deep Value")
+    st.caption(
+        "Dieser Scanner sucht nach BAT-ähnlichen Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
+        "und trotzdem positive Cashflows. Das ist ein Research-Hinweis, keine Kaufempfehlung."
+    )
+
+    with st.expander("So funktioniert der BAT-/Deep-Value-Pattern-Score", expanded=True):
+        st.markdown(
+            "Der Score bewertet Fälle, bei denen normale Kennzahlen wie KGV oder Payout Ratio durch Sondereffekte verzerrt sein können. "
+            "Das Muster lautet: **hohe Rendite + starker Drawdown + Cashflow bleibt positiv + Dividende wirkt gedeckt + Verschuldung kontrollierbar**."
+        )
+        rules = pd.DataFrame([
+            {"Baustein": "Dividendenrendite", "Punkte": "bis 20", "Gedanke": "> 7 % ist ein starkes Ertragssignal, kann aber auch Dividendenfalle sein."},
+            {"Baustein": "Drawdown vom 3J-/5J-Hoch", "Punkte": "bis 20", "Gedanke": "Der Markt hat die Aktie deutlich abgestraft."},
+            {"Baustein": "Positiver Cashflow", "Punkte": "15", "Gedanke": "Wichtigster Unterschied zwischen Sondersituation und operativem Kollaps."},
+            {"Baustein": "Dividende durch FCF gedeckt", "Punkte": "bis 15", "Gedanke": "Free Cashflow geteilt durch geschätzte jährliche Dividendenlast."},
+            {"Baustein": "Net Debt / EBITDA", "Punkte": "bis 10", "Gedanke": "Unter 3,5x wird als kontrollierbarer gewertet."},
+            {"Baustein": "KGV oder EPS-Verzerrung", "Punkte": "bis 10", "Gedanke": "Negatives KGV ist kein Ausschluss, wenn Cashflow positiv bleibt."},
+            {"Baustein": "Negatives News-Sentiment", "Punkte": "bis 10", "Gedanke": "Punkte nur, wenn News geladen wurden und der Cashflow nicht kollabiert."},
+        ])
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+        st.info(
+            "Ein Trigger bedeutet: **Bitte prüfen** – nicht kaufen. Besonders wichtig ist die Frage: "
+            "Ist der Gewinnrückgang operativ, oder wurde das Ergebnis durch Abschreibungen/Sondereffekte verzerrt?"
+        )
+
+    if df.empty:
+        st.info("Keine Daten für die aktuelle Filtereinstellung.")
+        return
+
+    required = ["special_situation_score", "special_situation_trigger"]
+    if not all(column in df.columns for column in required):
+        df = enrich_with_special_situations(df)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Prüfen", int(df["special_situation_trigger"].fillna(False).sum()))
+    metric_cols[1].metric("Score ≥ 70", int((pd.to_numeric(df["special_situation_score"], errors="coerce") >= 70).sum()))
+    metric_cols[2].metric("Ø Deep-Value-Score", format_number(pd.to_numeric(df["special_situation_score"], errors="coerce").mean(), 1))
+    metric_cols[3].metric("Ø Drawdown 3/5J", format_percent(pd.to_numeric(df.get("deepest_drawdown_3_5y_pct"), errors="coerce").mean(), 1, signed=True))
+
+    sorted_df = df.sort_values(["special_situation_trigger", "special_situation_score"], ascending=[False, False], na_position="last")
+    columns = [
+        "name", "ticker_yahoo", "sector", "special_situation_score", "special_situation_trigger",
+        "special_situation_status", "dividend_yield", "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct",
+        "deepest_drawdown_3_5y_pct", "free_cashflow", "cashflow_dividend_coverage",
+        "net_debt_ebitda", "pe_ratio", "payout_ratio", "special_situation_reason",
+    ]
+    visible = [column for column in columns if column in sorted_df.columns]
+    display = sorted_df[visible].rename(columns={
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "sector": "Sektor",
+        "special_situation_score": "BAT-/Deep-Value-Score",
+        "special_situation_trigger": "Prüfen",
+        "special_situation_status": "Status",
+        "dividend_yield": "Dividendenrendite",
+        "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
+        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt",
+        "deepest_drawdown_3_5y_pct": "Drawdown 3/5J",
+        "free_cashflow": "Free Cashflow",
+        "cashflow_dividend_coverage": "FCF/Dividende",
+        "net_debt_ebitda": "Net Debt/EBITDA",
+        "pe_ratio": "KGV",
+        "payout_ratio": "Payout",
+        "special_situation_reason": "Begründung",
+    })
+    formats = {
+        "BAT-/Deep-Value-Score": lambda value: format_number(value, 1),
+        "Prüfen": format_special_trigger,
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Ø Div.-Rendite 5J": lambda value: format_percent(value, 2),
+        "Rendite vs. 5J-Schnitt": lambda value: format_percent(value, 0, signed=True),
+        "Drawdown 3/5J": lambda value: format_percent(value, 1, signed=True),
+        "Free Cashflow": human_market_cap,
+        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
+        "Net Debt/EBITDA": lambda value: f"{format_number(value, 2)}x",
+        "KGV": lambda value: format_number(value, 2),
+        "Payout": lambda value: format_percent(value, 1),
+    }
+    styled = (
+        display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
+        .map(colorize_score, subset=[column for column in ["BAT-/Deep-Value-Score"] if column in display.columns])
+        .map(colorize_special_trigger, subset=[column for column in ["Prüfen"] if column in display.columns])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    st.markdown("### Einzelprüfung")
+    ticker = st.selectbox("Titel prüfen", sorted_df["ticker_yahoo"].tolist(), key="special_situation_detail_ticker")
+    row = sorted_df.loc[sorted_df["ticker_yahoo"] == ticker].iloc[0]
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("Score", format_number(row.get("special_situation_score"), 1))
+    detail_cols[1].metric("Dividendenrendite", format_percent(row.get("dividend_yield"), 2))
+    detail_cols[2].metric("Drawdown 3/5J", format_percent(row.get("deepest_drawdown_3_5y_pct"), 1, signed=True))
+    detail_cols[3].metric("FCF/Dividende", f"{format_number(row.get('cashflow_dividend_coverage'), 2)}x")
+
+    if bool(row.get("special_situation_trigger", False)):
+        st.warning(
+            "Sondersituation erkannt: hohe Dividende + starker Drawdown + positive Cashflow-Indizien. "
+            "Bitte prüfen, ob der Gewinnrückgang operativ oder bilanziell/Sondereffekt-getrieben ist."
+        )
+    elif safe_float(row.get("special_situation_score")) is not None and safe_float(row.get("special_situation_score")) >= 55:
+        st.info("Teilweise BAT-ähnliches Profil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
+    else:
+        st.info("Aktuell kein klares BAT-/Deep-Value-Muster nach den hinterlegten Regeln.")
+
+    st.markdown("**Score-Bausteine**")
+    st.code(str(row.get("special_situation_reason", "")))
+    st.markdown("**Zusatzhinweise**")
+    st.code(str(row.get("special_situation_checks", "")))
+
+    with st.expander("BAT-Fallstudie als Denkmodell", expanded=False):
+        st.markdown(
+            "BAT war ein Beispiel für eine Aktie, bei der der Markt stark auf strukturelle Risiken und eine große Abschreibung reagiert hat, "
+            "während Cashflow und Dividendenfähigkeit auf adjustierter Basis nicht im selben Maß kollabierten. Genau solche Spannungen soll dieser Scanner sichtbar machen."
+        )
+        st.markdown(
+            "Für eine belastbare Replikation fehlen weiterhin historische Fundamentaldaten zum damaligen Zeitpunkt. "
+            "Der Scanner ist deshalb ein **Hinweisgeber**, kein Backtest und keine automatische Entscheidung."
+        )
 
 
 def render_value_watchlist(
@@ -3684,6 +4123,7 @@ def main() -> None:
         score_min=float(score_min),
         yield_min=float(yield_min),
     )
+    data = enrich_with_special_situations(data)
 
     last_refresh = st.session_state.get("last_refresh", "–")
     st.caption(
@@ -3693,7 +4133,7 @@ def main() -> None:
 
     tabs = st.tabs([
         "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Research",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Research",
     ])
     with tabs[0]:
         render_overview(data)
@@ -3719,6 +4159,8 @@ def main() -> None:
             profile_name=profile_name,
         )
     with tabs[8]:
+        render_special_situation_scanner(data)
+    with tabs[9]:
         render_research(data, histories, index_name)
 
 
