@@ -16,6 +16,7 @@ Hinweise:
 from __future__ import annotations
 
 import os
+import logging
 import re
 import tempfile
 import time
@@ -31,6 +32,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 from dateutil import parser as dateparser
 
 
@@ -38,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.5"
+APP_VERSION = "3.6"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -172,7 +175,39 @@ def to_percent(value: Any) -> Optional[float]:
 
 
 def clean_ticker(ticker: Any) -> str:
-    return str(ticker or "").strip().upper()
+    """Normalisiert Yahoo-Ticker und entfernt Artefakte aus Webtabellen.
+
+    Wikipedia/Finanzseiten enthalten teils Fußnoten, Dollarzeichen oder
+    unsichtbare Leerzeichen. Diese Artefakte führten beim SDAX-Fallback zu
+    Symbolen wie $SRV.DE.
+    """
+    value = str(ticker or "").strip().upper()
+    value = re.sub(r"\[.*?\]", "", value)
+    value = value.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    value = value.strip().lstrip("$")
+    value = re.sub(r"\s+", "", value)
+    # Für Yahoo sind Buchstaben, Zahlen, Punkt und Bindestrich relevant.
+    value = re.sub(r"[^A-Z0-9.\-]", "", value)
+    return value
+
+
+def is_probably_german_yahoo_symbol(symbol: str, exchange: str = "") -> bool:
+    """Prüft, ob ein Yahoo-Suchtreffer plausibel zu einem deutschen Index passt.
+
+    Wichtig: Der Yahoo-Search-Fallback darf US-Symbole wie TSLX oder OTC-Symbole
+    wie DRRKF nicht einfach mit .DE ergänzen. Genau dadurch entstanden beim SDAX
+    ungültige Ticker wie TSLX.DE oder DRRKF.DE.
+    """
+    symbol = clean_ticker(symbol)
+    exchange = str(exchange or "").upper().strip()
+    if not symbol:
+        return False
+    if symbol.endswith(".DE") or symbol.endswith(".F"):
+        return True
+    german_exchanges = {"GER", "ETR", "EUX", "FRA", "STU", "MUN", "HAM", "HAN", "DUS", "BER"}
+    if exchange in german_exchanges and "." not in symbol:
+        return True
+    return False
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -346,24 +381,33 @@ def resolve_german_yahoo_ticker(company_name: str) -> str:
             continue
 
         for quote in quotes:
-            symbol = str(quote.get("symbol", "")).strip()
+            symbol = clean_ticker(quote.get("symbol", ""))
             short_name = str(quote.get("shortname") or quote.get("longname") or "")
             exchange = str(quote.get("exchange", "")).upper()
             quote_type = str(quote.get("quoteType", "")).upper()
+
             if not symbol or quote_type not in ("EQUITY", ""):
+                continue
+
+            # Kein blindes ".DE"-Anhängen mehr: US-/OTC-Treffer werden verworfen.
+            if not is_probably_german_yahoo_symbol(symbol, exchange):
                 continue
 
             score = 0
             if symbol.endswith(".DE"):
-                score += 100
+                score += 120
             elif symbol.endswith(".F"):
-                score += 40
+                score += 70
             elif "." not in symbol and exchange in {"GER", "FRA", "EUX", "ETR"}:
-                score += 60
+                score += 80
             if exchange in {"GER", "FRA", "EUX", "ETR"}:
-                score += 30
-            if clean_name and clean_name.lower().split(" ")[0] in short_name.lower():
-                score += 20
+                score += 40
+
+            first_token = clean_name.lower().split(" ")[0] if clean_name else ""
+            if first_token and first_token in short_name.lower():
+                score += 25
+            if clean_name and clean_name.lower() in short_name.lower():
+                score += 35
 
             if score > best_score:
                 best_score = score
@@ -411,8 +455,11 @@ def parse_german_index_tables(tables: list[pd.DataFrame], min_rows: int, index_l
                 .str.strip()
             )
             result["ticker_yahoo"] = result["ticker_yahoo"].apply(
-                lambda ticker: ticker if "." in ticker else f"{ticker}.DE"
+                lambda ticker: ticker if "." in clean_ticker(ticker) else f"{clean_ticker(ticker)}.DE"
             )
+            # Offensichtliche Nicht-DE-Artefakte aus Webtabellen entfernen.
+            result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
+            result = result[result["ticker_yahoo"].str.endswith((".DE", ".F"), na=False)]
         else:
             # Fallback für Tabellen ohne Symbol-Spalte, z. B. manche SDAX-Seiten.
             if len(table) < max(10, int(min_rows * 0.5)):
@@ -521,7 +568,6 @@ def _extract_ticker_history(downloaded: pd.DataFrame, ticker: str, ticker_count:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> dict[str, pd.DataFrame]:
     """Lädt historische Kurse gebündelt und behält Close sowie Adj Close.
@@ -529,7 +575,11 @@ def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> di
     Close = Preisrendite, Adj Close = von Yahoo bereinigte Reihe (als
     Näherung für Total Return). Die Datenquelle bleibt Yahoo Finance.
     """
-    clean_tickers = tuple(dict.fromkeys(ticker for ticker in tickers if ticker))
+    clean_tickers = tuple(
+        dict.fromkeys(clean_ticker(ticker) for ticker in tickers if clean_ticker(ticker))
+    )
+    # Schutz gegen Artefakte wie "$SRV.DE" oder versehentlich erzeugte leere Ticker.
+    clean_tickers = tuple(ticker for ticker in clean_tickers if re.match(r"^[A-Z0-9][A-Z0-9.\-]*$", ticker))
     if not clean_tickers:
         return {}
 
