@@ -127,6 +127,52 @@ INDEX_LOCAL_FILES = {
     "S&P 500": INDEX_DIR / "sp500.csv",
 }
 
+# Robuster Fallback für DAX 40, falls die Webtabelle unvollständig oder
+# uneinheitlich geparst wird. Stand: Wikipedia-Liste „as of 22 September 2025“.
+# Für maximale Kontrolle kann die Liste jederzeit über data/indices/dax40.csv überschrieben werden.
+DAX40_STATIC_CONSTITUENTS = [
+    {"name": "Adidas", "ticker_yahoo": "ADS.DE", "sector": "Apparel"},
+    {"name": "Airbus", "ticker_yahoo": "AIR.PA", "sector": "Aerospace & Defence"},
+    {"name": "Allianz", "ticker_yahoo": "ALV.DE", "sector": "Financial Services"},
+    {"name": "BASF", "ticker_yahoo": "BAS.DE", "sector": "Chemicals"},
+    {"name": "Bayer", "ticker_yahoo": "BAYN.DE", "sector": "Pharmaceuticals"},
+    {"name": "Beiersdorf", "ticker_yahoo": "BEI.DE", "sector": "Consumer Goods"},
+    {"name": "BMW", "ticker_yahoo": "BMW.DE", "sector": "Automotive"},
+    {"name": "Brenntag", "ticker_yahoo": "BNR.DE", "sector": "Distribution"},
+    {"name": "Commerzbank", "ticker_yahoo": "CBK.DE", "sector": "Financial Services"},
+    {"name": "Continental", "ticker_yahoo": "CON.DE", "sector": "Automotive"},
+    {"name": "Daimler Truck", "ticker_yahoo": "DTG.DE", "sector": "Automotive"},
+    {"name": "Deutsche Bank", "ticker_yahoo": "DBK.DE", "sector": "Financial Services"},
+    {"name": "Deutsche Börse", "ticker_yahoo": "DB1.DE", "sector": "Financial Services"},
+    {"name": "Deutsche Post", "ticker_yahoo": "DHL.DE", "sector": "Logistics"},
+    {"name": "Deutsche Telekom", "ticker_yahoo": "DTE.DE", "sector": "Telecommunication"},
+    {"name": "E.ON", "ticker_yahoo": "EOAN.DE", "sector": "Utilities"},
+    {"name": "Fresenius", "ticker_yahoo": "FRE.DE", "sector": "Healthcare"},
+    {"name": "Fresenius Medical Care", "ticker_yahoo": "FME.DE", "sector": "Healthcare"},
+    {"name": "GEA Group", "ticker_yahoo": "G1A.DE", "sector": "Mechanical Engineering"},
+    {"name": "Hannover Re", "ticker_yahoo": "HNR1.DE", "sector": "Insurance"},
+    {"name": "Heidelberg Materials", "ticker_yahoo": "HEI.DE", "sector": "Construction Materials"},
+    {"name": "Henkel", "ticker_yahoo": "HEN3.DE", "sector": "Consumer Goods"},
+    {"name": "Infineon Technologies", "ticker_yahoo": "IFX.DE", "sector": "Technology"},
+    {"name": "Mercedes-Benz Group", "ticker_yahoo": "MBG.DE", "sector": "Automotive"},
+    {"name": "Merck", "ticker_yahoo": "MRK.DE", "sector": "Pharmaceuticals"},
+    {"name": "MTU Aero Engines", "ticker_yahoo": "MTX.DE", "sector": "Aerospace & Defence"},
+    {"name": "Munich Re", "ticker_yahoo": "MUV2.DE", "sector": "Financial Services"},
+    {"name": "Porsche SE", "ticker_yahoo": "PAH3.DE", "sector": "Automotive"},
+    {"name": "Qiagen", "ticker_yahoo": "QIA.DE", "sector": "Biotech"},
+    {"name": "Rheinmetall", "ticker_yahoo": "RHM.DE", "sector": "Aerospace & Defence"},
+    {"name": "RWE", "ticker_yahoo": "RWE.DE", "sector": "Utilities"},
+    {"name": "SAP", "ticker_yahoo": "SAP.DE", "sector": "Technology"},
+    {"name": "Scout24", "ticker_yahoo": "G24.DE", "sector": "E-Commerce"},
+    {"name": "Siemens", "ticker_yahoo": "SIE.DE", "sector": "Industrials"},
+    {"name": "Siemens Energy", "ticker_yahoo": "ENR.DE", "sector": "Energy technology"},
+    {"name": "Siemens Healthineers", "ticker_yahoo": "SHL.DE", "sector": "Medical Equipment"},
+    {"name": "Symrise", "ticker_yahoo": "SY1.DE", "sector": "Chemicals"},
+    {"name": "Volkswagen Group", "ticker_yahoo": "VOW3.DE", "sector": "Automotive"},
+    {"name": "Vonovia", "ticker_yahoo": "VNA.DE", "sector": "Real Estate"},
+    {"name": "Zalando", "ticker_yahoo": "ZAL.DE", "sector": "E-Commerce"},
+]
+
 GERMAN_INDEX_SOURCES = {
     "DAX 40": {
         "urls": ["https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"],
@@ -148,6 +194,11 @@ BENCHMARK_BY_INDEX = {
     "SDAX": "^SDAXI",
     "S&P 500": "^GSPC",
 }
+
+# Deutsche Indizes enthalten nicht nur Xetra-/Frankfurt-Ticker.
+# Beispiel: Airbus ist im DAX, wird bei Yahoo aber zuverlässig als AIR.PA geführt.
+# V3.8 hat solche Werte versehentlich herausgefiltert und dadurch beim DAX nur 39 Titel geladen.
+GERMAN_INDEX_ALLOWED_SUFFIXES = (".DE", ".F", ".PA")
 
 
 # -----------------------------------------------------------------------------
@@ -202,7 +253,7 @@ def is_probably_german_yahoo_symbol(symbol: str, exchange: str = "") -> bool:
     exchange = str(exchange or "").upper().strip()
     if not symbol:
         return False
-    if symbol.endswith(".DE") or symbol.endswith(".F"):
+    if symbol.endswith(GERMAN_INDEX_ALLOWED_SUFFIXES):
         return True
     german_exchanges = {"GER", "ETR", "EUX", "FRA", "STU", "MUN", "HAM", "HAN", "DUS", "BER"}
     if exchange in german_exchanges and "." not in symbol:
@@ -401,6 +452,9 @@ def resolve_german_yahoo_ticker(company_name: str) -> str:
                 score += 120
             elif symbol.endswith(".F"):
                 score += 70
+            elif symbol.endswith(".PA"):
+                # Airbus ist DAX-Mitglied, der zuverlässige Yahoo-Ticker ist AIR.PA.
+                score += 65
             elif "." not in symbol and exchange in {"GER", "FRA", "EUX", "ETR"}:
                 score += 80
             if exchange in {"GER", "FRA", "EUX", "ETR"}:
@@ -462,7 +516,7 @@ def parse_german_index_tables(tables: list[pd.DataFrame], min_rows: int, index_l
             )
             # Offensichtliche Nicht-DE-Artefakte aus Webtabellen entfernen.
             result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
-            result = result[result["ticker_yahoo"].str.endswith((".DE", ".F"), na=False)]
+            result = result[result["ticker_yahoo"].str.endswith(GERMAN_INDEX_ALLOWED_SUFFIXES, na=False)]
         else:
             # Fallback für Tabellen ohne Symbol-Spalte, z. B. manche SDAX-Seiten.
             if len(table) < max(10, int(min_rows * 0.5)):
@@ -526,15 +580,34 @@ def load_index_constituents(index_name: str) -> pd.DataFrame:
     if index_name in GERMAN_INDEX_SOURCES:
         config = GERMAN_INDEX_SOURCES[index_name]
         errors: list[str] = []
+        best_result = pd.DataFrame()
         for url in config["urls"]:
             try:
-                return parse_german_index_tables(
+                parsed = parse_german_index_tables(
                     read_html_tables(fetch_html(url)),
                     min_rows=int(config["min_rows"]),
                     index_label=index_name,
                 )
+                if len(parsed) > len(best_result):
+                    best_result = parsed
+                # Beim DAX erwarten wir 40 Werte. V3.8 hat Airbus/AIR.PA herausgefiltert
+                # und dadurch schon beim Index-Universum nur 39 Werte geladen.
+                if index_name != "DAX 40" or len(parsed) >= 40:
+                    return parsed.reset_index(drop=True)
             except Exception as error:
                 errors.append(f"{url}: {error}")
+
+        if index_name == "DAX 40":
+            static_dax = validate_constituents(pd.DataFrame(DAX40_STATIC_CONSTITUENTS))
+            if not best_result.empty:
+                combined = pd.concat([best_result, static_dax], ignore_index=True)
+                combined = validate_constituents(combined)
+                if len(combined) >= 40:
+                    return combined.head(40).reset_index(drop=True)
+            return static_dax
+
+        if not best_result.empty:
+            return best_result.reset_index(drop=True)
         raise RuntimeError(f"{index_name} konnte nicht geladen werden. " + " | ".join(errors))
 
     if index_name == "S&P 500":
