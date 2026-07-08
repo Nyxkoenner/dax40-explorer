@@ -38,7 +38,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -114,6 +114,37 @@ RSS_SOURCES = [
     "https://www.handelsblatt.com/contentexport/feed/wirtschaft",
     "https://www.eqs-news.com/de/news/dgap/rss",
 ]
+
+INDEX_OPTIONS = ["DAX 40", "MDAX", "SDAX", "S&P 500"]
+
+INDEX_LOCAL_FILES = {
+    "DAX 40": INDEX_DIR / "dax40.csv",
+    "MDAX": INDEX_DIR / "mdax.csv",
+    "SDAX": INDEX_DIR / "sdax.csv",
+    "S&P 500": INDEX_DIR / "sp500.csv",
+}
+
+GERMAN_INDEX_SOURCES = {
+    "DAX 40": {
+        "urls": ["https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"],
+        "min_rows": 30,
+    },
+    "MDAX": {
+        "urls": ["https://en.wikipedia.org/wiki/MDAX", "https://de.wikipedia.org/wiki/MDAX"],
+        "min_rows": 40,
+    },
+    "SDAX": {
+        "urls": ["https://en.wikipedia.org/wiki/SDAX", "https://de.wikipedia.org/wiki/SDAX"],
+        "min_rows": 50,
+    },
+}
+
+BENCHMARK_BY_INDEX = {
+    "DAX 40": "^GDAXI",
+    "MDAX": "^MDAXI",
+    "SDAX": "^SDAXI",
+    "S&P 500": "^GSPC",
+}
 
 
 # -----------------------------------------------------------------------------
@@ -277,35 +308,143 @@ def validate_constituents(df: pd.DataFrame) -> pd.DataFrame:
     return result.drop_duplicates(subset=["ticker_yahoo"]).reset_index(drop=True)
 
 
-def parse_dax_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def resolve_german_yahoo_ticker(company_name: str) -> str:
+    """Versucht bei Wikipedia-Tabellen ohne Symbol den passenden Yahoo-Ticker zu finden.
+
+    Das ist ein Fallback für Seiten wie den SDAX, auf denen teils nur Firmenname,
+    Branche und Sitz stehen. Für eine produktive Version bleiben lokale CSV-Dateien
+    in data/indices/*.csv zuverlässiger.
+    """
+    if not company_name or pd.isna(company_name):
+        return ""
+
+    name = str(company_name)
+    clean_name = re.sub(r"\[.*?\]", "", name)
+    clean_name = re.sub(r"\b(AG|SE|KGaA|KGAA|GmbH|Holding|Group|S\.A\.|S\.A|N\.V\.|PLC)\b", " ", clean_name, flags=re.I)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip()
+
+    queries = []
+    for candidate in (name, clean_name, clean_name.split(" ")[0] if clean_name else ""):
+        candidate = str(candidate).strip()
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+
+    best_symbol = ""
+    best_score = -1
+    for query in queries[:3]:
+        try:
+            response = requests.get(
+                "https://query2.finance.yahoo.com/v1/finance/search",
+                params={"q": query, "quotesCount": 8, "newsCount": 0, "lang": "de-DE", "region": "DE"},
+                headers=DEFAULT_HEADERS,
+                timeout=12,
+            )
+            response.raise_for_status()
+            quotes = response.json().get("quotes", [])
+        except Exception:
+            continue
+
+        for quote in quotes:
+            symbol = str(quote.get("symbol", "")).strip()
+            short_name = str(quote.get("shortname") or quote.get("longname") or "")
+            exchange = str(quote.get("exchange", "")).upper()
+            quote_type = str(quote.get("quoteType", "")).upper()
+            if not symbol or quote_type not in ("EQUITY", ""):
+                continue
+
+            score = 0
+            if symbol.endswith(".DE"):
+                score += 100
+            elif symbol.endswith(".F"):
+                score += 40
+            elif "." not in symbol and exchange in {"GER", "FRA", "EUX", "ETR"}:
+                score += 60
+            if exchange in {"GER", "FRA", "EUX", "ETR"}:
+                score += 30
+            if clean_name and clean_name.lower().split(" ")[0] in short_name.lower():
+                score += 20
+
+            if score > best_score:
+                best_score = score
+                best_symbol = symbol
+
+    if best_symbol and "." not in best_symbol:
+        best_symbol = f"{best_symbol}.DE"
+    return clean_ticker(best_symbol)
+
+
+def parse_german_index_tables(tables: list[pd.DataFrame], min_rows: int, index_label: str) -> pd.DataFrame:
+    """Extrahiert deutsche Indexmitglieder aus Wikipedia-Tabellen.
+
+    DAX/MDAX enthalten häufig eine Symbol-Spalte. SDAX-Tabellen enthalten je nach
+    Seite manchmal nur Namen; dann wird als Fallback über Yahoo Finance gesucht.
+    Lokale CSV-Dateien bleiben stabiler und sind für saubere Ergebnisse empfohlen.
+    """
+    partial_results: list[pd.DataFrame] = []
+
     for table in tables:
         table = normalize_columns(table)
         columns = list(table.columns)
-        name_col = find_col(columns, ["Company", "Unternehmen", "Name", "Constituent", "Security"])
-        ticker_col = find_col(columns, ["Ticker symbol", "Ticker", "Symbol"])
-        sector_col = find_col(columns, ["Industry", "Sector", "Industrie", "Branche"])
+        name_col = find_col(columns, [
+            "Company", "Unternehmen", "Name", "Constituent", "Security", "Issuer", "Emittent"
+        ])
+        ticker_col = find_col(columns, [
+            "Ticker symbol", "Ticker", "Symbol", "Yahoo", "Yahoo symbol"
+        ])
+        sector_col = find_col(columns, [
+            "Industry", "Sector", "Industrie", "Branche", "Prime Standard sector", "Supersector"
+        ])
 
-        if not name_col or not ticker_col:
+        if not name_col:
             continue
-        if any(word in ticker_col.lower() for word in ("isin", "wkn")):
-            continue
+        if ticker_col and any(word in ticker_col.lower() for word in ("isin", "wkn")):
+            ticker_col = None
 
-        result = table[[name_col, ticker_col]].copy()
-        result.columns = ["name", "ticker_yahoo"]
+        if ticker_col:
+            result = table[[name_col, ticker_col]].copy()
+            result.columns = ["name", "ticker_yahoo"]
+            result["ticker_yahoo"] = (
+                result["ticker_yahoo"].astype(str)
+                .str.replace(r"\[.*?\]", "", regex=True)
+                .str.replace("\xa0", " ", regex=False)
+                .str.strip()
+            )
+            result["ticker_yahoo"] = result["ticker_yahoo"].apply(
+                lambda ticker: ticker if "." in ticker else f"{ticker}.DE"
+            )
+        else:
+            # Fallback für Tabellen ohne Symbol-Spalte, z. B. manche SDAX-Seiten.
+            if len(table) < max(10, int(min_rows * 0.5)):
+                continue
+            result = table[[name_col]].copy()
+            result.columns = ["name"]
+            result["ticker_yahoo"] = result["name"].astype(str).map(resolve_german_yahoo_ticker)
+
         result["sector"] = table[sector_col] if sector_col else "Unbekannt"
-        result["ticker_yahoo"] = (
-            result["ticker_yahoo"].astype(str)
-            .str.replace(r"\[.*?\]", "", regex=True)
-            .str.strip()
-        )
-        result = result[result["ticker_yahoo"].str.len().gt(0)]
-        result["ticker_yahoo"] = result["ticker_yahoo"].apply(
-            lambda ticker: ticker if "." in ticker else f"{ticker}.DE"
-        )
-        result = validate_constituents(result)
-        if len(result) >= 30:
+        try:
+            result = validate_constituents(result)
+        except Exception:
+            continue
+
+        if len(result) >= min_rows:
             return result
-    raise RuntimeError("Keine passende DAX-Tabelle mit Yahoo-Tickern gefunden.")
+        if not result.empty:
+            partial_results.append(result)
+
+    if partial_results:
+        combined = pd.concat(partial_results, ignore_index=True)
+        combined = validate_constituents(combined)
+        # Lieber einen teilweise geladenen SDAX anzeigen als komplett scheitern;
+        # im UI kann später eine Warnung ergänzt werden. Für exakte Listen: CSV nutzen.
+        if len(combined) >= max(10, int(min_rows * 0.4)):
+            return combined
+
+    raise RuntimeError(f"Keine passende {index_label}-Tabelle mit Yahoo-Tickern gefunden.")
+
+
+def parse_dax_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    return parse_german_index_tables(tables, min_rows=30, index_label="DAX")
 
 
 def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
@@ -330,28 +469,33 @@ def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def load_index_constituents(index_name: str) -> pd.DataFrame:
     """Lädt zuerst eine optionale lokale CSV, sonst Wikipedia als Fallback."""
-    local_files = {
-        "DAX 40": INDEX_DIR / "dax40.csv",
-        "S&P 500": INDEX_DIR / "sp500.csv",
-    }
-    local_path = local_files.get(index_name)
+    local_path = INDEX_LOCAL_FILES.get(index_name)
     if local_path and local_path.exists():
         return validate_constituents(pd.read_csv(local_path))
 
-    if index_name == "DAX 40":
+    if index_name in GERMAN_INDEX_SOURCES:
+        config = GERMAN_INDEX_SOURCES[index_name]
         errors: list[str] = []
-        for url in ("https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"):
+        for url in config["urls"]:
             try:
-                return parse_dax_tables(read_html_tables(fetch_html(url)))
+                return parse_german_index_tables(
+                    read_html_tables(fetch_html(url)),
+                    min_rows=int(config["min_rows"]),
+                    index_label=index_name,
+                )
             except Exception as error:
                 errors.append(f"{url}: {error}")
-        raise RuntimeError("DAX konnte nicht geladen werden. " + " | ".join(errors))
+        raise RuntimeError(f"{index_name} konnte nicht geladen werden. " + " | ".join(errors))
 
     if index_name == "S&P 500":
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         return parse_sp500_tables(read_html_tables(fetch_html(url)))
 
     raise ValueError(f"Unbekannter Index: {index_name}")
+
+
+def benchmark_for_index(index_name: str) -> str:
+    return BENCHMARK_BY_INDEX.get(index_name, "^GSPC")
 
 
 # -----------------------------------------------------------------------------
@@ -2366,7 +2510,7 @@ def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_
     ticker = st.selectbox("Aktie für Vergleich", df["ticker_yahoo"].tolist(), key="research_ticker")
     use_adjusted = st.checkbox("Bereinigte Kurse verwenden (Adj Close)", value=True, key="research_adjusted")
     history = histories.get(ticker, pd.DataFrame())
-    benchmark_ticker = "^GDAXI" if index_name == "DAX 40" else "^GSPC"
+    benchmark_ticker = benchmark_for_index(index_name)
     benchmark = fetch_benchmark_history(benchmark_ticker, period="5y")
     column = "Adj Close" if use_adjusted and "Adj Close" in history.columns else "Close"
     benchmark_column = "Adj Close" if use_adjusted and "Adj Close" in benchmark.columns else "Close"
@@ -3383,8 +3527,8 @@ def main() -> None:
     # ----- Sidebar: Daten, Filter und Scanner-Parameter -----
     with st.sidebar:
         st.header("Analyse-Einstellungen")
-        index_name = st.selectbox("Index", ["DAX 40", "S&P 500"], key="index_name")
-        st.caption("Für maximale Stabilität: data/indices/dax40.csv oder sp500.csv pflegen; Wikipedia bleibt nur Fallback.")
+        index_name = st.selectbox("Index", INDEX_OPTIONS, key="index_name")
+        st.caption("Optional stabiler über CSV: data/indices/dax40.csv, mdax.csv, sdax.csv oder sp500.csv. Wikipedia bleibt nur Fallback.")
 
         try:
             constituents = load_index_constituents(index_name)
@@ -3406,12 +3550,20 @@ def main() -> None:
             )
             filtered_constituents = filtered_constituents[mask]
 
-        maximum = min(150 if index_name == "S&P 500" else len(filtered_constituents), len(filtered_constituents))
+        maximum = len(filtered_constituents)
         if maximum <= 0:
             st.error("Der Filter enthält keine Unternehmen.")
             st.stop()
         default_count = min(40, maximum)
-        max_stocks = st.slider("Max. Unternehmen laden", min_value=1, max_value=maximum, value=default_count, step=1)
+        slider_step = 1 if maximum <= 150 else 10
+        max_stocks = st.slider(
+            "Max. Unternehmen laden",
+            min_value=1,
+            max_value=maximum,
+            value=default_count,
+            step=slider_step,
+            help="Mehr Unternehmen bedeuten deutlich längere Ladezeiten, weil viele Fundamentaldaten einzeln abgefragt werden.",
+        )
 
         st.divider()
         st.header("Scanner-Profil")
