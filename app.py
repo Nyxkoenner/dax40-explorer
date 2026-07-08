@@ -3199,7 +3199,7 @@ def render_overview(df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
         "Value-Score und Value-Trigger sind verschieden: Der Score ordnet Kandidaten ein; der Trigger ist ein strenger Filter, "
-        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach BAT-ähnlichen Sondersituationen."
+        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach Sondersituationen."
     )
     st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
@@ -3359,7 +3359,7 @@ def render_value_trigger_explanation(
 def render_special_situation_scanner(df: pd.DataFrame) -> None:
     st.subheader("Sondersituation / Deep Value")
     st.caption(
-        "Dieser Scanner sucht nach BAT-ähnlichen Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
+        "Dieser Scanner sucht nach  Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
         "und trotzdem positive Cashflows. Das ist ein Research-Hinweis, keine Kaufempfehlung."
     )
 
@@ -3458,7 +3458,7 @@ def render_special_situation_scanner(df: pd.DataFrame) -> None:
             "Bitte prüfen, ob der Gewinnrückgang operativ oder bilanziell/Sondereffekt-getrieben ist."
         )
     elif safe_float(row.get("special_situation_score")) is not None and safe_float(row.get("special_situation_score")) >= 55:
-        st.info("Teilweise BAT-ähnliches Profil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
+        st.info("Teilweise Sonderprofil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
     else:
         st.info("Aktuell kein klares BAT-/Deep-Value-Muster nach den hinterlegten Regeln.")
 
