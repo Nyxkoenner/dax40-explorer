@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.3"
+APP_VERSION = "4.4"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -96,19 +96,123 @@ FINANCIAL_SECTOR_TERMS = {
     "capital markets",
 }
 
-POSITIVE_WORDS = {
-    "beat", "beats", "record", "strong", "upgrade", "upgrades", "buy",
-    "outperform", "bullish", "profit", "growth", "raised", "raise",
-    "besser als erwartet", "rekord", "stark", "angehoben", "kaufen",
-    "gewinn", "wachstum", "übertrifft", "uebertrifft",
+# Gewichtete Phrasen statt einzelner, mehrdeutiger Wörter. Dadurch wird z. B.
+# "profit warning" nicht mehr durch das Wort "profit" fälschlich neutralisiert.
+# Der Score ist eine transparente Heuristik auf Basis von Überschrift und RSS-
+# Beschreibung; er ersetzt keine vollständige Artikelanalyse.
+POSITIVE_SENTIMENT_PHRASES: dict[str, int] = {
+    "beats estimates": 3,
+    "beat estimates": 3,
+    "better than expected": 3,
+    "uebertrifft erwartungen": 3,
+    "besser als erwartet": 3,
+    "raises guidance": 3,
+    "raised guidance": 3,
+    "guidance raised": 3,
+    "prognose angehoben": 3,
+    "hebt prognose an": 3,
+    "erhoeht prognose": 3,
+    "record profit": 3,
+    "record revenue": 3,
+    "rekordgewinn": 3,
+    "rekordumsatz": 3,
+    "dividend increase": 3,
+    "dividend raised": 3,
+    "raises dividend": 3,
+    "dividende erhoeht": 3,
+    "erhoeht dividende": 3,
+    "share buyback": 2,
+    "stock buyback": 2,
+    "aktienrueckkauf": 2,
+    "analyst upgrade": 2,
+    "upgraded to buy": 2,
+    "upgrade to buy": 2,
+    "outperform rating": 2,
+    "kursziel angehoben": 2,
+    "hebt kursziel": 2,
+    "heben kursziel": 2,
+    "wins contract": 2,
+    "contract win": 2,
+    "auftrag gewonnen": 2,
+    "starkes wachstum": 2,
+    "strong growth": 2,
+    "profit rises": 2,
+    "earnings rise": 2,
+    "gewinn steigt": 2,
+    "revenue rises": 1,
+    "sales rise": 1,
+    "umsatz steigt": 1,
+    "margin improvement": 2,
+    "margin expands": 2,
+    "marge verbessert": 2,
+    "debt reduced": 2,
+    "reduces debt": 2,
+    "verschuldung gesenkt": 2,
+    "regulatory approval": 2,
+    "zulassung erhalten": 2,
 }
 
-NEGATIVE_WORDS = {
-    "warning", "profit warning", "miss", "downgrade", "sell", "weak",
-    "loss", "fraud", "investigation", "lawsuit", "cut", "cuts",
-    "warnung", "gewinnwarnung", "verfehlt", "herabgestuft", "verkaufen",
-    "schwach", "verlust", "betrug", "untersuchung", "klage", "senken",
+NEGATIVE_SENTIMENT_PHRASES: dict[str, int] = {
+    "profit warning": 4,
+    "gewinnwarnung": 4,
+    "cuts guidance": 3,
+    "cut guidance": 3,
+    "guidance cut": 3,
+    "lowers guidance": 3,
+    "senkt prognose": 3,
+    "prognose gesenkt": 3,
+    "dividend cut": 4,
+    "cuts dividend": 4,
+    "dividende gekuerzt": 4,
+    "kuerzt dividende": 4,
+    "suspends dividend": 4,
+    "dividende ausgesetzt": 4,
+    "misses estimates": 3,
+    "missed estimates": 3,
+    "below expectations": 3,
+    "verfehlt erwartungen": 3,
+    "unter den erwartungen": 3,
+    "analyst downgrade": 2,
+    "downgraded to sell": 2,
+    "underperform rating": 2,
+    "kursziel gesenkt": 2,
+    "senkt kursziel": 2,
+    "lawsuit": 2,
+    "class action": 2,
+    "klage": 2,
+    "investigation": 2,
+    "untersuchung": 2,
+    "fraud": 4,
+    "betrug": 4,
+    "recall": 2,
+    "product recall": 2,
+    "rueckruf": 2,
+    "job cuts": 2,
+    "layoffs": 2,
+    "stellenabbau": 2,
+    "loss widens": 3,
+    "verlust weitet sich aus": 3,
+    "revenue falls": 2,
+    "sales fall": 2,
+    "umsatz sinkt": 2,
+    "profit falls": 2,
+    "earnings fall": 2,
+    "gewinn sinkt": 2,
+    "bankruptcy": 5,
+    "insolvency": 5,
+    "insolvenz": 5,
+    "regulatory setback": 2,
+    "trial fails": 3,
+    "clinical trial failure": 3,
+    "studie gescheitert": 3,
+    "plant closure": 2,
+    "werksschliessung": 2,
+    "ruecklaeufe": 1,
 }
+
+# Beibehalten für ältere Hilfsfunktionen/Kompatibilität.
+POSITIVE_WORDS = set(POSITIVE_SENTIMENT_PHRASES)
+NEGATIVE_WORDS = set(NEGATIVE_SENTIMENT_PHRASES)
 
 RSS_SOURCES = [
     "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
@@ -1914,13 +2018,84 @@ def contains_alias(text: str, aliases: list[str]) -> bool:
     return any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lower_text) for alias in aliases)
 
 
+def _sentiment_phrase_present(text: str, phrase: str) -> bool:
+    """Prüft normalisierte Phrasen mit Wortgrenzen statt riskanter Teilstrings."""
+    normalized_text = f" {normalize_for_search(text)} "
+    normalized_phrase = normalize_for_search(phrase)
+    return bool(normalized_phrase and f" {normalized_phrase} " in normalized_text)
+
+
+def analyze_sentiment(title: str, summary: str = "") -> dict[str, Any]:
+    """Gewichtete, nachvollziehbare News-Sentiment-Heuristik.
+
+    Überschriften werden doppelt gewichtet, weil RSS-Beschreibungen oft fremde
+    Navigationstexte oder Wiederholungen enthalten. Sobald klare positive und
+    negative Signale gleichzeitig vorkommen, lautet das Label bewusst
+    ``gemischt`` statt einer irreführenden Neutralisierung.
+    """
+    positive_points = 0
+    negative_points = 0
+    positive_hits: list[str] = []
+    negative_hits: list[str] = []
+
+    for phrase, weight in POSITIVE_SENTIMENT_PHRASES.items():
+        if _sentiment_phrase_present(title, phrase):
+            positive_points += int(weight) * 2
+            positive_hits.append(phrase)
+        elif summary and _sentiment_phrase_present(summary, phrase):
+            positive_points += int(weight)
+            positive_hits.append(phrase)
+
+    for phrase, weight in NEGATIVE_SENTIMENT_PHRASES.items():
+        if _sentiment_phrase_present(title, phrase):
+            negative_points += int(weight) * 2
+            negative_hits.append(phrase)
+        elif summary and _sentiment_phrase_present(summary, phrase):
+            negative_points += int(weight)
+            negative_hits.append(phrase)
+
+    raw_score = max(-10, min(10, positive_points - negative_points))
+
+    if positive_points >= 2 and negative_points >= 2:
+        label = "gemischt"
+    elif raw_score >= 2:
+        label = "positiv"
+    elif raw_score <= -2:
+        label = "negativ"
+    else:
+        label = "neutral"
+
+    strongest = max(positive_points, negative_points)
+    if label == "gemischt" and min(positive_points, negative_points) >= 4:
+        confidence = "hoch"
+    elif strongest >= 6:
+        confidence = "hoch"
+    elif strongest >= 3:
+        confidence = "mittel"
+    else:
+        confidence = "niedrig"
+
+    reason_parts: list[str] = []
+    if positive_hits:
+        reason_parts.append("Positiv: " + ", ".join(dict.fromkeys(positive_hits[:3])))
+    if negative_hits:
+        reason_parts.append("Negativ: " + ", ".join(dict.fromkeys(negative_hits[:3])))
+    reason = " | ".join(reason_parts) if reason_parts else "Keine eindeutige richtungsweisende Phrase erkannt."
+
+    return {
+        "score": int(raw_score),
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+        "positive_points": int(positive_points),
+        "negative_points": int(negative_points),
+    }
+
+
 def simple_sentiment(text: str) -> tuple[int, str]:
-    lower_text = text.lower()
-    positive = sum(1 for word in POSITIVE_WORDS if word in lower_text)
-    negative = sum(1 for word in NEGATIVE_WORDS if word in lower_text)
-    score = positive - negative
-    label = "positiv" if score > 0 else "negativ" if score < 0 else "neutral"
-    return score, label
+    """Kompatibilitäts-Wrapper für ältere Aufrufstellen."""
+    result = analyze_sentiment(text, "")
+    return int(result["score"]), str(result["label"])
 
 
 def entry_datetime(entry: Any) -> Optional[datetime]:
@@ -1983,6 +2158,8 @@ def fetch_news_for_ticker(ticker: str, company_name: str, days_back: int, max_it
                 "source": source_name,
                 "sentiment_score": score,
                 "sentiment_label": label,
+                "sentiment_confidence": "niedrig",
+                "sentiment_reason": "Legacy-RSS-Auswertung",
             })
 
     if not entries:
@@ -2173,8 +2350,9 @@ def empty_news_frame() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "published", "ticker_yahoo", "title", "link", "source", "source_kind",
-            "matched_alias", "sentiment_score", "sentiment_label", "event_type",
-            "relevance_score", "relevance_label", "relevance_reason", "is_relevant",
+            "matched_alias", "sentiment_score", "sentiment_label", "sentiment_confidence",
+            "sentiment_reason", "event_type", "relevance_score", "relevance_label",
+            "relevance_reason", "is_relevant",
         ]
     )
 
@@ -2183,7 +2361,8 @@ def empty_events_frame() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "date", "ticker_yahoo", "event_type", "title", "source", "link",
-            "sentiment_score", "sentiment_label", "importance", "is_future_event",
+            "sentiment_score", "sentiment_label", "sentiment_confidence",
+            "sentiment_reason", "importance", "is_future_event",
         ]
     )
 
@@ -2385,21 +2564,47 @@ def save_aliases_for_ticker(ticker: str, aliases_text: str) -> None:
     safe_write_csv(alias_frame, ALIAS_PATH)
 
 
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    normalized_text = f" {normalize_for_search(text)} "
+    normalized_phrase = normalize_for_search(phrase)
+    return bool(normalized_phrase and f" {normalized_phrase} " in normalized_text)
+
+
 def classify_event_from_text(text: str) -> str:
-    """Ordnet nur konkrete Finanzereignisse ein; allgemeine News bleiben News."""
-    normalized = normalize_for_search(text)
-    if any(phrase in normalized for phrase in [
-        "quarterly results", "quarterly earnings", "earnings results", "quartalszahlen",
-        "quartalsbericht", "geschaeftszahlen", "geschäftszahlen", "jahreszahlen",
-    ]):
+    """Ordnet nur konkrete Finanzereignisse mit Wortgrenzen ein.
+
+    Das verhindert z. B., dass das Kürzel ``AGM`` versehentlich innerhalb des
+    Wortes ``Dienstagmittag`` als Hauptversammlung erkannt wird.
+    """
+    earnings_phrases = [
+        "quarterly results", "quarterly earnings", "earnings results", "earnings release",
+        "quartalszahlen", "quartalsbericht", "geschaeftszahlen", "jahreszahlen",
+        "full year results", "half year results", "halbjahreszahlen",
+    ]
+    dividend_phrases = [
+        "ex dividend", "ex dividende", "dividend payment", "dividendenzahlung",
+        "dividend increase", "dividend cut", "dividende", "dividend",
+    ]
+    meeting_phrases = [
+        "hauptversammlung", "annual general meeting", "annual meeting", "agm",
+    ]
+    report_phrases = [
+        "geschaeftsbericht", "annual report", "sustainability report", "nachhaltigkeitsbericht",
+    ]
+    analyst_phrases = [
+        "analyst", "analysts", "analysten", "kursziel", "price target", "rating",
+        "upgrade", "downgrade", "outperform", "underperform",
+    ]
+
+    if any(_contains_normalized_phrase(text, phrase) for phrase in earnings_phrases):
         return "earnings"
-    if any(phrase in normalized for phrase in ["ex divid", "dividend", "dividende"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in dividend_phrases):
         return "dividend"
-    if any(phrase in normalized for phrase in ["hauptversammlung", "annual general meeting", "annual meeting", "agm"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in meeting_phrases):
         return "annual_meeting"
-    if any(phrase in normalized for phrase in ["geschaeftsbericht", "geschäftsbericht", "annual report", "quarterly report"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in report_phrases):
         return "report"
-    if any(phrase in normalized for phrase in ["kursziel", "analyst", "upgrade", "downgrade", "outperform", "underperform"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in analyst_phrases):
         return "analyst"
     return "news"
 
@@ -2538,7 +2743,9 @@ def fetch_news_bundle(
                 diagnostic["uncertain_matches"] += 1
 
             combined_text = f"{entry['title']} {entry['summary']}"
-            sentiment_score, sentiment_label = simple_sentiment(combined_text)
+            sentiment_result = analyze_sentiment(entry["title"], entry["summary"])
+            sentiment_score = int(sentiment_result["score"])
+            sentiment_label = str(sentiment_result["label"])
             event_type = classify_event_from_text(combined_text) if bool(relevance["is_relevant"]) else "news"
             news_rows.append(
                 {
@@ -2551,6 +2758,8 @@ def fetch_news_bundle(
                     "matched_alias": relevance["matched_alias"],
                     "sentiment_score": sentiment_score,
                     "sentiment_label": sentiment_label,
+                    "sentiment_confidence": sentiment_result["confidence"],
+                    "sentiment_reason": sentiment_result["reason"],
                     "event_type": event_type,
                     "relevance_score": relevance["relevance_score"],
                     "relevance_label": relevance["relevance_label"],
@@ -2716,6 +2925,8 @@ def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
             "link": eligible.get("link", ""),
             "sentiment_score": eligible.get("sentiment_score", 0.0),
             "sentiment_label": eligible.get("sentiment_label", "neutral"),
+            "sentiment_confidence": eligible.get("sentiment_confidence", "niedrig"),
+            "sentiment_reason": eligible.get("sentiment_reason", ""),
             "importance": "mittel",
             "is_future_event": False,
         }
@@ -2777,6 +2988,8 @@ def load_persisted_events(ticker: str, days_back: int = 1825) -> pd.DataFrame:
     for column, default in {
         "sentiment_score": 0.0,
         "sentiment_label": "neutral",
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "",
         "importance": "mittel",
         "is_future_event": False,
         "link": "",
@@ -3071,6 +3284,82 @@ def render_company_profile(ticker: str) -> None:
     )
 
 
+def sentiment_badge(label: Any) -> str:
+    normalized = str(label or "neutral").lower()
+    return {
+        "positiv": "🟢 Positiv",
+        "negativ": "🔴 Negativ",
+        "gemischt": "🟡 Gemischt",
+        "neutral": "⚪ Neutral",
+    }.get(normalized, "⚪ Neutral")
+
+
+def sentiment_cell_style(value: Any) -> str:
+    normalized = str(value or "").lower()
+    if "positiv" in normalized:
+        return "color: #166534; background-color: #dcfce7; font-weight: 700"
+    if "negativ" in normalized:
+        return "color: #991b1b; background-color: #fee2e2; font-weight: 700"
+    if "gemischt" in normalized:
+        return "color: #854d0e; background-color: #fef9c3; font-weight: 700"
+    return "color: #475569; background-color: #f1f5f9"
+
+
+def _event_type_label(value: Any) -> str:
+    event_type = str(value or "news")
+    icon = {
+        "news": "📰",
+        "earnings": "📊",
+        "dividend": "💶",
+        "annual_meeting": "🗳️",
+        "report": "📄",
+        "analyst": "🎯",
+    }.get(event_type, "•")
+    label = EVENT_META.get(event_type, {}).get("label", event_type)
+    return f"{icon} {label}"
+
+
+def _friendly_event_date(value: Any) -> str:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return "–"
+    if timestamp.hour == 0 and timestamp.minute == 0:
+        return timestamp.strftime("%d.%m.%Y")
+    return timestamp.strftime("%d.%m.%Y, %H:%M")
+
+
+def _render_event_table(frame: pd.DataFrame, empty_message: str) -> None:
+    if frame.empty:
+        st.info(empty_message)
+        return
+
+    display = frame.copy()
+    display["Datum"] = display["date"].map(_friendly_event_date)
+    display["Typ"] = display["event_type"].map(_event_type_label)
+    display["Titel"] = display.get("title", "").fillna("")
+    display["Quelle"] = display.get("source", "").fillna("")
+    display["Sentiment"] = display.get("sentiment_label", "neutral").map(sentiment_badge)
+    display["Sicherheit"] = display.get("sentiment_confidence", "niedrig").fillna("niedrig").astype(str).str.capitalize()
+    display["Begründung"] = display.get("sentiment_reason", "").fillna("")
+    display["Artikel"] = display.get("link", "").fillna("")
+
+    visible = ["Datum", "Typ", "Titel", "Quelle", "Sentiment", "Sicherheit", "Begründung", "Artikel"]
+    styled = display[visible].style.map(sentiment_cell_style, subset=["Sentiment"])
+    try:
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Artikel": st.column_config.LinkColumn("Artikel", display_text="Öffnen"),
+                "Titel": st.column_config.TextColumn("Titel", width="large"),
+                "Begründung": st.column_config.TextColumn("Warum?", width="large"),
+            },
+        )
+    except (TypeError, AttributeError):
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 def render_event_calendar(events: pd.DataFrame) -> None:
     st.markdown("#### Ereigniskalender")
     if events is None or events.empty:
@@ -3079,18 +3368,70 @@ def render_event_calendar(events: pd.DataFrame) -> None:
 
     display = events.copy()
     display["date"] = pd.to_datetime(display["date"], errors="coerce")
-    display["Typ"] = display["event_type"].map(lambda value: EVENT_META.get(str(value), {}).get("label", str(value)))
-    future_flags = display["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"})
-    display["Zukunft"] = future_flags.map(lambda value: "Ja" if value else "Nein")
-    visible = ["date", "ticker_yahoo", "Typ", "title", "source", "sentiment_label", "Zukunft", "link"]
-    visible = [column for column in visible if column in display.columns]
-    st.dataframe(
-        display[visible].sort_values("date", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+    display = display.dropna(subset=["date"])
+    if display.empty:
+        st.info("Die gespeicherten Ereignisse enthalten keine gültigen Datumswerte.")
+        return
 
+    event_options = sorted(display["event_type"].dropna().astype(str).unique().tolist())
+    sentiment_options = ["positiv", "negativ", "gemischt", "neutral"]
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        selected_types = st.multiselect(
+            "Ereignistypen",
+            options=event_options,
+            default=event_options,
+            format_func=lambda value: _event_type_label(value),
+            key="calendar_event_types",
+        )
+    with filter_col2:
+        selected_sentiments = st.multiselect(
+            "Sentiment",
+            options=sentiment_options,
+            default=sentiment_options,
+            format_func=sentiment_badge,
+            key="calendar_sentiments",
+        )
 
+    if selected_types:
+        display = display[display["event_type"].astype(str).isin(selected_types)]
+    else:
+        display = display.iloc[0:0]
+    if selected_sentiments:
+        display = display[display.get("sentiment_label", "neutral").fillna("neutral").astype(str).str.lower().isin(selected_sentiments)]
+    else:
+        display = display.iloc[0:0]
+
+    today = pd.Timestamp.now().normalize()
+    future_flags = display.get("is_future_event", False).astype(str).str.lower().isin({"true", "1", "yes", "ja"})
+    upcoming_mask = future_flags | (display["date"].dt.normalize() >= today)
+    upcoming = display[upcoming_mask].sort_values("date", ascending=True)
+    past = display[~upcoming_mask].sort_values("date", ascending=False)
+
+    counts = st.columns(4)
+    counts[0].metric("Kommende Termine", len(upcoming))
+    counts[1].metric("Positive Ereignisse", int((display.get("sentiment_label", "neutral").astype(str).str.lower() == "positiv").sum()))
+    counts[2].metric("Negative Ereignisse", int((display.get("sentiment_label", "neutral").astype(str).str.lower() == "negativ").sum()))
+    counts[3].metric("Gemischt/Neutral", int(display.get("sentiment_label", "neutral").astype(str).str.lower().isin(["gemischt", "neutral"]).sum()))
+
+    st.markdown("##### Kommende Termine")
+    _render_event_table(upcoming, "Keine kommenden Termine für die gewählten Filter.")
+
+    with st.expander(f"Vergangene Ereignisse ({len(past)})", expanded=upcoming.empty):
+        _render_event_table(past, "Keine vergangenen Ereignisse für die gewählten Filter.")
+
+    with st.expander("Wie werden Ereignistyp und Sentiment bestimmt?", expanded=False):
+        st.markdown(
+            """
+- **Ereignistyp** und **Sentiment** sind getrennt: Eine Quartalszahl oder Dividende ist zunächst neutral. Erst Formulierungen wie „Erwartungen übertroffen“, „Prognose angehoben“ oder „Dividende gekürzt“ erzeugen eine Richtung.
+- **Positiv**: u. a. Erwartungsübertreffen, Prognoseanhebung, Dividendenerhöhung, Aktienrückkauf, Analysten-Upgrade, Schuldenabbau.
+- **Negativ**: u. a. Gewinnwarnung, Prognosesenkung, Dividendenkürzung, Erwartungsverfehlung, Analysten-Downgrade, Klage/Untersuchung oder Insolvenz.
+- **Gemischt**: klare positive und negative Signale stehen gleichzeitig in Überschrift/Beschreibung, etwa „Erwartungen übertroffen, aber Prognose gesenkt“.
+- **Neutral**: kein eindeutiges Richtungssignal; ein bloßer Termin oder ein allgemeiner Analystenartikel bleibt neutral.
+
+Die Bewertung nutzt nur RSS-Überschrift und -Beschreibung. Ironie, komplexe Zusammenhänge und der vollständige Artikel können dadurch nicht sicher erfasst werden.
+            """
+        )
 
 
 
@@ -4132,26 +4473,50 @@ def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> 
         )
 
 
+def _sentiment_badge_html(label: Any) -> str:
+    normalized = str(label or "neutral").lower()
+    styles = {
+        "positiv": ("Positiv", "#166534", "#dcfce7", "#86efac"),
+        "negativ": ("Negativ", "#991b1b", "#fee2e2", "#fca5a5"),
+        "gemischt": ("Gemischt", "#854d0e", "#fef9c3", "#fde047"),
+        "neutral": ("Neutral", "#475569", "#f1f5f9", "#cbd5e1"),
+    }
+    text_label, color, background, border = styles.get(normalized, styles["neutral"])
+    return (
+        f'<span style="display:inline-block;padding:0.18rem 0.55rem;border-radius:999px;'
+        f'font-weight:700;font-size:0.8rem;color:{color};background:{background};'
+        f'border:1px solid {border};">{text_label}</span>'
+    )
+
+
 def render_news_card(item: pd.Series, card_index: int) -> None:
-    """Kompakte, lesbare News-Karte statt einer breiten Rohdaten-Tabelle."""
+    """Kompakte News-Karte mit klarer Sentimentfarbe und Begründung."""
     published = pd.to_datetime(item.get("published"), errors="coerce")
     date_label = published.strftime("%d.%m.%Y, %H:%M") if pd.notna(published) else "Datum unbekannt"
     event_label = EVENT_META.get(str(item.get("event_type", "news")), {}).get("label", "News")
-    sentiment = str(item.get("sentiment_label") or "neutral").capitalize()
+    sentiment_label = str(item.get("sentiment_label") or "neutral").lower()
     relevance = str(item.get("relevance_label") or "–").capitalize()
+    confidence = str(item.get("sentiment_confidence") or "niedrig").capitalize()
 
     with st.container(border=True):
-        st.markdown(f"**{str(item.get('title') or 'Ohne Titel')}**")
+        header_left, header_right = st.columns([5, 1])
+        with header_left:
+            st.markdown(f"**{str(item.get('title') or 'Ohne Titel')}**")
+        with header_right:
+            st.markdown(_sentiment_badge_html(sentiment_label), unsafe_allow_html=True)
+
         st.caption(
-            f"{event_label} · {sentiment} · Relevanz: {relevance} · "
+            f"{event_label} · Relevanz: {relevance} · Sentiment-Sicherheit: {confidence} · "
             f"{str(item.get('source') or 'Quelle unbekannt')} · {date_label}"
         )
-        reason = str(item.get("relevance_reason") or "").strip()
-        if reason:
-            st.caption(f"Warum zugeordnet: {reason}")
+        sentiment_reason = str(item.get("sentiment_reason") or "").strip()
+        if sentiment_reason:
+            st.caption(f"Sentiment-Begründung: {sentiment_reason}")
+        relevance_reason = str(item.get("relevance_reason") or "").strip()
+        if relevance_reason:
+            st.caption(f"Firmenzuordnung: {relevance_reason}")
         link = str(item.get("link") or "").strip()
         if link:
-            # Kompatibel mit älteren Streamlit-Versionen, deren link_button noch kein key-Argument unterstützt.
             try:
                 st.link_button(
                     "Artikel öffnen",
@@ -4187,6 +4552,14 @@ def render_news_summary(
     st.markdown("#### Einordnung")
     st.info(headline)
 
+    if not relevant_news.empty:
+        labels = relevant_news.get("sentiment_label", pd.Series("neutral", index=relevant_news.index)).fillna("neutral").astype(str).str.lower()
+        sentiment_counts = st.columns(4)
+        sentiment_counts[0].metric("🟢 Positiv", int((labels == "positiv").sum()))
+        sentiment_counts[1].metric("🔴 Negativ", int((labels == "negativ").sum()))
+        sentiment_counts[2].metric("🟡 Gemischt", int((labels == "gemischt").sum()))
+        sentiment_counts[3].metric("⚪ Neutral", int((labels == "neutral").sum()))
+
     notes: list[str] = []
     if not future_events.empty:
         next_event = future_events.iloc[0]
@@ -4212,6 +4585,19 @@ def render_news(df: pd.DataFrame) -> None:
         "Relevante Unternehmensnews, bestätigte Kalendertermine und technische Quelleninformationen sind getrennt dargestellt. "
         "Mehrdeutige Ticker werden bewusst strenger gefiltert."
     )
+    with st.expander("Sentiment-Logik kurz erklärt", expanded=False):
+        st.markdown(
+            """
+Das Label beschreibt nur den **Ton der RSS-Überschrift und Kurzbeschreibung**, nicht die Qualität der Aktie.
+
+- 🟢 **Positiv:** klare Verbesserungen wie Prognoseanhebung, Erwartungsübertreffen, Dividendenerhöhung oder Upgrade.
+- 🔴 **Negativ:** klare Verschlechterungen wie Gewinnwarnung, Prognosesenkung, Dividendenkürzung, Verfehlung oder Downgrade.
+- 🟡 **Gemischt:** positive und negative Aussagen gleichzeitig.
+- ⚪ **Neutral:** Termin-/Informationsmeldung ohne klare Richtung.
+
+Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als Beschreibungen. Das Ergebnis ist eine Recherchehilfe, kein Handelssignal.
+            """
+        )
 
     ticker = company_selectbox("Aktie für News", df, key="news_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
@@ -4280,6 +4666,14 @@ def render_news(df: pd.DataFrame) -> None:
     news = bundle["news"].copy()
     diagnostics = bundle["diagnostics"].copy()
     events = bundle["events"].copy()
+    for column, default in {
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "",
+    }.items():
+        if column not in news.columns:
+            news[column] = default
+        if column not in events.columns:
+            events[column] = default
     warning = str(bundle.get("snapshot_warning") or "")
     events_warning = str(bundle.get("events_warning") or "")
     if warning:
