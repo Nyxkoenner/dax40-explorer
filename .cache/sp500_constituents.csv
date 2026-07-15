@@ -1,0 +1,504 @@
+name,ticker_yahoo,sector
+3M,MMM,Industrials
+A. O. Smith,AOS,Industrials
+Abbott Laboratories,ABT,Health Care
+AbbVie,ABBV,Health Care
+Accenture,ACN,Information Technology
+Adobe Inc.,ADBE,Information Technology
+Advanced Micro Devices,AMD,Information Technology
+AES Corporation,AES,Utilities
+Aflac,AFL,Financials
+Agilent Technologies,A,Health Care
+Air Products,APD,Materials
+Airbnb,ABNB,Consumer Discretionary
+Akamai Technologies,AKAM,Information Technology
+Albemarle Corporation,ALB,Materials
+Alexandria Real Estate Equities,ARE,Real Estate
+Align Technology,ALGN,Health Care
+Allegion,ALLE,Industrials
+Alliant Energy,LNT,Utilities
+Allstate,ALL,Financials
+Alphabet Inc. (Class A),GOOGL,Communication Services
+Alphabet Inc. (Class C),GOOG,Communication Services
+Altria,MO,Consumer Staples
+Amazon,AMZN,Consumer Discretionary
+Amcor,AMCR,Materials
+Ameren,AEE,Utilities
+American Electric Power,AEP,Utilities
+American Express,AXP,Financials
+American International Group,AIG,Financials
+American Tower,AMT,Real Estate
+American Water Works,AWK,Utilities
+Ameriprise Financial,AMP,Financials
+Ametek,AME,Industrials
+Amgen,AMGN,Health Care
+Amphenol,APH,Information Technology
+Analog Devices,ADI,Information Technology
+Aon plc,AON,Financials
+APA Corporation,APA,Energy
+Apollo Global Management,APO,Financials
+Apple Inc.,AAPL,Information Technology
+Applied Materials,AMAT,Information Technology
+AppLovin,APP,Information Technology
+Aptiv,APTV,Consumer Discretionary
+Arch Capital Group,ACGL,Financials
+Archer Daniels Midland,ADM,Consumer Staples
+Ares Management,ARES,Financials
+Arista Networks,ANET,Information Technology
+Arthur J. Gallagher & Co.,AJG,Financials
+Assurant,AIZ,Financials
+AT&T,T,Communication Services
+Atmos Energy,ATO,Utilities
+Autodesk,ADSK,Information Technology
+Automatic Data Processing,ADP,Industrials
+AutoZone,AZO,Consumer Discretionary
+AvalonBay Communities,AVB,Real Estate
+Avery Dennison,AVY,Materials
+Axon Enterprise,AXON,Industrials
+Baker Hughes,BKR,Energy
+Ball Corporation,BALL,Materials
+Bank of America,BAC,Financials
+Baxter International,BAX,Health Care
+Becton Dickinson,BDX,Health Care
+Berkshire Hathaway,BRK-B,Financials
+Best Buy,BBY,Consumer Discretionary
+Bio-Techne,TECH,Health Care
+Biogen,BIIB,Health Care
+BlackRock,BLK,Financials
+Blackstone Inc.,BX,Financials
+"Block, Inc.",XYZ,Financials
+BNY Mellon,BNY,Financials
+Boeing,BA,Industrials
+Booking Holdings,BKNG,Consumer Discretionary
+Boston Scientific,BSX,Health Care
+Bristol Myers Squibb,BMY,Health Care
+Broadcom,AVGO,Information Technology
+Broadridge Financial Solutions,BR,Industrials
+Brown & Brown,BRO,Financials
+Brown–Forman,BF-B,Consumer Staples
+Builders FirstSource,BLDR,Industrials
+Bunge Global,BG,Consumer Staples
+"BXP, Inc.",BXP,Real Estate
+C.H. Robinson,CHRW,Industrials
+Cadence Design Systems,CDNS,Information Technology
+Camden Property Trust,CPT,Real Estate
+Capital One,COF,Financials
+Cardinal Health,CAH,Health Care
+Carnival Corporation,CCL,Consumer Discretionary
+Carrier Global,CARR,Industrials
+Carvana,CVNA,Consumer Discretionary
+Casey's,CASY,Consumer Staples
+Caterpillar Inc.,CAT,Industrials
+Cboe Global Markets,CBOE,Financials
+CBRE Group,CBRE,Real Estate
+CDW Corporation,CDW,Information Technology
+Cencora,COR,Health Care
+Centene Corporation,CNC,Health Care
+CenterPoint Energy,CNP,Utilities
+CF Industries,CF,Materials
+Charles River Laboratories,CRL,Health Care
+Charles Schwab Corporation,SCHW,Financials
+Charter Communications,CHTR,Communication Services
+Chevron Corporation,CVX,Energy
+Chipotle Mexican Grill,CMG,Consumer Discretionary
+Chubb Limited,CB,Financials
+Church & Dwight,CHD,Consumer Staples
+Ciena,CIEN,Information Technology
+Cigna,CI,Health Care
+Cincinnati Financial,CINF,Financials
+Cintas,CTAS,Industrials
+Cisco,CSCO,Information Technology
+Citigroup,C,Financials
+Citizens Financial Group,CFG,Financials
+Clorox,CLX,Consumer Staples
+CME Group,CME,Financials
+CMS Energy,CMS,Utilities
+Coca-Cola Company (The),KO,Consumer Staples
+Cognizant,CTSH,Information Technology
+Coherent Corp.,COHR,Information Technology
+Coinbase,COIN,Financials
+Colgate-Palmolive,CL,Consumer Staples
+Comcast,CMCSA,Communication Services
+Comfort Systems USA,FIX,Industrials
+ConocoPhillips,COP,Energy
+Consolidated Edison,ED,Utilities
+Constellation Brands,STZ,Consumer Staples
+Constellation Energy,CEG,Utilities
+Cooper Companies (The),COO,Health Care
+Copart,CPRT,Industrials
+Corning Inc.,GLW,Information Technology
+Corpay,CPAY,Financials
+Corteva,CTVA,Materials
+CoStar Group,CSGP,Real Estate
+Costco,COST,Consumer Staples
+CRH plc,CRH,Materials
+CrowdStrike,CRWD,Information Technology
+Crown Castle,CCI,Real Estate
+CSX Corporation,CSX,Industrials
+Cummins,CMI,Industrials
+CVS Health,CVS,Health Care
+Danaher Corporation,DHR,Health Care
+Darden Restaurants,DRI,Consumer Discretionary
+Datadog,DDOG,Information Technology
+DaVita,DVA,Health Care
+Deckers Brands,DECK,Consumer Discretionary
+Deere & Company,DE,Industrials
+Dell Technologies,DELL,Information Technology
+Delta Air Lines,DAL,Industrials
+Devon Energy,DVN,Energy
+Dexcom,DXCM,Health Care
+Diamondback Energy,FANG,Energy
+Digital Realty,DLR,Real Estate
+Dollar General,DG,Consumer Staples
+Dollar Tree,DLTR,Consumer Staples
+Dominion Energy,D,Utilities
+Domino's,DPZ,Consumer Discretionary
+DoorDash,DASH,Consumer Discretionary
+Dover Corporation,DOV,Industrials
+Dow Inc.,DOW,Materials
+D. R. Horton,DHI,Consumer Discretionary
+DTE Energy,DTE,Utilities
+Duke Energy,DUK,Utilities
+DuPont,DD,Materials
+Eaton Corporation,ETN,Industrials
+eBay Inc.,EBAY,Consumer Discretionary
+EchoStar,ECHO,Communication Services
+Ecolab,ECL,Materials
+Edison International,EIX,Utilities
+Edwards Lifesciences,EW,Health Care
+Electronic Arts,EA,Communication Services
+Elevance Health,ELV,Health Care
+Emcor,EME,Industrials
+Emerson Electric,EMR,Industrials
+Entergy,ETR,Utilities
+EOG Resources,EOG,Energy
+EQT Corporation,EQT,Energy
+Equifax,EFX,Industrials
+Equinix,EQIX,Real Estate
+Equity Residential,EQR,Real Estate
+Erie Indemnity,ERIE,Financials
+Essex Property Trust,ESS,Real Estate
+Estée Lauder Companies (The),EL,Consumer Staples
+Everest Group,EG,Financials
+Evergy,EVRG,Utilities
+Eversource Energy,ES,Utilities
+Exelon,EXC,Utilities
+Expand Energy,EXE,Energy
+Expedia Group,EXPE,Consumer Discretionary
+Expeditors International,EXPD,Industrials
+Extra Space Storage,EXR,Real Estate
+ExxonMobil,XOM,Energy
+"F5, Inc.",FFIV,Information Technology
+FactSet,FDS,Financials
+Fair Isaac,FICO,Information Technology
+Fastenal,FAST,Industrials
+Federal Realty Investment Trust,FRT,Real Estate
+FedEx,FDX,Industrials
+FedEx Freight,FDXF,Industrials
+Fidelity National Information Services,FIS,Financials
+Fifth Third Bancorp,FITB,Financials
+First Solar,FSLR,Information Technology
+FirstEnergy,FE,Utilities
+Fiserv,FISV,Financials
+Flex Ltd.,FLEX,Information Technology
+Ford Motor Company,F,Consumer Discretionary
+Fortinet,FTNT,Information Technology
+Fortive,FTV,Industrials
+Fox Corporation (Class A),FOXA,Communication Services
+Fox Corporation (Class B),FOX,Communication Services
+Franklin Resources,BEN,Financials
+Freeport-McMoRan,FCX,Materials
+Garmin,GRMN,Consumer Discretionary
+Gartner,IT,Information Technology
+GE Aerospace,GE,Industrials
+GE HealthCare,GEHC,Health Care
+GE Vernova,GEV,Industrials
+Gen Digital,GEN,Information Technology
+Generac,GNRC,Industrials
+General Dynamics,GD,Industrials
+General Mills,GIS,Consumer Staples
+General Motors,GM,Consumer Discretionary
+Genuine Parts Company,GPC,Consumer Discretionary
+Gilead Sciences,GILD,Health Care
+Global Payments,GPN,Financials
+Globe Life,GL,Financials
+GoDaddy,GDDY,Information Technology
+Goldman Sachs,GS,Financials
+Halliburton,HAL,Energy
+Hartford (The),HIG,Financials
+Hasbro,HAS,Consumer Discretionary
+HCA Healthcare,HCA,Health Care
+Healthpeak Properties,DOC,Real Estate
+Henry Schein,HSIC,Health Care
+Hershey Company (The),HSY,Consumer Staples
+Hewlett Packard Enterprise,HPE,Information Technology
+Hilton Worldwide,HLT,Consumer Discretionary
+Home Depot (The),HD,Consumer Discretionary
+Honeywell Aerospace,HONA,Industrials
+Honeywell Technologies,HON,Industrials
+Hormel Foods,HRL,Consumer Staples
+Host Hotels & Resorts,HST,Real Estate
+Howmet Aerospace,HWM,Industrials
+HP Inc.,HPQ,Information Technology
+Hubbell Incorporated,HUBB,Industrials
+Humana,HUM,Health Care
+Huntington Bancshares,HBAN,Financials
+Huntington Ingalls Industries,HII,Industrials
+IBM,IBM,Information Technology
+IDEX Corporation,IEX,Industrials
+Idexx Laboratories,IDXX,Health Care
+Illinois Tool Works,ITW,Industrials
+Incyte,INCY,Health Care
+Ingersoll Rand,IR,Industrials
+Insulet Corporation,PODD,Health Care
+Intel,INTC,Information Technology
+Interactive Brokers,IBKR,Financials
+Intercontinental Exchange,ICE,Financials
+International Flavors & Fragrances,IFF,Materials
+International Paper,IP,Materials
+Intuit,INTU,Information Technology
+Intuitive Surgical,ISRG,Health Care
+Invesco,IVZ,Financials
+Invitation Homes,INVH,Real Estate
+IQVIA,IQV,Health Care
+Iron Mountain,IRM,Real Estate
+J.B. Hunt,JBHT,Industrials
+Jabil,JBL,Information Technology
+Jack Henry & Associates,JKHY,Financials
+Jacobs Solutions,J,Industrials
+Johnson & Johnson,JNJ,Health Care
+Johnson Controls,JCI,Industrials
+JPMorgan Chase,JPM,Financials
+Kenvue,KVUE,Consumer Staples
+Keurig Dr Pepper,KDP,Consumer Staples
+KeyCorp,KEY,Financials
+Keysight Technologies,KEYS,Information Technology
+Kimberly-Clark,KMB,Consumer Staples
+Kimco Realty,KIM,Real Estate
+Kinder Morgan,KMI,Energy
+KKR & Co.,KKR,Financials
+KLA Corporation,KLAC,Information Technology
+Kraft Heinz,KHC,Consumer Staples
+Kroger,KR,Consumer Staples
+L3Harris,LHX,Industrials
+Labcorp,LH,Health Care
+Lam Research,LRCX,Information Technology
+Las Vegas Sands,LVS,Consumer Discretionary
+Leidos,LDOS,Industrials
+Lennar,LEN,Consumer Discretionary
+Lennox International,LII,Industrials
+Lilly (Eli),LLY,Health Care
+Linde plc,LIN,Materials
+Live Nation Entertainment,LYV,Communication Services
+Lockheed Martin,LMT,Industrials
+Loews Corporation,L,Financials
+Lowe's,LOW,Consumer Discretionary
+Lululemon Athletica,LULU,Consumer Discretionary
+Lumentum,LITE,Information Technology
+LyondellBasell,LYB,Materials
+M&T Bank,MTB,Financials
+Marathon Petroleum,MPC,Energy
+Marriott International,MAR,Consumer Discretionary
+Marsh McLennan,MRSH,Financials
+Martin Marietta Materials,MLM,Materials
+Marvell Technology,MRVL,Information Technology
+Masco,MAS,Industrials
+Mastercard,MA,Financials
+McCormick & Company,MKC,Consumer Staples
+McDonald's,MCD,Consumer Discretionary
+McKesson Corporation,MCK,Health Care
+Medtronic,MDT,Health Care
+Merck & Co.,MRK,Health Care
+Meta Platforms,META,Communication Services
+MetLife,MET,Financials
+Mettler Toledo,MTD,Health Care
+MGM Resorts,MGM,Consumer Discretionary
+Microchip Technology,MCHP,Information Technology
+Micron Technology,MU,Information Technology
+Microsoft,MSFT,Information Technology
+Mid-America Apartment Communities,MAA,Real Estate
+Moderna,MRNA,Health Care
+Molson Coors Beverage Company,TAP,Consumer Staples
+Mondelez International,MDLZ,Consumer Staples
+Monolithic Power Systems,MPWR,Information Technology
+Monster Beverage,MNST,Consumer Staples
+Moody's Corporation,MCO,Financials
+Morgan Stanley,MS,Financials
+Mosaic Company (The),MOS,Materials
+Motorola Solutions,MSI,Information Technology
+MSCI Inc.,MSCI,Financials
+"Nasdaq, Inc.",NDAQ,Financials
+NetApp,NTAP,Information Technology
+Netflix,NFLX,Communication Services
+Newmont,NEM,Materials
+News Corp (Class A),NWSA,Communication Services
+News Corp (Class B),NWS,Communication Services
+NextEra Energy,NEE,Utilities
+"Nike, Inc.",NKE,Consumer Discretionary
+NiSource,NI,Utilities
+Nordson Corporation,NDSN,Industrials
+Norfolk Southern,NSC,Industrials
+Northern Trust,NTRS,Financials
+Northrop Grumman,NOC,Industrials
+Norwegian Cruise Line Holdings,NCLH,Consumer Discretionary
+NRG Energy,NRG,Utilities
+Nucor,NUE,Materials
+Nvidia,NVDA,Information Technology
+"NVR, Inc.",NVR,Consumer Discretionary
+NXP Semiconductors,NXPI,Information Technology
+O’Reilly Automotive,ORLY,Consumer Discretionary
+Occidental Petroleum,OXY,Energy
+Old Dominion,ODFL,Industrials
+Omnicom Group,OMC,Communication Services
+ON Semiconductor,ON,Information Technology
+Oneok,OKE,Energy
+Oracle Corporation,ORCL,Information Technology
+Otis Worldwide,OTIS,Industrials
+Paccar,PCAR,Industrials
+Packaging Corporation of America,PKG,Materials
+Palantir Technologies,PLTR,Information Technology
+Palo Alto Networks,PANW,Information Technology
+Paramount Skydance Corporation,PSKY,Communication Services
+Parker Hannifin,PH,Industrials
+Paychex,PAYX,Industrials
+PayPal,PYPL,Financials
+Pentair,PNR,Industrials
+PepsiCo,PEP,Consumer Staples
+Pfizer,PFE,Health Care
+PG&E Corporation,PCG,Utilities
+Philip Morris International,PM,Consumer Staples
+Phillips 66,PSX,Energy
+Pinnacle West Capital,PNW,Utilities
+PNC Financial Services,PNC,Financials
+PPG Industries,PPG,Materials
+PPL Corporation,PPL,Utilities
+Principal Financial Group,PFG,Financials
+Procter & Gamble,PG,Consumer Staples
+Progressive Corporation,PGR,Financials
+Prologis,PLD,Real Estate
+Prudential Financial,PRU,Financials
+Public Service Enterprise Group,PEG,Utilities
+PTC Inc.,PTC,Information Technology
+Public Storage,PSA,Real Estate
+PulteGroup,PHM,Consumer Discretionary
+Quanta Services,PWR,Industrials
+Qualcomm,QCOM,Information Technology
+Quest Diagnostics,DGX,Health Care
+Qnity Electronics,Q,Information Technology
+Ralph Lauren Corporation,RL,Consumer Discretionary
+Raymond James Financial,RJF,Financials
+RTX Corporation,RTX,Industrials
+Realty Income,O,Real Estate
+Regency Centers,REG,Real Estate
+Regeneron Pharmaceuticals,REGN,Health Care
+Regions Financial Corporation,RF,Financials
+Republic Services,RSG,Industrials
+ResMed,RMD,Health Care
+Revvity,RVTY,Health Care
+Robinhood Markets,HOOD,Financials
+Rockwell Automation,ROK,Industrials
+"Rollins, Inc.",ROL,Industrials
+Roper Technologies,ROP,Information Technology
+Ross Stores,ROST,Consumer Discretionary
+Royal Caribbean Group,RCL,Consumer Discretionary
+S&P Global,SPGI,Financials
+Salesforce,CRM,Information Technology
+Sandisk,SNDK,Information Technology
+SBA Communications,SBAC,Real Estate
+Schlumberger,SLB,Energy
+Seagate Technology,STX,Information Technology
+Sempra,SRE,Utilities
+ServiceNow,NOW,Information Technology
+Sherwin-Williams,SHW,Materials
+Simon Property Group,SPG,Real Estate
+Skyworks Solutions,SWKS,Information Technology
+J.M. Smucker Company (The),SJM,Consumer Staples
+Smurfit Westrock,SW,Materials
+Snap-on,SNA,Industrials
+Solventum,SOLV,Health Care
+Southern Company,SO,Utilities
+Southwest Airlines,LUV,Industrials
+Stanley Black & Decker,SWK,Industrials
+Starbucks,SBUX,Consumer Discretionary
+State Street Corporation,STT,Financials
+Steel Dynamics,STLD,Materials
+Steris,STE,Health Care
+Stryker Corporation,SYK,Health Care
+Supermicro,SMCI,Information Technology
+Synchrony Financial,SYF,Financials
+Synopsys,SNPS,Information Technology
+Sysco,SYY,Consumer Staples
+T-Mobile US,TMUS,Communication Services
+T. Rowe Price,TROW,Financials
+Take-Two Interactive,TTWO,Communication Services
+"Tapestry, Inc.",TPR,Consumer Discretionary
+Targa Resources,TRGP,Energy
+Target Corporation,TGT,Consumer Staples
+TE Connectivity,TEL,Information Technology
+Teledyne Technologies,TDY,Information Technology
+Teradyne,TER,Information Technology
+"Tesla, Inc.",TSLA,Consumer Discretionary
+Texas Instruments,TXN,Information Technology
+Texas Pacific Land Corporation,TPL,Energy
+Textron,TXT,Industrials
+Thermo Fisher Scientific,TMO,Health Care
+TJX Companies,TJX,Consumer Discretionary
+TKO Group Holdings,TKO,Communication Services
+Trade Desk (The),TTD,Communication Services
+Tractor Supply,TSCO,Consumer Discretionary
+Trane Technologies,TT,Industrials
+TransDigm Group,TDG,Industrials
+Travelers Companies (The),TRV,Financials
+Trimble Inc.,TRMB,Information Technology
+Truist Financial,TFC,Financials
+Tyler Technologies,TYL,Information Technology
+Tyson Foods,TSN,Consumer Staples
+U.S. Bancorp,USB,Financials
+Uber,UBER,Industrials
+"UDR, Inc.",UDR,Real Estate
+Ulta Beauty,ULTA,Consumer Discretionary
+Union Pacific Corporation,UNP,Industrials
+United Airlines Holdings,UAL,Industrials
+United Parcel Service,UPS,Industrials
+United Rentals,URI,Industrials
+UnitedHealth Group,UNH,Health Care
+Universal Health Services,UHS,Health Care
+Valero Energy,VLO,Energy
+Veeva Systems,VEEV,Health Care
+Ventas,VTR,Real Estate
+Veralto,VLTO,Industrials
+Verisign,VRSN,Information Technology
+Verisk Analytics,VRSK,Industrials
+Verizon,VZ,Communication Services
+Vertex Pharmaceuticals,VRTX,Health Care
+Vertiv,VRT,Industrials
+Viatris,VTRS,Health Care
+Vici Properties,VICI,Real Estate
+Visa Inc.,V,Financials
+Vistra Corp.,VST,Utilities
+Vulcan Materials Company,VMC,Materials
+W. R. Berkley Corporation,WRB,Financials
+W. W. Grainger,GWW,Industrials
+Wabtec,WAB,Industrials
+Walmart,WMT,Consumer Staples
+Walt Disney Company (The),DIS,Communication Services
+Warner Bros. Discovery,WBD,Communication Services
+Waste Management,WM,Industrials
+Waters Corporation,WAT,Health Care
+WEC Energy Group,WEC,Utilities
+Wells Fargo,WFC,Financials
+Welltower,WELL,Real Estate
+West Pharmaceutical Services,WST,Health Care
+Western Digital,WDC,Information Technology
+Weyerhaeuser,WY,Real Estate
+"Williams-Sonoma, Inc.",WSM,Consumer Discretionary
+Williams Companies,WMB,Energy
+Willis Towers Watson,WTW,Financials
+"Workday, Inc.",WDAY,Information Technology
+Wynn Resorts,WYNN,Consumer Discretionary
+Xcel Energy,XEL,Utilities
+Xylem Inc.,XYL,Industrials
+Yum! Brands,YUM,Consumer Discretionary
+Zebra Technologies,ZBRA,Information Technology
+Zimmer Biomet,ZBH,Health Care
+Zoetis,ZTS,Health Care
