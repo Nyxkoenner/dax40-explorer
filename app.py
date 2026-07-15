@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4151,7 +4151,15 @@ def render_news_card(item: pd.Series, card_index: int) -> None:
             st.caption(f"Warum zugeordnet: {reason}")
         link = str(item.get("link") or "").strip()
         if link:
-            st.link_button("Artikel öffnen", link, key=f"news_link_{card_index}_{normalize_for_search(str(item.get('title', '')))}")
+            # Kompatibel mit älteren Streamlit-Versionen, deren link_button noch kein key-Argument unterstützt.
+            try:
+                st.link_button(
+                    "Artikel öffnen",
+                    link,
+                    key=f"news_link_{card_index}_{normalize_for_search(str(item.get('title', '')))}",
+                )
+            except TypeError:
+                st.link_button("Artikel öffnen", link)
 
 
 def render_news_summary(
