@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.8"
+APP_VERSION = "4.9"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4537,10 +4537,160 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     st.caption("*Gesamtrendite und bereinigter Kurs: Yahoo Adj Close als Näherung, nicht als Broker- oder Steuerberechnung.")
 
 
-def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
-    st.subheader("Sektor-Übersicht 2.0")
+
+def _extract_sector_from_chart_event(event: Any, selection_name: str) -> Optional[str]:
+    """Liest eine Sektor-Auswahl robust aus einem Streamlit-/Altair-Event."""
+    if event is None:
+        return None
+
+    try:
+        selection = event.selection
+    except Exception:
+        try:
+            selection = event.get("selection", {})
+        except Exception:
+            return None
+
+    try:
+        payload = selection.get(selection_name, [])
+    except Exception:
+        try:
+            payload = selection[selection_name]
+        except Exception:
+            return None
+
+    if isinstance(payload, list) and payload:
+        candidate = payload[-1]
+        if isinstance(candidate, dict):
+            value = candidate.get("Sektor") or candidate.get("sector")
+            return str(value) if value not in (None, "") else None
+
+    if isinstance(payload, dict):
+        value = payload.get("Sektor") or payload.get("sector")
+        if isinstance(value, list) and value:
+            value = value[-1]
+        return str(value) if value not in (None, "") else None
+
+    return None
+
+
+def _navigate_to_company(page: str, ticker: str) -> None:
+    """Wechselt per Widget-Callback sicher auf eine firmenspezifische Ansicht."""
+    ticker = str(ticker)
+    if page == "Einzelanalyse":
+        st.session_state["analysis_ticker"] = ticker
+    elif page == "News & Events":
+        st.session_state["news_ticker"] = ticker
+    st.session_state["main_navigation"] = page
+
+
+def _render_sector_company_drilldown(df: pd.DataFrame, selected_sector: str) -> None:
+    """Zeigt die Einzelwerte eines Sektors und bietet gezielte Navigation an."""
+    sector_mask = df["sector"].fillna("Unbekannt").astype(str).eq(str(selected_sector))
+    sector_df = df.loc[sector_mask].copy()
+    if sector_df.empty:
+        st.info("Für diesen Sektor sind aktuell keine Aktien verfügbar.")
+        return
+
+    st.markdown(f"### Aktien im Sektor: {selected_sector}")
     st.caption(
-        "Vergleicht Sektoren über mehrere Zeiträume. Kursrendite = Close, Gesamtrendite = Yahoo Adj Close als Näherung."
+        "Der Sektor bleibt als Kontext sichtbar. Wähle anschließend eine Aktie und öffne gezielt "
+        "die Einzelanalyse oder den News-Bereich."
+    )
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Unternehmen", len(sector_df))
+    metric_cols[1].metric("Ø Qualitäts-Score", format_number(sector_df.get("total_score", pd.Series(dtype=float)).mean(), 1))
+    metric_cols[2].metric("Ø Value-Score", format_number(sector_df.get("value_score", pd.Series(dtype=float)).mean(), 1))
+    metric_cols[3].metric("Ø Kursrendite 1J", format_percent(sector_df.get("change_1y", pd.Series(dtype=float)).mean(), 1, signed=True))
+    metric_cols[4].metric("Ø Dividendenrendite", format_percent(sector_df.get("dividend_yield", pd.Series(dtype=float)).mean(), 2))
+
+    columns = [
+        "name", "ticker_yahoo", "currency", "last_price", "change_1y", "total_return_1y",
+        "dividend_yield", "total_score", "value_score", "value_trigger",
+        "special_situation_score", "vol_1y", "max_drawdown_1y",
+    ]
+    available_columns = [column for column in columns if column in sector_df.columns]
+    detail = sector_df[available_columns].copy()
+    sort_columns = [column for column in ["value_score", "total_score"] if column in detail.columns]
+    if sort_columns:
+        detail = detail.sort_values(sort_columns, ascending=[False] * len(sort_columns), na_position="last")
+
+    display = detail.rename(columns={
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "currency": "Währung",
+        "last_price": "Letzter Kurs",
+        "change_1y": "Kursrendite 1J",
+        "total_return_1y": "Gesamtrendite 1J*",
+        "dividend_yield": "Dividendenrendite",
+        "total_score": "Qualitäts-Score",
+        "value_score": "Value-Score",
+        "value_trigger": "Value-Trigger",
+        "special_situation_score": "Deep-Value-Score",
+        "vol_1y": "Volatilität 1J",
+        "max_drawdown_1y": "Max. Drawdown 1J",
+    })
+
+    formatters = {
+        "Letzter Kurs": lambda value: format_number(value, 2),
+        "Kursrendite 1J": lambda value: format_percent(value, 1, signed=True),
+        "Gesamtrendite 1J*": lambda value: format_percent(value, 1, signed=True),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Value-Score": lambda value: format_number(value, 1),
+        "Value-Trigger": format_value_trigger,
+        "Deep-Value-Score": lambda value: format_number(value, 1),
+        "Volatilität 1J": lambda value: format_percent(value, 1),
+        "Max. Drawdown 1J": lambda value: format_percent(value, 1, signed=True),
+    }
+    styled = display.style.format(
+        {key: value for key, value in formatters.items() if key in display.columns},
+        na_rep="–",
+    )
+    if "Kursrendite 1J" in display.columns:
+        styled = styled.map(colorize_change, subset=["Kursrendite 1J"])
+    if "Gesamtrendite 1J*" in display.columns:
+        styled = styled.map(colorize_change, subset=["Gesamtrendite 1J*"])
+    score_columns = [column for column in ["Qualitäts-Score", "Deep-Value-Score"] if column in display.columns]
+    if score_columns:
+        styled = styled.map(colorize_score, subset=score_columns)
+    if "Value-Trigger" in display.columns:
+        styled = styled.map(colorize_value_trigger, subset=["Value-Trigger"])
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    selected_ticker = company_selectbox(
+        "Aktie aus diesem Sektor auswählen",
+        sector_df,
+        key="sector_company_ticker",
+    )
+    selected_row = sector_df.loc[sector_df["ticker_yahoo"].astype(str).eq(str(selected_ticker))].iloc[0]
+    selected_name = str(selected_row.get("name") or selected_ticker)
+
+    action_cols = st.columns([1, 1, 3])
+    action_cols[0].button(
+        "Einzelanalyse öffnen",
+        key=f"sector_open_analysis_{selected_ticker}",
+        on_click=_navigate_to_company,
+        args=("Einzelanalyse", selected_ticker),
+        use_container_width=True,
+    )
+    action_cols[1].button(
+        "News öffnen",
+        key=f"sector_open_news_{selected_ticker}",
+        on_click=_navigate_to_company,
+        args=("News & Events", selected_ticker),
+        use_container_width=True,
+    )
+    action_cols[2].caption(f"Ausgewählt: {selected_name} ({selected_ticker})")
+
+
+def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Sektor-Übersicht 2.1")
+    st.caption(
+        "Vergleicht Sektoren über mehrere Zeiträume. Klicke im Diagramm auf einen Sektor "
+        "oder wähle ihn darunter manuell aus."
     )
     if df is None or df.empty:
         st.info("Keine Daten für die Sektoransicht vorhanden.")
@@ -4551,12 +4701,22 @@ def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> 
         st.info("Für die geladenen Werte liegen keine ausreichenden Kursdaten vor.")
         return
 
+    available_sectors = sorted(
+        df["sector"].fillna("Unbekannt").astype(str).drop_duplicates().tolist(),
+        key=str.casefold,
+    )
+    if not available_sectors:
+        st.info("Keine Sektoren verfügbar.")
+        return
+
     metric_mode = st.radio(
         "Kennzahl anzeigen",
         ["Kursrendite", "Gesamtrendite", "Bewertung & Risiko"],
         horizontal=True,
         key="sector_view_metric_mode_v2",
     )
+
+    clicked_sector: Optional[str] = None
 
     if metric_mode in ("Kursrendite", "Gesamtrendite"):
         prefix = "Kurs" if metric_mode == "Kursrendite" else "Gesamt"
@@ -4589,12 +4749,37 @@ def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> 
             key=f"sector_chart_period_{prefix}",
         )
         chart_data = display.dropna(subset=[chart_period]).copy()
-        chart = alt.Chart(chart_data).mark_bar().encode(
-            x=alt.X(f"{chart_period}:Q", title=f"{metric_mode} {chart_period} in %"),
-            y=alt.Y("Sektor:N", sort="-x", title="Sektor"),
-            tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip(f"{chart_period}:Q", format=".2f")],
-        ).properties(height=max(260, 34 * len(chart_data)))
-        st.altair_chart(chart, use_container_width=True)
+        selection_name = f"sector_bar_selection_{prefix.lower()}"
+        selector = alt.selection_point(
+            name=selection_name,
+            fields=["Sektor"],
+            on="click",
+            clear="dblclick",
+        )
+        chart = (
+            alt.Chart(chart_data)
+            .mark_bar()
+            .encode(
+                x=alt.X(f"{chart_period}:Q", title=f"{metric_mode} {chart_period} in %"),
+                y=alt.Y("Sektor:N", sort="-x", title="Sektor"),
+                opacity=alt.condition(selector, alt.value(1.0), alt.value(0.55)),
+                tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip(f"{chart_period}:Q", format=".2f")],
+            )
+            .add_params(selector)
+            .properties(height=max(260, 34 * len(chart_data)))
+        )
+        try:
+            event = st.altair_chart(
+                chart,
+                use_container_width=True,
+                key=f"sector_bar_chart_{prefix.lower()}",
+                on_select="rerun",
+                selection_mode=selection_name,
+            )
+            clicked_sector = _extract_sector_from_chart_event(event, selection_name)
+        except TypeError:
+            # Kompatibilitäts-Fallback für ältere Streamlit-Versionen.
+            st.altair_chart(chart, use_container_width=True)
 
     else:
         columns = [
@@ -4626,13 +4811,58 @@ def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> 
             hide_index=True,
         )
 
-        scatter = alt.Chart(display.dropna(subset=["Value-Score", "Volatilität 1J"])).mark_circle(size=120).encode(
-            x=alt.X("Volatilität 1J:Q", title="Volatilität 1J in %"),
-            y=alt.Y("Value-Score:Q", title="Value-Score"),
-            size=alt.Size("Unternehmen:Q", title="Unternehmen"),
-            tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip("Value-Score:Q", format=".1f"), alt.Tooltip("Volatilität 1J:Q", format=".1f")],
-        ).properties(height=420)
-        st.altair_chart(scatter, use_container_width=True)
+        scatter_data = display.dropna(subset=["Value-Score", "Volatilität 1J"]).copy()
+        selection_name = "sector_scatter_selection"
+        selector = alt.selection_point(
+            name=selection_name,
+            fields=["Sektor"],
+            on="click",
+            clear="dblclick",
+        )
+        scatter = (
+            alt.Chart(scatter_data)
+            .mark_circle(size=120)
+            .encode(
+                x=alt.X("Volatilität 1J:Q", title="Volatilität 1J in %"),
+                y=alt.Y("Value-Score:Q", title="Value-Score"),
+                size=alt.Size("Unternehmen:Q", title="Unternehmen"),
+                opacity=alt.condition(selector, alt.value(1.0), alt.value(0.55)),
+                tooltip=[
+                    "Sektor:N",
+                    "Unternehmen:Q",
+                    alt.Tooltip("Value-Score:Q", format=".1f"),
+                    alt.Tooltip("Volatilität 1J:Q", format=".1f"),
+                ],
+            )
+            .add_params(selector)
+            .properties(height=420)
+        )
+        try:
+            event = st.altair_chart(
+                scatter,
+                use_container_width=True,
+                key="sector_scatter_chart_interactive",
+                on_select="rerun",
+                selection_mode=selection_name,
+            )
+            clicked_sector = _extract_sector_from_chart_event(event, selection_name)
+        except TypeError:
+            st.altair_chart(scatter, use_container_width=True)
+
+    if clicked_sector in available_sectors:
+        st.session_state["sector_drilldown_selected"] = clicked_sector
+
+    if st.session_state.get("sector_drilldown_selected") not in available_sectors:
+        st.session_state["sector_drilldown_selected"] = available_sectors[0]
+
+    st.divider()
+    selected_sector = st.selectbox(
+        "Sektor für Detailansicht",
+        options=available_sectors,
+        key="sector_drilldown_selected",
+        help="Ein Klick im Diagramm setzt diese Auswahl automatisch. Die manuelle Auswahl dient als zuverlässiger Fallback.",
+    )
+    _render_sector_company_drilldown(df, selected_sector)
 
     with st.expander("Was sagt diese Ansicht aus?"):
         st.write(
@@ -4640,6 +4870,10 @@ def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> 
             "oder ob ein kompletter Sektor unter Druck steht. Besonders nützlich ist der Vergleich aus 1J/3J/5J-Rendite, "
             "Value-Score, Dividendenrendite und Volatilität. Ein hoher Value-Score bei gleichzeitig hohem Drawdown kann "
             "eine Chance oder eine Value Trap sein – deshalb immer mit News, Cashflow und Verschuldung gegenprüfen."
+        )
+        st.write(
+            "Die Detailansicht springt bewusst nicht sofort aus dem Sektorbereich heraus: Erst wird der Sektor aufgeklappt, "
+            "danach entscheidest du ausdrücklich, ob du eine Aktie in der Einzelanalyse oder im News-Bereich öffnen möchtest."
         )
 
 
