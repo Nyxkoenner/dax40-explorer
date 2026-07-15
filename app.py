@@ -16,6 +16,7 @@ Hinweise:
 from __future__ import annotations
 
 import os
+import logging
 import re
 import tempfile
 import time
@@ -31,6 +32,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 from dateutil import parser as dateparser
 
 
@@ -38,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.4"
+APP_VERSION = "4.9"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -93,19 +96,123 @@ FINANCIAL_SECTOR_TERMS = {
     "capital markets",
 }
 
-POSITIVE_WORDS = {
-    "beat", "beats", "record", "strong", "upgrade", "upgrades", "buy",
-    "outperform", "bullish", "profit", "growth", "raised", "raise",
-    "besser als erwartet", "rekord", "stark", "angehoben", "kaufen",
-    "gewinn", "wachstum", "übertrifft", "uebertrifft",
+# Gewichtete Phrasen statt einzelner, mehrdeutiger Wörter. Dadurch wird z. B.
+# "profit warning" nicht mehr durch das Wort "profit" fälschlich neutralisiert.
+# Der Score ist eine transparente Heuristik auf Basis von Überschrift und RSS-
+# Beschreibung; er ersetzt keine vollständige Artikelanalyse.
+POSITIVE_SENTIMENT_PHRASES: dict[str, int] = {
+    "beats estimates": 3,
+    "beat estimates": 3,
+    "better than expected": 3,
+    "uebertrifft erwartungen": 3,
+    "besser als erwartet": 3,
+    "raises guidance": 3,
+    "raised guidance": 3,
+    "guidance raised": 3,
+    "prognose angehoben": 3,
+    "hebt prognose an": 3,
+    "erhoeht prognose": 3,
+    "record profit": 3,
+    "record revenue": 3,
+    "rekordgewinn": 3,
+    "rekordumsatz": 3,
+    "dividend increase": 3,
+    "dividend raised": 3,
+    "raises dividend": 3,
+    "dividende erhoeht": 3,
+    "erhoeht dividende": 3,
+    "share buyback": 2,
+    "stock buyback": 2,
+    "aktienrueckkauf": 2,
+    "analyst upgrade": 2,
+    "upgraded to buy": 2,
+    "upgrade to buy": 2,
+    "outperform rating": 2,
+    "kursziel angehoben": 2,
+    "hebt kursziel": 2,
+    "heben kursziel": 2,
+    "wins contract": 2,
+    "contract win": 2,
+    "auftrag gewonnen": 2,
+    "starkes wachstum": 2,
+    "strong growth": 2,
+    "profit rises": 2,
+    "earnings rise": 2,
+    "gewinn steigt": 2,
+    "revenue rises": 1,
+    "sales rise": 1,
+    "umsatz steigt": 1,
+    "margin improvement": 2,
+    "margin expands": 2,
+    "marge verbessert": 2,
+    "debt reduced": 2,
+    "reduces debt": 2,
+    "verschuldung gesenkt": 2,
+    "regulatory approval": 2,
+    "zulassung erhalten": 2,
 }
 
-NEGATIVE_WORDS = {
-    "warning", "profit warning", "miss", "downgrade", "sell", "weak",
-    "loss", "fraud", "investigation", "lawsuit", "cut", "cuts",
-    "warnung", "gewinnwarnung", "verfehlt", "herabgestuft", "verkaufen",
-    "schwach", "verlust", "betrug", "untersuchung", "klage", "senken",
+NEGATIVE_SENTIMENT_PHRASES: dict[str, int] = {
+    "profit warning": 4,
+    "gewinnwarnung": 4,
+    "cuts guidance": 3,
+    "cut guidance": 3,
+    "guidance cut": 3,
+    "lowers guidance": 3,
+    "senkt prognose": 3,
+    "prognose gesenkt": 3,
+    "dividend cut": 4,
+    "cuts dividend": 4,
+    "dividende gekuerzt": 4,
+    "kuerzt dividende": 4,
+    "suspends dividend": 4,
+    "dividende ausgesetzt": 4,
+    "misses estimates": 3,
+    "missed estimates": 3,
+    "below expectations": 3,
+    "verfehlt erwartungen": 3,
+    "unter den erwartungen": 3,
+    "analyst downgrade": 2,
+    "downgraded to sell": 2,
+    "underperform rating": 2,
+    "kursziel gesenkt": 2,
+    "senkt kursziel": 2,
+    "lawsuit": 2,
+    "class action": 2,
+    "klage": 2,
+    "investigation": 2,
+    "untersuchung": 2,
+    "fraud": 4,
+    "betrug": 4,
+    "recall": 2,
+    "product recall": 2,
+    "rueckruf": 2,
+    "job cuts": 2,
+    "layoffs": 2,
+    "stellenabbau": 2,
+    "loss widens": 3,
+    "verlust weitet sich aus": 3,
+    "revenue falls": 2,
+    "sales fall": 2,
+    "umsatz sinkt": 2,
+    "profit falls": 2,
+    "earnings fall": 2,
+    "gewinn sinkt": 2,
+    "bankruptcy": 5,
+    "insolvency": 5,
+    "insolvenz": 5,
+    "regulatory setback": 2,
+    "trial fails": 3,
+    "clinical trial failure": 3,
+    "studie gescheitert": 3,
+    "plant closure": 2,
+    "werksschliessung": 2,
+    "ruecklaeufe": 1,
 }
+
+# Beibehalten für ältere Hilfsfunktionen/Kompatibilität.
+POSITIVE_WORDS = set(POSITIVE_SENTIMENT_PHRASES)
+NEGATIVE_WORDS = set(NEGATIVE_SENTIMENT_PHRASES)
 
 RSS_SOURCES = [
     "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
@@ -114,6 +221,230 @@ RSS_SOURCES = [
     "https://www.handelsblatt.com/contentexport/feed/wirtschaft",
     "https://www.eqs-news.com/de/news/dgap/rss",
 ]
+
+INDEX_OPTIONS = ["DAX 40", "MDAX", "SDAX", "S&P 500"]
+
+INDEX_LOCAL_FILES = {
+    "DAX 40": INDEX_DIR / "dax40.csv",
+    "MDAX": INDEX_DIR / "mdax.csv",
+    "SDAX": INDEX_DIR / "sdax.csv",
+    "S&P 500": INDEX_DIR / "sp500.csv",
+}
+
+# Integrierte Offline-Listen für deutsche Indizes. Stand: 22. Juni 2026.
+# Lokale CSV-Dateien unter data/indices/ überschreiben diese Vorlagen.
+# Dadurch ist der normale App-Start nicht von Wikipedia oder dessen Rate-Limits abhängig.
+DAX40_STATIC_CONSTITUENTS = [
+    {"name": "Adidas", "ticker_yahoo": "ADS.DE", "sector": "Apparel"},
+    {"name": "Airbus", "ticker_yahoo": "AIR.PA", "sector": "Aerospace & Defence"},
+    {"name": "Allianz", "ticker_yahoo": "ALV.DE", "sector": "Financial Services"},
+    {"name": "BASF", "ticker_yahoo": "BAS.DE", "sector": "Chemicals"},
+    {"name": "Bayer", "ticker_yahoo": "BAYN.DE", "sector": "Pharmaceuticals"},
+    {"name": "Beiersdorf", "ticker_yahoo": "BEI.DE", "sector": "Consumer Goods"},
+    {"name": "BMW", "ticker_yahoo": "BMW.DE", "sector": "Automotive"},
+    {"name": "Brenntag", "ticker_yahoo": "BNR.DE", "sector": "Distribution"},
+    {"name": "Commerzbank", "ticker_yahoo": "CBK.DE", "sector": "Financial Services"},
+    {"name": "Continental", "ticker_yahoo": "CON.DE", "sector": "Automotive"},
+    {"name": "Daimler Truck", "ticker_yahoo": "DTG.DE", "sector": "Automotive"},
+    {"name": "Deutsche Bank", "ticker_yahoo": "DBK.DE", "sector": "Financial Services"},
+    {"name": "Deutsche Börse", "ticker_yahoo": "DB1.DE", "sector": "Financial Services"},
+    {"name": "Deutsche Post", "ticker_yahoo": "DHL.DE", "sector": "Logistics"},
+    {"name": "Deutsche Telekom", "ticker_yahoo": "DTE.DE", "sector": "Telecommunication"},
+    {"name": "E.ON", "ticker_yahoo": "EOAN.DE", "sector": "Utilities"},
+    {"name": "Fresenius", "ticker_yahoo": "FRE.DE", "sector": "Healthcare"},
+    {"name": "Fresenius Medical Care", "ticker_yahoo": "FME.DE", "sector": "Healthcare"},
+    {"name": "GEA Group", "ticker_yahoo": "G1A.DE", "sector": "Mechanical Engineering"},
+    {"name": "Hannover Re", "ticker_yahoo": "HNR1.DE", "sector": "Insurance"},
+    {"name": "Heidelberg Materials", "ticker_yahoo": "HEI.DE", "sector": "Construction Materials"},
+    {"name": "Henkel", "ticker_yahoo": "HEN3.DE", "sector": "Consumer Goods"},
+    {"name": "Infineon Technologies", "ticker_yahoo": "IFX.DE", "sector": "Technology"},
+    {"name": "Mercedes-Benz Group", "ticker_yahoo": "MBG.DE", "sector": "Automotive"},
+    {"name": "Merck", "ticker_yahoo": "MRK.DE", "sector": "Pharmaceuticals"},
+    {"name": "MTU Aero Engines", "ticker_yahoo": "MTX.DE", "sector": "Aerospace & Defence"},
+    {"name": "Munich Re", "ticker_yahoo": "MUV2.DE", "sector": "Financial Services"},
+    {"name": "Hochtief", "ticker_yahoo": "HOT.DE", "sector": "Construction"},
+    {"name": "Qiagen", "ticker_yahoo": "QIA.DE", "sector": "Biotech"},
+    {"name": "Rheinmetall", "ticker_yahoo": "RHM.DE", "sector": "Aerospace & Defence"},
+    {"name": "RWE", "ticker_yahoo": "RWE.DE", "sector": "Utilities"},
+    {"name": "SAP", "ticker_yahoo": "SAP.DE", "sector": "Technology"},
+    {"name": "Scout24", "ticker_yahoo": "G24.DE", "sector": "E-Commerce"},
+    {"name": "Siemens", "ticker_yahoo": "SIE.DE", "sector": "Industrials"},
+    {"name": "Siemens Energy", "ticker_yahoo": "ENR.DE", "sector": "Energy technology"},
+    {"name": "Siemens Healthineers", "ticker_yahoo": "SHL.DE", "sector": "Medical Equipment"},
+    {"name": "Symrise", "ticker_yahoo": "SY1.DE", "sector": "Chemicals"},
+    {"name": "Volkswagen Group", "ticker_yahoo": "VOW3.DE", "sector": "Automotive"},
+    {"name": "Vonovia", "ticker_yahoo": "VNA.DE", "sector": "Real Estate"},
+    {"name": "Zalando", "ticker_yahoo": "ZAL.DE", "sector": "E-Commerce"},
+]
+
+
+MDAX_STATIC_CONSTITUENTS = [
+    {"name": "AIXTRON", "ticker_yahoo": "AIXA.DE", "sector": "Technology"},
+    {"name": "Aroundtown", "ticker_yahoo": "AT1.DE", "sector": "Real Estate"},
+    {"name": "AUMOVIO", "ticker_yahoo": "AMV0.DE", "sector": "Automotive Technology"},
+    {"name": "Aurubis", "ticker_yahoo": "NDA.DE", "sector": "Basic Materials"},
+    {"name": "AUTO1 Group", "ticker_yahoo": "AG1.DE", "sector": "Consumer Cyclical"},
+    {"name": "Bechtle", "ticker_yahoo": "BC8.DE", "sector": "Technology"},
+    {"name": "Bilfinger", "ticker_yahoo": "GBF.DE", "sector": "Industrials"},
+    {"name": "CTS Eventim", "ticker_yahoo": "EVD.DE", "sector": "Communication Services"},
+    {"name": "Delivery Hero", "ticker_yahoo": "DHER.DE", "sector": "Consumer Cyclical"},
+    {"name": "Deutz", "ticker_yahoo": "DEZ.DE", "sector": "Industrials"},
+    {"name": "DWS Group", "ticker_yahoo": "DWS.DE", "sector": "Financial Services"},
+    {"name": "Elmos Semiconductor", "ticker_yahoo": "ELG.DE", "sector": "Technology"},
+    {"name": "Evonik Industries", "ticker_yahoo": "EVK.DE", "sector": "Chemicals"},
+    {"name": "flatexDEGIRO", "ticker_yahoo": "FTK.DE", "sector": "Financial Services"},
+    {"name": "Fraport", "ticker_yahoo": "FRA.DE", "sector": "Industrials"},
+    {"name": "freenet", "ticker_yahoo": "FNTN.DE", "sector": "Communication Services"},
+    {"name": "FUCHS", "ticker_yahoo": "FPE3.DE", "sector": "Chemicals"},
+    {"name": "HELLA", "ticker_yahoo": "HLE.DE", "sector": "Automotive"},
+    {"name": "HENSOLDT", "ticker_yahoo": "HAG.DE", "sector": "Aerospace & Defence"},
+    {"name": "HUGO BOSS", "ticker_yahoo": "BOSS.DE", "sector": "Consumer Cyclical"},
+    {"name": "IONOS Group", "ticker_yahoo": "IOS.DE", "sector": "Technology"},
+    {"name": "Jenoptik", "ticker_yahoo": "JEN.DE", "sector": "Technology"},
+    {"name": "K+S", "ticker_yahoo": "SDF.DE", "sector": "Basic Materials"},
+    {"name": "KION Group", "ticker_yahoo": "KGX.DE", "sector": "Industrials"},
+    {"name": "Knorr-Bremse", "ticker_yahoo": "KBX.DE", "sector": "Industrials"},
+    {"name": "KRONES", "ticker_yahoo": "KRN.DE", "sector": "Industrials"},
+    {"name": "LANXESS", "ticker_yahoo": "LXS.DE", "sector": "Chemicals"},
+    {"name": "LEG Immobilien", "ticker_yahoo": "LEG.DE", "sector": "Real Estate"},
+    {"name": "Lufthansa", "ticker_yahoo": "LHA.DE", "sector": "Industrials"},
+    {"name": "Nemetschek", "ticker_yahoo": "NEM.DE", "sector": "Technology"},
+    {"name": "Nordex", "ticker_yahoo": "NDX1.DE", "sector": "Industrials"},
+    {"name": "Porsche AG", "ticker_yahoo": "P911.DE", "sector": "Automotive"},
+    {"name": "Porsche Automobil Holding", "ticker_yahoo": "PAH3.DE", "sector": "Automotive"},
+    {"name": "PUMA", "ticker_yahoo": "PUM.DE", "sector": "Consumer Cyclical"},
+    {"name": "RATIONAL", "ticker_yahoo": "RAA.DE", "sector": "Industrials"},
+    {"name": "RENK Group", "ticker_yahoo": "R3NK.DE", "sector": "Aerospace & Defence"},
+    {"name": "RTL Group", "ticker_yahoo": "RRTL.DE", "sector": "Communication Services"},
+    {"name": "Salzgitter", "ticker_yahoo": "SZG.DE", "sector": "Basic Materials"},
+    {"name": "Sartorius", "ticker_yahoo": "SRT3.DE", "sector": "Healthcare"},
+    {"name": "Schaeffler", "ticker_yahoo": "SHA0.DE", "sector": "Automotive"},
+    {"name": "Siltronic", "ticker_yahoo": "WAF.DE", "sector": "Technology"},
+    {"name": "SUSS MicroTec", "ticker_yahoo": "SMHN.DE", "sector": "Technology"},
+    {"name": "TAG Immobilien", "ticker_yahoo": "TEG.DE", "sector": "Real Estate"},
+    {"name": "Talanx", "ticker_yahoo": "TLX.DE", "sector": "Financial Services"},
+    {"name": "thyssenkrupp", "ticker_yahoo": "TKA.DE", "sector": "Industrials"},
+    {"name": "TKMS", "ticker_yahoo": "TKMS.DE", "sector": "Aerospace & Defence"},
+    {"name": "TRATON", "ticker_yahoo": "8TRA.DE", "sector": "Automotive"},
+    {"name": "TUI", "ticker_yahoo": "TUI1.DE", "sector": "Consumer Cyclical"},
+    {"name": "United Internet", "ticker_yahoo": "UTDI.DE", "sector": "Communication Services"},
+    {"name": "Wacker Chemie", "ticker_yahoo": "WCH.DE", "sector": "Chemicals"},
+]
+
+SDAX_STATIC_CONSTITUENTS = [
+    {"name": "1&1", "ticker_yahoo": "1U1.DE", "sector": "Communication Services"},
+    {"name": "Adtran Networks", "ticker_yahoo": "ADV.DE", "sector": "Technology"},
+    {"name": "AlzChem Group", "ticker_yahoo": "ACT.DE", "sector": "Chemicals"},
+    {"name": "Asta Energy Solutions", "ticker_yahoo": "1AST.DE", "sector": "Industrials"},
+    {"name": "ATOSS Software", "ticker_yahoo": "AOF.DE", "sector": "Technology"},
+    {"name": "Basler", "ticker_yahoo": "BSL.DE", "sector": "Technology"},
+    {"name": "Befesa", "ticker_yahoo": "BFSA.DE", "sector": "Industrials"},
+    {"name": "CANCOM", "ticker_yahoo": "COK.DE", "sector": "Technology"},
+    {"name": "Carl Zeiss Meditec", "ticker_yahoo": "AFX.DE", "sector": "Healthcare"},
+    {"name": "CEWE", "ticker_yahoo": "CWC.DE", "sector": "Consumer Cyclical"},
+    {"name": "Dermapharm", "ticker_yahoo": "DMP.DE", "sector": "Healthcare"},
+    {"name": "Deutsche Beteiligungs", "ticker_yahoo": "DBAN.DE", "sector": "Financial Services"},
+    {"name": "Deutsche EuroShop", "ticker_yahoo": "DEQ.DE", "sector": "Real Estate"},
+    {"name": "Deutsche Pfandbriefbank", "ticker_yahoo": "PBB.DE", "sector": "Financial Services"},
+    {"name": "Douglas", "ticker_yahoo": "DOU.DE", "sector": "Consumer Cyclical"},
+    {"name": "Drägerwerk", "ticker_yahoo": "DRW3.DE", "sector": "Healthcare"},
+    {"name": "Dürr", "ticker_yahoo": "DUE.DE", "sector": "Industrials"},
+    {"name": "Eckert & Ziegler", "ticker_yahoo": "EUZ.DE", "sector": "Healthcare"},
+    {"name": "Einhell Germany", "ticker_yahoo": "EIN3.DE", "sector": "Consumer Cyclical"},
+    {"name": "Energiekontor", "ticker_yahoo": "EKT.DE", "sector": "Utilities"},
+    {"name": "Evotec", "ticker_yahoo": "EVT.DE", "sector": "Healthcare"},
+    {"name": "Fielmann", "ticker_yahoo": "FIE.DE", "sector": "Consumer Cyclical"},
+    {"name": "Friedrich Vorwerk", "ticker_yahoo": "VH2.DE", "sector": "Industrials"},
+    {"name": "GFT Technologies", "ticker_yahoo": "GFT.DE", "sector": "Technology"},
+    {"name": "Grand City Properties", "ticker_yahoo": "GYC.DE", "sector": "Real Estate"},
+    {"name": "Grenke", "ticker_yahoo": "GLJ.DE", "sector": "Financial Services"},
+    {"name": "Hamborner REIT", "ticker_yahoo": "HABA.DE", "sector": "Real Estate"},
+    {"name": "Heidelberger Druckmaschinen", "ticker_yahoo": "HDP.DE", "sector": "Industrials"},
+    {"name": "HelloFresh", "ticker_yahoo": "HFG.DE", "sector": "Consumer Cyclical"},
+    {"name": "HORNBACH Holding", "ticker_yahoo": "HBM.DE", "sector": "Consumer Cyclical"},
+    {"name": "Hypoport", "ticker_yahoo": "HYQ.DE", "sector": "Financial Services"},
+    {"name": "INDUS Holding", "ticker_yahoo": "INH.DE", "sector": "Industrials"},
+    {"name": "INIT", "ticker_yahoo": "IXX.DE", "sector": "Technology"},
+    {"name": "JOST Werke", "ticker_yahoo": "JST.DE", "sector": "Industrials"},
+    {"name": "Jungheinrich", "ticker_yahoo": "JUN3.DE", "sector": "Industrials"},
+    {"name": "Klöckner & Co", "ticker_yahoo": "KCO.DE", "sector": "Basic Materials"},
+    {"name": "Kontron", "ticker_yahoo": "KTN.DE", "sector": "Technology"},
+    {"name": "KSB", "ticker_yahoo": "KSB.DE", "sector": "Industrials"},
+    {"name": "KWS SAAT", "ticker_yahoo": "KWS.DE", "sector": "Consumer Defensive"},
+    {"name": "LPKF Laser & Electronics", "ticker_yahoo": "LPK.DE", "sector": "Technology"},
+    {"name": "MBB", "ticker_yahoo": "MBB.DE", "sector": "Industrials"},
+    {"name": "Medios", "ticker_yahoo": "ILM1.DE", "sector": "Healthcare"},
+    {"name": "MLP", "ticker_yahoo": "MLP.DE", "sector": "Financial Services"},
+    {"name": "Mutares", "ticker_yahoo": "MUX.DE", "sector": "Financial Services"},
+    {"name": "Nagarro", "ticker_yahoo": "NA9.DE", "sector": "Technology"},
+    {"name": "NORMA Group", "ticker_yahoo": "NOEJ.DE", "sector": "Industrials"},
+    {"name": "Ottobock", "ticker_yahoo": "OBCK.DE", "sector": "Healthcare"},
+    {"name": "PATRIZIA", "ticker_yahoo": "PAT.DE", "sector": "Real Estate"},
+    {"name": "PNE", "ticker_yahoo": "PNE3.DE", "sector": "Utilities"},
+    {"name": "PVA TePla", "ticker_yahoo": "TPE.DE", "sector": "Technology"},
+    {"name": "Redcare Pharmacy", "ticker_yahoo": "RDC.DE", "sector": "Healthcare"},
+    {"name": "SAF-HOLLAND", "ticker_yahoo": "SFQ.DE", "sector": "Industrials"},
+    {"name": "SCHOTT Pharma", "ticker_yahoo": "1SXP.DE", "sector": "Healthcare"},
+    {"name": "secunet Security Networks", "ticker_yahoo": "YSN.DE", "sector": "Technology"},
+    {"name": "SFC Energy", "ticker_yahoo": "F3C.DE", "sector": "Industrials"},
+    {"name": "Shelly Group", "ticker_yahoo": "SLYG.DE", "sector": "Technology"},
+    {"name": "Sixt", "ticker_yahoo": "SIX2.DE", "sector": "Industrials"},
+    {"name": "SMA Solar Technology", "ticker_yahoo": "S92.DE", "sector": "Technology"},
+    {"name": "Springer Nature", "ticker_yahoo": "SPG.DE", "sector": "Communication Services"},
+    {"name": "Stabilus", "ticker_yahoo": "STM.DE", "sector": "Industrials"},
+    {"name": "STO", "ticker_yahoo": "STO3.DE", "sector": "Basic Materials"},
+    {"name": "STRATEC", "ticker_yahoo": "SBS.DE", "sector": "Healthcare"},
+    {"name": "Ströer", "ticker_yahoo": "SAX.DE", "sector": "Communication Services"},
+    {"name": "Südzucker", "ticker_yahoo": "SZU.DE", "sector": "Consumer Defensive"},
+    {"name": "TeamViewer", "ticker_yahoo": "TMV.DE", "sector": "Technology"},
+    {"name": "tonies", "ticker_yahoo": "TNIE.DE", "sector": "Consumer Cyclical"},
+    {"name": "VERBIO", "ticker_yahoo": "VBK.DE", "sector": "Energy"},
+    {"name": "Vincorion", "ticker_yahoo": "V1NC.DE", "sector": "Aerospace & Defence"},
+    {"name": "Vossloh", "ticker_yahoo": "VOS.DE", "sector": "Industrials"},
+    {"name": "Wacker Neuson", "ticker_yahoo": "WAC.DE", "sector": "Industrials"},
+]
+
+STATIC_INDEX_CONSTITUENTS = {
+    "DAX 40": DAX40_STATIC_CONSTITUENTS,
+    "MDAX": MDAX_STATIC_CONSTITUENTS,
+    "SDAX": SDAX_STATIC_CONSTITUENTS,
+}
+
+INDEX_EXPECTED_COUNTS = {
+    "DAX 40": 40,
+    "MDAX": 50,
+    "SDAX": 70,
+    "S&P 500": 500,
+}
+
+INDEX_STATIC_AS_OF = "22.06.2026"
+
+GERMAN_INDEX_SOURCES = {
+    "DAX 40": {
+        "urls": ["https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"],
+        "min_rows": 30,
+    },
+    "MDAX": {
+        "urls": ["https://en.wikipedia.org/wiki/MDAX", "https://de.wikipedia.org/wiki/MDAX"],
+        "min_rows": 40,
+    },
+    "SDAX": {
+        "urls": ["https://en.wikipedia.org/wiki/SDAX", "https://de.wikipedia.org/wiki/SDAX"],
+        "min_rows": 50,
+    },
+}
+
+BENCHMARK_BY_INDEX = {
+    "DAX 40": "^GDAXI",
+    "MDAX": "^MDAXI",
+    "SDAX": "^SDAXI",
+    "S&P 500": "^GSPC",
+}
+
+# Deutsche Indizes enthalten nicht nur Xetra-/Frankfurt-Ticker.
+# Beispiel: Airbus ist im DAX, wird bei Yahoo aber zuverlässig als AIR.PA geführt.
+# V3.8 hat solche Werte versehentlich herausgefiltert und dadurch beim DAX nur 39 Titel geladen.
+GERMAN_INDEX_ALLOWED_SUFFIXES = (".DE", ".F", ".PA")
 
 
 # -----------------------------------------------------------------------------
@@ -141,7 +472,39 @@ def to_percent(value: Any) -> Optional[float]:
 
 
 def clean_ticker(ticker: Any) -> str:
-    return str(ticker or "").strip().upper()
+    """Normalisiert Yahoo-Ticker und entfernt Artefakte aus Webtabellen.
+
+    Wikipedia/Finanzseiten enthalten teils Fußnoten, Dollarzeichen oder
+    unsichtbare Leerzeichen. Diese Artefakte führten beim SDAX-Fallback zu
+    Symbolen wie $SRV.DE.
+    """
+    value = str(ticker or "").strip().upper()
+    value = re.sub(r"\[.*?\]", "", value)
+    value = value.replace("\xa0", " ").replace("–", "-").replace("—", "-")
+    value = value.strip().lstrip("$")
+    value = re.sub(r"\s+", "", value)
+    # Für Yahoo sind Buchstaben, Zahlen, Punkt und Bindestrich relevant.
+    value = re.sub(r"[^A-Z0-9.\-]", "", value)
+    return value
+
+
+def is_probably_german_yahoo_symbol(symbol: str, exchange: str = "") -> bool:
+    """Prüft, ob ein Yahoo-Suchtreffer plausibel zu einem deutschen Index passt.
+
+    Wichtig: Der Yahoo-Search-Fallback darf US-Symbole wie TSLX oder OTC-Symbole
+    wie DRRKF nicht einfach mit .DE ergänzen. Genau dadurch entstanden beim SDAX
+    ungültige Ticker wie TSLX.DE oder DRRKF.DE.
+    """
+    symbol = clean_ticker(symbol)
+    exchange = str(exchange or "").upper().strip()
+    if not symbol:
+        return False
+    if symbol.endswith(GERMAN_INDEX_ALLOWED_SUFFIXES):
+        return True
+    german_exchanges = {"GER", "ETR", "EUX", "FRA", "STU", "MUN", "HAM", "HAN", "DUS", "BER"}
+    if exchange in german_exchanges and "." not in symbol:
+        return True
+    return False
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -211,6 +574,70 @@ def human_market_cap(value: Any) -> str:
     return format_number(number, 0)
 
 
+def company_selectbox(
+    label: str,
+    df: pd.DataFrame,
+    key: str,
+    *,
+    ticker_col: str = "ticker_yahoo",
+    name_col: str = "name",
+    sort_by_name: bool = True,
+    **selectbox_kwargs: Any,
+) -> str:
+    """Zeigt Firmenname und Ticker, gibt intern aber nur den Ticker zurück.
+
+    Beispiel in der Oberfläche: ``Bayer (BAYN.DE)``. Bestehende Berechnungen
+    arbeiten unverändert mit ``BAYN.DE`` weiter. Der Helper räumt außerdem
+    veraltete Session-State-Werte nach einem Index- oder Filterwechsel auf.
+    """
+    if df is None or df.empty or ticker_col not in df.columns:
+        raise ValueError("Für die Aktienauswahl sind keine Ticker verfügbar.")
+
+    columns = [ticker_col]
+    if name_col in df.columns:
+        columns.append(name_col)
+
+    choices = df[columns].copy()
+    choices[ticker_col] = choices[ticker_col].fillna("").astype(str).str.strip()
+    choices = choices[choices[ticker_col].ne("")].drop_duplicates(subset=[ticker_col])
+    if choices.empty:
+        raise ValueError("Für die Aktienauswahl sind keine gültigen Ticker verfügbar.")
+
+    if name_col not in choices.columns:
+        choices[name_col] = choices[ticker_col]
+    else:
+        choices[name_col] = choices[name_col].fillna("").astype(str).str.strip()
+        choices.loc[choices[name_col].eq(""), name_col] = choices.loc[choices[name_col].eq(""), ticker_col]
+
+    if sort_by_name:
+        choices = choices.assign(_sort_name=choices[name_col].str.casefold()).sort_values(
+            ["_sort_name", ticker_col], kind="stable"
+        )
+
+    options = choices[ticker_col].tolist()
+    labels = {
+        row[ticker_col]: (
+            f"{row[name_col]} ({row[ticker_col]})"
+            if row[name_col] != row[ticker_col]
+            else row[ticker_col]
+        )
+        for _, row in choices.iterrows()
+    }
+
+    # Nach Index-/Filterwechseln kann ein alter Ticker im Session State liegen.
+    # Vor Erzeugung des Widgets entfernen, damit Streamlit keinen ungültigen Wert hält.
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+
+    return st.selectbox(
+        label,
+        options=options,
+        format_func=lambda ticker: labels.get(ticker, str(ticker)),
+        key=key,
+        **selectbox_kwargs,
+    )
+
+
 def is_financial_sector(sector: Any) -> bool:
     text = str(sector or "").lower()
     return any(term in text for term in FINANCIAL_SECTOR_TERMS)
@@ -229,11 +656,14 @@ def empty_metrics_frame() -> pd.DataFrame:
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d",
         "change_5d", "change_1y", "total_return_1y", "vol_30d", "vol_1y",
-        "max_drawdown_1y", "high_52w", "low_52w", "market_cap", "pe_ratio",
+        "max_drawdown_1y", "drawdown_3y_high_pct", "drawdown_5y_high_pct",
+        "high_52w", "low_52w", "market_cap", "pe_ratio",
         "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda", "net_margin",
         "operating_margin", "roe", "roa", "dividend_yield", "dividend_per_share",
         "payout_ratio", "dividend_growth_5y", "dividend_frequency",
-        "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
+        "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct",
+        "operating_cashflow", "free_cashflow", "shares_outstanding",
+        "cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
     ]
     return pd.DataFrame(columns=columns)
 
@@ -277,35 +707,158 @@ def validate_constituents(df: pd.DataFrame) -> pd.DataFrame:
     return result.drop_duplicates(subset=["ticker_yahoo"]).reset_index(drop=True)
 
 
-def parse_dax_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def resolve_german_yahoo_ticker(company_name: str) -> str:
+    """Versucht bei Wikipedia-Tabellen ohne Symbol den passenden Yahoo-Ticker zu finden.
+
+    Das ist ein Fallback für Seiten wie den SDAX, auf denen teils nur Firmenname,
+    Branche und Sitz stehen. Für eine produktive Version bleiben lokale CSV-Dateien
+    in data/indices/*.csv zuverlässiger.
+    """
+    if not company_name or pd.isna(company_name):
+        return ""
+
+    name = str(company_name)
+    clean_name = re.sub(r"\[.*?\]", "", name)
+    clean_name = re.sub(r"\b(AG|SE|KGaA|KGAA|GmbH|Holding|Group|S\.A\.|S\.A|N\.V\.|PLC)\b", " ", clean_name, flags=re.I)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip()
+
+    queries = []
+    for candidate in (name, clean_name, clean_name.split(" ")[0] if clean_name else ""):
+        candidate = str(candidate).strip()
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+
+    best_symbol = ""
+    best_score = -1
+    for query in queries[:3]:
+        try:
+            response = requests.get(
+                "https://query2.finance.yahoo.com/v1/finance/search",
+                params={"q": query, "quotesCount": 8, "newsCount": 0, "lang": "de-DE", "region": "DE"},
+                headers=DEFAULT_HEADERS,
+                timeout=12,
+            )
+            response.raise_for_status()
+            quotes = response.json().get("quotes", [])
+        except Exception:
+            continue
+
+        for quote in quotes:
+            symbol = clean_ticker(quote.get("symbol", ""))
+            short_name = str(quote.get("shortname") or quote.get("longname") or "")
+            exchange = str(quote.get("exchange", "")).upper()
+            quote_type = str(quote.get("quoteType", "")).upper()
+
+            if not symbol or quote_type not in ("EQUITY", ""):
+                continue
+
+            # Kein blindes ".DE"-Anhängen mehr: US-/OTC-Treffer werden verworfen.
+            if not is_probably_german_yahoo_symbol(symbol, exchange):
+                continue
+
+            score = 0
+            if symbol.endswith(".DE"):
+                score += 120
+            elif symbol.endswith(".F"):
+                score += 70
+            elif symbol.endswith(".PA"):
+                # Airbus ist DAX-Mitglied, der zuverlässige Yahoo-Ticker ist AIR.PA.
+                score += 65
+            elif "." not in symbol and exchange in {"GER", "FRA", "EUX", "ETR"}:
+                score += 80
+            if exchange in {"GER", "FRA", "EUX", "ETR"}:
+                score += 40
+
+            first_token = clean_name.lower().split(" ")[0] if clean_name else ""
+            if first_token and first_token in short_name.lower():
+                score += 25
+            if clean_name and clean_name.lower() in short_name.lower():
+                score += 35
+
+            if score > best_score:
+                best_score = score
+                best_symbol = symbol
+
+    if best_symbol and "." not in best_symbol:
+        best_symbol = f"{best_symbol}.DE"
+    return clean_ticker(best_symbol)
+
+
+def parse_german_index_tables(tables: list[pd.DataFrame], min_rows: int, index_label: str) -> pd.DataFrame:
+    """Extrahiert deutsche Indexmitglieder aus Wikipedia-Tabellen.
+
+    DAX/MDAX enthalten häufig eine Symbol-Spalte. SDAX-Tabellen enthalten je nach
+    Seite manchmal nur Namen; dann wird als Fallback über Yahoo Finance gesucht.
+    Lokale CSV-Dateien bleiben stabiler und sind für saubere Ergebnisse empfohlen.
+    """
+    partial_results: list[pd.DataFrame] = []
+
     for table in tables:
         table = normalize_columns(table)
         columns = list(table.columns)
-        name_col = find_col(columns, ["Company", "Unternehmen", "Name", "Constituent", "Security"])
-        ticker_col = find_col(columns, ["Ticker symbol", "Ticker", "Symbol"])
-        sector_col = find_col(columns, ["Industry", "Sector", "Industrie", "Branche"])
+        name_col = find_col(columns, [
+            "Company", "Unternehmen", "Name", "Constituent", "Security", "Issuer", "Emittent"
+        ])
+        ticker_col = find_col(columns, [
+            "Ticker symbol", "Ticker", "Symbol", "Yahoo", "Yahoo symbol"
+        ])
+        sector_col = find_col(columns, [
+            "Industry", "Sector", "Industrie", "Branche", "Prime Standard sector", "Supersector"
+        ])
 
-        if not name_col or not ticker_col:
+        if not name_col:
             continue
-        if any(word in ticker_col.lower() for word in ("isin", "wkn")):
-            continue
+        if ticker_col and any(word in ticker_col.lower() for word in ("isin", "wkn")):
+            ticker_col = None
 
-        result = table[[name_col, ticker_col]].copy()
-        result.columns = ["name", "ticker_yahoo"]
+        if ticker_col:
+            result = table[[name_col, ticker_col]].copy()
+            result.columns = ["name", "ticker_yahoo"]
+            result["ticker_yahoo"] = (
+                result["ticker_yahoo"].astype(str)
+                .str.replace(r"\[.*?\]", "", regex=True)
+                .str.replace("\xa0", " ", regex=False)
+                .str.strip()
+            )
+            result["ticker_yahoo"] = result["ticker_yahoo"].apply(
+                lambda ticker: ticker if "." in clean_ticker(ticker) else f"{clean_ticker(ticker)}.DE"
+            )
+            # Offensichtliche Nicht-DE-Artefakte aus Webtabellen entfernen.
+            result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
+            result = result[result["ticker_yahoo"].str.endswith(GERMAN_INDEX_ALLOWED_SUFFIXES, na=False)]
+        else:
+            # Fallback für Tabellen ohne Symbol-Spalte, z. B. manche SDAX-Seiten.
+            if len(table) < max(10, int(min_rows * 0.5)):
+                continue
+            result = table[[name_col]].copy()
+            result.columns = ["name"]
+            result["ticker_yahoo"] = result["name"].astype(str).map(resolve_german_yahoo_ticker)
+
         result["sector"] = table[sector_col] if sector_col else "Unbekannt"
-        result["ticker_yahoo"] = (
-            result["ticker_yahoo"].astype(str)
-            .str.replace(r"\[.*?\]", "", regex=True)
-            .str.strip()
-        )
-        result = result[result["ticker_yahoo"].str.len().gt(0)]
-        result["ticker_yahoo"] = result["ticker_yahoo"].apply(
-            lambda ticker: ticker if "." in ticker else f"{ticker}.DE"
-        )
-        result = validate_constituents(result)
-        if len(result) >= 30:
+        try:
+            result = validate_constituents(result)
+        except Exception:
+            continue
+
+        if len(result) >= min_rows:
             return result
-    raise RuntimeError("Keine passende DAX-Tabelle mit Yahoo-Tickern gefunden.")
+        if not result.empty:
+            partial_results.append(result)
+
+    if partial_results:
+        combined = pd.concat(partial_results, ignore_index=True)
+        combined = validate_constituents(combined)
+        # Lieber einen teilweise geladenen SDAX anzeigen als komplett scheitern;
+        # im UI kann später eine Warnung ergänzt werden. Für exakte Listen: CSV nutzen.
+        if len(combined) >= max(10, int(min_rows * 0.4)):
+            return combined
+
+    raise RuntimeError(f"Keine passende {index_label}-Tabelle mit Yahoo-Tickern gefunden.")
+
+
+def parse_dax_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    return parse_german_index_tables(tables, min_rows=30, index_label="DAX")
 
 
 def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
@@ -327,31 +880,83 @@ def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
     raise RuntimeError("Keine passende S&P-500-Tabelle gefunden.")
 
 
+def _valid_local_index(index_name: str) -> Optional[pd.DataFrame]:
+    """Lädt eine lokale Indexdatei nur, wenn sie strukturell plausibel ist."""
+    local_path = INDEX_LOCAL_FILES.get(index_name)
+    if local_path is None or not local_path.exists():
+        return None
+    try:
+        frame = validate_constituents(pd.read_csv(local_path))
+    except Exception:
+        return None
+
+    expected = INDEX_EXPECTED_COUNTS.get(index_name, 0)
+    minimum = expected if index_name in STATIC_INDEX_CONSTITUENTS else max(1, int(expected * 0.8))
+    if len(frame) < minimum:
+        return None
+    return frame.reset_index(drop=True)
+
+
+def index_source_description(index_name: str) -> str:
+    """Kurze, nutzerfreundliche Beschreibung der verwendeten Indexquelle."""
+    if _valid_local_index(index_name) is not None:
+        return f"Lokale CSV: {INDEX_LOCAL_FILES[index_name]}"
+    if index_name in STATIC_INDEX_CONSTITUENTS:
+        return f"Integrierte Offline-Liste · Stand {INDEX_STATIC_AS_OF}"
+    return "Online-Quelle mit lokalem Cache"
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def load_index_constituents(index_name: str) -> pd.DataFrame:
-    """Lädt zuerst eine optionale lokale CSV, sonst Wikipedia als Fallback."""
-    local_files = {
-        "DAX 40": INDEX_DIR / "dax40.csv",
-        "S&P 500": INDEX_DIR / "sp500.csv",
-    }
-    local_path = local_files.get(index_name)
-    if local_path and local_path.exists():
-        return validate_constituents(pd.read_csv(local_path))
+    """Lädt Indizes robust, ohne deutsche Listen automatisch von Wikipedia abzurufen.
 
-    if index_name == "DAX 40":
-        errors: list[str] = []
-        for url in ("https://en.wikipedia.org/wiki/DAX", "https://de.wikipedia.org/wiki/DAX"):
-            try:
-                return parse_dax_tables(read_html_tables(fetch_html(url)))
-            except Exception as error:
-                errors.append(f"{url}: {error}")
-        raise RuntimeError("DAX konnte nicht geladen werden. " + " | ".join(errors))
+    Reihenfolge:
+    1. valide lokale CSV unter data/indices/
+    2. integrierte Offline-Liste für DAX, MDAX und SDAX
+    3. S&P 500: lokaler Cache, danach Online-Fallback
+    """
+    local_frame = _valid_local_index(index_name)
+    if local_frame is not None:
+        return local_frame
+
+    if index_name in STATIC_INDEX_CONSTITUENTS:
+        frame = validate_constituents(pd.DataFrame(STATIC_INDEX_CONSTITUENTS[index_name]))
+        expected = INDEX_EXPECTED_COUNTS[index_name]
+        if len(frame) != expected:
+            raise RuntimeError(
+                f"Interne {index_name}-Liste ist unvollständig: {len(frame)} statt {expected} Werte."
+            )
+        return frame.reset_index(drop=True)
 
     if index_name == "S&P 500":
+        cache_path = CACHE_DIR / "sp500_constituents.csv"
+        if cache_path.exists():
+            try:
+                cached = validate_constituents(pd.read_csv(cache_path))
+                if len(cached) >= 400:
+                    return cached.reset_index(drop=True)
+            except Exception:
+                pass
+
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        return parse_sp500_tables(read_html_tables(fetch_html(url)))
+        try:
+            frame = parse_sp500_tables(read_html_tables(fetch_html(url)))
+            try:
+                frame.to_csv(cache_path, index=False)
+            except Exception:
+                pass
+            return frame.reset_index(drop=True)
+        except Exception as error:
+            raise RuntimeError(
+                "S&P 500 konnte online nicht geladen werden und es liegt noch kein lokaler Cache vor. "
+                "Lege alternativ data/indices/sp500.csv an."
+            ) from error
 
     raise ValueError(f"Unbekannter Index: {index_name}")
+
+
+def benchmark_for_index(index_name: str) -> str:
+    return BENCHMARK_BY_INDEX.get(index_name, "^GSPC")
 
 
 # -----------------------------------------------------------------------------
@@ -377,7 +982,6 @@ def _extract_ticker_history(downloaded: pd.DataFrame, ticker: str, ticker_count:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> dict[str, pd.DataFrame]:
     """Lädt historische Kurse gebündelt und behält Close sowie Adj Close.
@@ -385,7 +989,11 @@ def download_price_histories(tickers: tuple[str, ...], period: str = "5y") -> di
     Close = Preisrendite, Adj Close = von Yahoo bereinigte Reihe (als
     Näherung für Total Return). Die Datenquelle bleibt Yahoo Finance.
     """
-    clean_tickers = tuple(dict.fromkeys(ticker for ticker in tickers if ticker))
+    clean_tickers = tuple(
+        dict.fromkeys(clean_ticker(ticker) for ticker in tickers if clean_ticker(ticker))
+    )
+    # Schutz gegen Artefakte wie "$SRV.DE" oder versehentlich erzeugte leere Ticker.
+    clean_tickers = tuple(ticker for ticker in clean_tickers if re.match(r"^[A-Z0-9][A-Z0-9.\-]*$", ticker))
     if not clean_tickers:
         return {}
 
@@ -439,6 +1047,7 @@ def fetch_ticker_info(ticker: str) -> dict[str, Any]:
         "profitMargins", "operatingMargins", "returnOnEquity",
         "returnOnAssets", "dividendYield", "dividendRate", "payoutRatio",
         "debtToEquity", "totalDebt", "totalCash", "ebitda",
+        "operatingCashflow", "freeCashflow", "sharesOutstanding",
         "currency", "financialCurrency", "beta",
 
         # Unternehmensprofil und Management
@@ -557,6 +1166,67 @@ def trailing_dividend_per_share(dividend_frame: pd.DataFrame) -> Optional[float]
     return safe_float(result) if result > 0 else None
 
 
+def dividend_yield_history_metrics(
+    dividend_frame: pd.DataFrame,
+    history: pd.DataFrame,
+    current_yield: Any,
+) -> tuple[Optional[float], Optional[float]]:
+    """Vergleicht die aktuelle Dividendenrendite grob mit der eigenen 5J-Historie.
+
+    Für jedes abgeschlossene Kalenderjahr wird die Jahressumme der Dividenden
+    durch den durchschnittlichen Schlusskurs desselben Jahres geteilt. Das ist
+    keine perfekte Total-Return-Rechnung, gibt aber eine nützliche Einordnung:
+    Ist die heutige Rendite ungewöhnlich hoch im Vergleich zur eigenen Historie?
+    """
+    if dividend_frame is None or dividend_frame.empty or history is None or history.empty or "Close" not in history.columns:
+        return None, None
+
+    frame = dividend_frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    frame = frame.dropna(subset=["date", "amount"])
+    if frame.empty:
+        return None, None
+
+    prices = ensure_datetime_index(history.copy())
+    close = pd.to_numeric(prices["Close"], errors="coerce").dropna()
+    if close.empty:
+        return None, None
+
+    current_year = datetime.now().year
+
+    # Wichtig: Erst filtern, dann mit einer gleich langen Gruppierungsachse gruppieren.
+    # Sonst erzeugt Pandas bei aktuellen Versionen den Fehler
+    # "Grouper and axis must be same length".
+    div_past = frame[frame["date"].dt.year < current_year].copy()
+    price_past = close[close.index.year < current_year].copy()
+
+    if div_past.empty or price_past.empty:
+        return None, None
+
+    annual_div = div_past.groupby(div_past["date"].dt.year)["amount"].sum().sort_index()
+    annual_price = price_past.groupby(price_past.index.year).mean().sort_index()
+    common_years = sorted(set(annual_div.index).intersection(set(annual_price.index)))
+    if not common_years:
+        return None, None
+
+    common_years = common_years[-5:]
+    yields = []
+    for year in common_years:
+        price = safe_float(annual_price.loc[year])
+        div = safe_float(annual_div.loc[year])
+        if price not in (None, 0) and div is not None and div > 0:
+            yields.append(div / price * 100)
+
+    if not yields:
+        return None, None
+
+    avg_yield = sum(yields) / len(yields)
+    current = safe_float(current_yield)
+    vs_avg = None if current is None or avg_yield == 0 else (current / avg_yield - 1) * 100
+    return avg_yield, vs_avg
+
+
 def metrics_from_ticker(
     ticker: str,
     name: str,
@@ -579,6 +1249,8 @@ def metrics_from_ticker(
         "vol_30d": None,
         "vol_1y": None,
         "max_drawdown_1y": None,
+        "drawdown_3y_high_pct": None,
+        "drawdown_5y_high_pct": None,
         "high_52w": None,
         "low_52w": None,
         "market_cap": safe_float(info.get("marketCap")),
@@ -596,6 +1268,12 @@ def metrics_from_ticker(
         "payout_ratio": to_percent(info.get("payoutRatio")),
         "dividend_growth_5y": calc_dividend_growth_5y(dividends),
         "dividend_frequency": infer_dividend_frequency(dividends),
+        "dividend_yield_5y_avg": None,
+        "dividend_yield_vs_5y_avg_pct": None,
+        "operating_cashflow": safe_float(info.get("operatingCashflow")),
+        "free_cashflow": safe_float(info.get("freeCashflow")),
+        "shares_outstanding": safe_float(info.get("sharesOutstanding")),
+        "cashflow_dividend_coverage": None,
         "debt_to_equity": None,
         "net_debt_ebitda": None,
         "beta": safe_float(info.get("beta")),
@@ -629,6 +1307,17 @@ def metrics_from_ticker(
                 record["vol_1y"] = float(returns.std() * (252 ** 0.5) * 100)
                 cumulative = (1 + returns).cumprod()
                 record["max_drawdown_1y"] = float((cumulative / cumulative.cummax() - 1).min() * 100)
+
+            if last_price := safe_float(close.iloc[-1]):
+                for years, column in ((3, "drawdown_3y_high_pct"), (5, "drawdown_5y_high_pct")):
+                    window = close.tail(int(252 * years) + 5)
+                    high_value = safe_float(window.max()) if not window.empty else None
+                    if high_value not in (None, 0):
+                        record[column] = (last_price / high_value - 1) * 100
+
+        avg_yield, yield_vs_avg = dividend_yield_history_metrics(dividends, history, record.get("dividend_yield"))
+        record["dividend_yield_5y_avg"] = avg_yield
+        record["dividend_yield_vs_5y_avg_pct"] = yield_vs_avg
 
         if "Adj Close" in history.columns:
             adjusted = pd.to_numeric(history["Adj Close"], errors="coerce").dropna()
@@ -688,6 +1377,198 @@ def collect_metrics(constituents: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,
         if column not in frame.columns:
             frame[column] = None
     return frame[empty_metrics_frame().columns], histories, errors
+
+
+# -----------------------------------------------------------------------------
+# Datenstatus und Sektor-Zeitreihen
+# -----------------------------------------------------------------------------
+
+DATA_STATUS_FIELD_GROUPS = {
+    "Kursdaten": ["last_price", "change_1d", "change_5d", "change_1y", "vol_1y", "max_drawdown_1y"],
+    "Bewertung": ["market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda"],
+    "Qualität": ["net_margin", "operating_margin", "roe", "roa", "debt_to_equity", "net_debt_ebitda"],
+    "Dividende": ["dividend_yield", "dividend_per_share", "payout_ratio", "dividend_growth_5y", "dividend_frequency"],
+    "Cashflow": ["operating_cashflow", "free_cashflow", "cashflow_dividend_coverage"],
+    "Deep Value": ["drawdown_3y_high_pct", "drawdown_5y_high_pct", "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct"],
+}
+
+
+def _has_value(value: Any) -> bool:
+    """Robuste Prüfung für Datenstatus-Tab."""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    if isinstance(value, str) and value.strip() in ("", "–", "None", "nan"):
+        return False
+    return True
+
+
+def row_coverage(row: pd.Series, fields: list[str]) -> tuple[int, int, float]:
+    present = sum(1 for field in fields if field in row.index and _has_value(row.get(field)))
+    total = len(fields)
+    pct = present / total * 100 if total else 0.0
+    return present, total, pct
+
+
+def build_data_status(
+    constituents: pd.DataFrame,
+    metrics: pd.DataFrame,
+    histories: dict[str, pd.DataFrame],
+    errors: list[str],
+    index_name: str,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Erzeugt eine verständliche Datenabdeckung je Ticker.
+
+    Ziel: Wenn ein Index 40 Werte hat, aber nur 39/40 geladen werden oder einzelne
+    Kennzahlen fehlen, sieht man im Tool sofort warum.
+    """
+    if constituents is None or constituents.empty:
+        return {
+            "index": index_name,
+            "angefragt": 0,
+            "analysiert": 0,
+            "mit_kursdaten": 0,
+            "abdeckung_prozent": 0.0,
+            "fehler": len(errors or []),
+        }, pd.DataFrame()
+
+    wanted = constituents.copy()
+    wanted["ticker_yahoo"] = wanted["ticker_yahoo"].map(clean_ticker)
+    loaded = metrics.copy() if metrics is not None else pd.DataFrame()
+    if not loaded.empty:
+        loaded["ticker_yahoo"] = loaded["ticker_yahoo"].map(clean_ticker)
+
+    merged = wanted[["name", "ticker_yahoo", "sector"]].merge(
+        loaded, on="ticker_yahoo", how="left", suffixes=("_index", "")
+    )
+    if "name" not in merged.columns and "name_index" in merged.columns:
+        merged["name"] = merged["name_index"]
+    if "sector" not in merged.columns and "sector_index" in merged.columns:
+        merged["sector"] = merged["sector_index"]
+
+    error_map: dict[str, list[str]] = {}
+    for err in errors or []:
+        ticker = clean_ticker(str(err).split(":", 1)[0])
+        error_map.setdefault(ticker, []).append(str(err))
+
+    rows: list[dict[str, Any]] = []
+    all_fields = sorted({field for fields in DATA_STATUS_FIELD_GROUPS.values() for field in fields})
+    for _, row in merged.iterrows():
+        ticker = clean_ticker(row.get("ticker_yahoo"))
+        history = histories.get(ticker, pd.DataFrame()) if histories else pd.DataFrame()
+        has_history = history is not None and not history.empty and "Close" in history.columns
+        present, total, pct = row_coverage(row, all_fields)
+        status = "OK"
+        if not has_history:
+            status = "keine Kursdaten"
+        elif pct < 50:
+            status = "viele Kennzahlen fehlen"
+        elif pct < 75:
+            status = "teilweise"
+
+        detail = {
+            "Status": status,
+            "Name": row.get("name") or row.get("name_index"),
+            "Ticker": ticker,
+            "Sektor": row.get("sector") or row.get("sector_index"),
+            "Kursdaten": "Ja" if has_history else "Nein",
+            "Historie Tage": len(history) if history is not None else 0,
+            "Datenabdeckung": pct,
+            "Vorhandene Felder": present,
+            "Mögliche Felder": total,
+            "Fehler/Hinweis": " | ".join(error_map.get(ticker, [])),
+        }
+        for group_name, fields in DATA_STATUS_FIELD_GROUPS.items():
+            g_present, g_total, g_pct = row_coverage(row, fields)
+            detail[group_name] = g_pct
+        rows.append(detail)
+
+    detail_df = pd.DataFrame(rows)
+    requested = len(wanted)
+    analysed = len(loaded) if loaded is not None else 0
+    with_prices = int((detail_df["Kursdaten"] == "Ja").sum()) if not detail_df.empty else 0
+    summary = {
+        "index": index_name,
+        "angefragt": requested,
+        "analysiert": analysed,
+        "mit_kursdaten": with_prices,
+        "abdeckung_prozent": analysed / requested * 100 if requested else 0.0,
+        "kursdaten_prozent": with_prices / requested * 100 if requested else 0.0,
+        "durchschnitt_datenabdeckung": safe_float(detail_df["Datenabdeckung"].mean()) if not detail_df.empty else None,
+        "fehler": len(errors or []),
+    }
+    return summary, detail_df
+
+
+def period_return_from_history(history: pd.DataFrame, trading_days: int, use_adjusted: bool = False) -> Optional[float]:
+    if history is None or history.empty:
+        return None
+    column = "Adj Close" if use_adjusted and "Adj Close" in history.columns else "Close"
+    if column not in history.columns:
+        return None
+    values = pd.to_numeric(history[column], errors="coerce").dropna()
+    if len(values) < 2:
+        return None
+    if len(values) <= trading_days:
+        base = values.iloc[0]
+    else:
+        base = values.iloc[-1 - trading_days]
+    last = values.iloc[-1]
+    base = safe_float(base)
+    last = safe_float(last)
+    if base in (None, 0) or last is None:
+        return None
+    return (last / base - 1) * 100.0
+
+
+def sector_timeframe_stats(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    periods = {
+        "1M": 21,
+        "3M": 63,
+        "6M": 126,
+        "1J": 252,
+        "3J": 756,
+        "5J": 1260,
+    }
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        ticker = clean_ticker(row.get("ticker_yahoo"))
+        history = histories.get(ticker, pd.DataFrame()) if histories else pd.DataFrame()
+        base = {
+            "ticker_yahoo": ticker,
+            "name": row.get("name"),
+            "sector": row.get("sector") or "Unbekannt",
+            "value_trigger": bool(row.get("value_trigger")) if _has_value(row.get("value_trigger")) else False,
+            "total_score": safe_float(row.get("total_score")),
+            "value_score": safe_float(row.get("value_score")),
+            "dividend_yield": safe_float(row.get("dividend_yield")),
+            "vol_1y": safe_float(row.get("vol_1y")),
+            "max_drawdown_1y": safe_float(row.get("max_drawdown_1y")),
+        }
+        for label, days in periods.items():
+            base[f"Kursrendite_{label}"] = period_return_from_history(history, days, use_adjusted=False)
+            base[f"Gesamtrendite_{label}"] = period_return_from_history(history, days, use_adjusted=True)
+        rows.append(base)
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame()
+    agg_map: dict[str, Any] = {
+        "Unternehmen": ("ticker_yahoo", "count"),
+        "Value_Trigger": ("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
+        "Qualitäts_Score": ("total_score", "mean"),
+        "Value_Score": ("value_score", "mean"),
+        "Dividendenrendite": ("dividend_yield", "mean"),
+        "Volatilität_1J": ("vol_1y", "mean"),
+        "Max_Drawdown_1J": ("max_drawdown_1y", "mean"),
+    }
+    for label in periods:
+        agg_map[f"Kurs_{label}"] = (f"Kursrendite_{label}", "mean")
+        agg_map[f"Gesamt_{label}"] = (f"Gesamtrendite_{label}", "mean")
+    return detail.groupby("sector", dropna=False).agg(**agg_map).reset_index()
 
 
 # -----------------------------------------------------------------------------
@@ -918,6 +1799,216 @@ def enrich_with_scores(
     return pd.concat([result, value], axis=1)
 
 
+def load_recent_sentiment_map(days_back: int = 120) -> dict[str, dict[str, Any]]:
+    """Liest gespeicherte News-/Event-Sentiments als Zusatzsignal für den Deep-Value-Scanner.
+
+    Falls noch keine News für einen Ticker geladen wurden, bleibt das Signal leer.
+    Der Scanner funktioniert dann weiterhin, erhält aber keine Punkte für das News-Sentiment.
+    """
+    try:
+        if not EVENTS_PATH.exists():
+            return {}
+        events = pd.read_csv(EVENTS_PATH)
+    except Exception:
+        return {}
+    if events.empty or "ticker_yahoo" not in events.columns:
+        return {}
+
+    events["ticker_yahoo"] = events["ticker_yahoo"].map(clean_ticker)
+    events["date"] = pd.to_datetime(events.get("date"), errors="coerce")
+    cutoff = pd.Timestamp(datetime.now() - timedelta(days=days_back))
+    events = events[events["date"].notna() & (events["date"] >= cutoff)]
+    if events.empty:
+        return {}
+
+    if "sentiment_score" not in events.columns:
+        events["sentiment_score"] = 0
+    events["sentiment_score"] = pd.to_numeric(events["sentiment_score"], errors="coerce").fillna(0)
+
+    result: dict[str, dict[str, Any]] = {}
+    for ticker, group in events.groupby("ticker_yahoo"):
+        scores = group["sentiment_score"]
+        result[ticker] = {
+            "count": int(len(group)),
+            "negative_count": int((scores < 0).sum()),
+            "positive_count": int((scores > 0).sum()),
+            "avg_sentiment": float(scores.mean()) if len(scores) else 0.0,
+        }
+    return result
+
+
+def compute_special_situation_score(row: pd.Series, sentiment_info: Optional[dict[str, Any]] = None) -> pd.Series:
+    """BAT-/Deep-Value-Pattern: hohe Rendite + großer Drawdown + Cashflow-Stabilität.
+
+    Das ist bewusst kein Kaufsignal. Es ist ein Warn-/Research-Trigger für Fälle,
+    bei denen Standardkennzahlen wie KGV oder Payout Ratio durch Sondereffekte
+    verzerrt sein können.
+    """
+    sentiment_info = sentiment_info or {}
+
+    dividend_yield = safe_float(row.get("dividend_yield"))
+    dd_3y = safe_float(row.get("drawdown_3y_high_pct"))
+    dd_5y = safe_float(row.get("drawdown_5y_high_pct"))
+    dd_1y = safe_float(row.get("drawdown_1y_high_pct"))
+    drawdown_candidates = [value for value in [dd_5y, dd_3y, dd_1y] if value is not None]
+    deepest_drawdown = min(drawdown_candidates) if drawdown_candidates else None
+
+    operating_cashflow = safe_float(row.get("operating_cashflow"))
+    free_cashflow = safe_float(row.get("free_cashflow"))
+    cashflow_positive = (free_cashflow is not None and free_cashflow > 0) or (operating_cashflow is not None and operating_cashflow > 0)
+    coverage = safe_float(row.get("cashflow_dividend_coverage"))
+    net_debt_ebitda = safe_float(row.get("net_debt_ebitda"))
+    pe = safe_float(row.get("pe_ratio"))
+    payout = safe_float(row.get("payout_ratio"))
+    yield_vs_avg = safe_float(row.get("dividend_yield_vs_5y_avg_pct"))
+
+    score = 0.0
+    reasons: list[str] = []
+    checks: list[str] = []
+
+    # 1) Dividendenrendite
+    if dividend_yield is not None:
+        if dividend_yield >= 7:
+            points = 20
+        elif dividend_yield >= 5:
+            points = 15
+        elif dividend_yield >= 3.5:
+            points = 9
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Rendite {points:.0f}/20 ({format_percent(dividend_yield, 1)})")
+        if yield_vs_avg is not None and yield_vs_avg >= 25:
+            checks.append(f"Rendite liegt {format_percent(yield_vs_avg, 0, signed=True)} über dem eigenen 5J-Schnitt")
+    else:
+        reasons.append("Rendite 0/20 (keine Daten)")
+
+    # 2) Drawdown vom 3J-/5J-Hoch
+    if deepest_drawdown is not None:
+        drawdown_abs = abs(min(deepest_drawdown, 0))
+        if drawdown_abs >= 35:
+            points = 20
+        elif drawdown_abs >= 25:
+            points = 15
+        elif drawdown_abs >= 15:
+            points = 8
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Drawdown {points:.0f}/20 ({format_percent(deepest_drawdown, 1, signed=True)})")
+    else:
+        reasons.append("Drawdown 0/20 (keine Daten)")
+
+    # 3) Cashflow positiv
+    if cashflow_positive:
+        score += 15
+        source = "Free Cashflow" if free_cashflow is not None and free_cashflow > 0 else "operativer Cashflow"
+        reasons.append(f"Cashflow 15/15 ({source} positiv)")
+    else:
+        reasons.append("Cashflow 0/15 (nicht positiv oder keine Daten)")
+
+    # 4) Dividende durch Cashflow gedeckt
+    if coverage is not None:
+        if coverage >= 1.2:
+            points = 15
+        elif coverage >= 1.0:
+            points = 11
+        elif coverage >= 0.8:
+            points = 5
+        else:
+            points = 0
+        score += points
+        reasons.append(f"FCF/Dividende {points:.0f}/15 ({format_number(coverage, 2)}x)")
+    elif payout is not None and 0 <= payout <= 90:
+        score += 6
+        reasons.append(f"FCF/Dividende 6/15 (Payout ersatzweise {format_percent(payout, 0)})")
+    else:
+        reasons.append("FCF/Dividende 0/15 (keine belastbare Deckung)")
+
+    # 5) Leverage kontrollierbar
+    if net_debt_ebitda is not None:
+        if net_debt_ebitda < 3.5:
+            points = 10
+        elif net_debt_ebitda < 5:
+            points = 5
+        else:
+            points = 0
+        score += points
+        reasons.append(f"Leverage {points:.0f}/10 ({format_number(net_debt_ebitda, 2)}x Net Debt/EBITDA)")
+    else:
+        reasons.append("Leverage 0/10 (keine Daten)")
+
+    # 6) KGV niedrig oder durch Sondereffekt möglicherweise verzerrt
+    eps_distortion_possible = pe is not None and pe <= 0 and cashflow_positive
+    if pe is not None:
+        if 0 < pe <= 12:
+            points = 10
+            detail = f"KGV {format_number(pe, 1)}"
+        elif 0 < pe <= 18:
+            points = 6
+            detail = f"KGV {format_number(pe, 1)}"
+        elif eps_distortion_possible:
+            points = 8
+            detail = "negatives KGV, aber Cashflow positiv"
+            checks.append("Reported EPS könnte durch Sondereffekt verzerrt sein")
+        else:
+            points = 0
+            detail = f"KGV {format_number(pe, 1)}"
+        score += points
+        reasons.append(f"Bewertung/Sondereffekt {points:.0f}/10 ({detail})")
+    else:
+        reasons.append("Bewertung/Sondereffekt 0/10 (keine KGV-Daten)")
+
+    # 7) Negatives News-Sentiment ohne Cashflow-Kollaps
+    negative_count = int(sentiment_info.get("negative_count", 0) or 0)
+    avg_sentiment = safe_float(sentiment_info.get("avg_sentiment"))
+    if cashflow_positive and (negative_count > 0 or (avg_sentiment is not None and avg_sentiment < 0)):
+        score += 10
+        reasons.append(f"News-Kontrast 10/10 ({negative_count} negative Treffer, Cashflow positiv)")
+    elif cashflow_positive and sentiment_info.get("count"):
+        score += 3
+        reasons.append("News-Kontrast 3/10 (News geladen, aber nicht klar negativ)")
+    else:
+        reasons.append("News-Kontrast 0/10 (keine negativen News oder News nicht geladen)")
+
+    trigger = bool(
+        score >= 70
+        and dividend_yield is not None and dividend_yield >= 5
+        and deepest_drawdown is not None and deepest_drawdown <= -25
+        and cashflow_positive
+    )
+
+    status = "Sondersituation prüfen" if trigger else "Beobachten" if score >= 55 else "kein BAT-Muster"
+    if cashflow_positive:
+        checks.append("Cashflow weiterhin positiv")
+    if coverage is not None and coverage >= 1:
+        checks.append("Dividende grob durch Free Cashflow gedeckt")
+    if net_debt_ebitda is not None and net_debt_ebitda < 3.5:
+        checks.append("Leverage unter 3,5x")
+
+    return pd.Series({
+        "special_situation_score": round(min(max(score, 0), 100), 1),
+        "special_situation_trigger": trigger,
+        "special_situation_status": status,
+        "special_situation_reason": " | ".join(reasons),
+        "special_situation_checks": " | ".join(checks) if checks else "Keine besonderen Zusatzhinweise",
+        "deepest_drawdown_3_5y_pct": deepest_drawdown,
+    })
+
+
+def enrich_with_special_situations(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    sentiment_map = load_recent_sentiment_map(days_back=120)
+    scored = df.apply(
+        lambda row: compute_special_situation_score(
+            row, sentiment_map.get(clean_ticker(row.get("ticker_yahoo")), {})
+        ),
+        axis=1,
+    )
+    return pd.concat([df.copy(), scored], axis=1)
+
+
 # -----------------------------------------------------------------------------
 # Währungen und Portfolio
 # -----------------------------------------------------------------------------
@@ -1097,13 +2188,84 @@ def contains_alias(text: str, aliases: list[str]) -> bool:
     return any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lower_text) for alias in aliases)
 
 
+def _sentiment_phrase_present(text: str, phrase: str) -> bool:
+    """Prüft normalisierte Phrasen mit Wortgrenzen statt riskanter Teilstrings."""
+    normalized_text = f" {normalize_for_search(text)} "
+    normalized_phrase = normalize_for_search(phrase)
+    return bool(normalized_phrase and f" {normalized_phrase} " in normalized_text)
+
+
+def analyze_sentiment(title: str, summary: str = "") -> dict[str, Any]:
+    """Gewichtete, nachvollziehbare News-Sentiment-Heuristik.
+
+    Überschriften werden doppelt gewichtet, weil RSS-Beschreibungen oft fremde
+    Navigationstexte oder Wiederholungen enthalten. Sobald klare positive und
+    negative Signale gleichzeitig vorkommen, lautet das Label bewusst
+    ``gemischt`` statt einer irreführenden Neutralisierung.
+    """
+    positive_points = 0
+    negative_points = 0
+    positive_hits: list[str] = []
+    negative_hits: list[str] = []
+
+    for phrase, weight in POSITIVE_SENTIMENT_PHRASES.items():
+        if _sentiment_phrase_present(title, phrase):
+            positive_points += int(weight) * 2
+            positive_hits.append(phrase)
+        elif summary and _sentiment_phrase_present(summary, phrase):
+            positive_points += int(weight)
+            positive_hits.append(phrase)
+
+    for phrase, weight in NEGATIVE_SENTIMENT_PHRASES.items():
+        if _sentiment_phrase_present(title, phrase):
+            negative_points += int(weight) * 2
+            negative_hits.append(phrase)
+        elif summary and _sentiment_phrase_present(summary, phrase):
+            negative_points += int(weight)
+            negative_hits.append(phrase)
+
+    raw_score = max(-10, min(10, positive_points - negative_points))
+
+    if positive_points >= 2 and negative_points >= 2:
+        label = "gemischt"
+    elif raw_score >= 2:
+        label = "positiv"
+    elif raw_score <= -2:
+        label = "negativ"
+    else:
+        label = "neutral"
+
+    strongest = max(positive_points, negative_points)
+    if label == "gemischt" and min(positive_points, negative_points) >= 4:
+        confidence = "hoch"
+    elif strongest >= 6:
+        confidence = "hoch"
+    elif strongest >= 3:
+        confidence = "mittel"
+    else:
+        confidence = "niedrig"
+
+    reason_parts: list[str] = []
+    if positive_hits:
+        reason_parts.append("Positiv: " + ", ".join(dict.fromkeys(positive_hits[:3])))
+    if negative_hits:
+        reason_parts.append("Negativ: " + ", ".join(dict.fromkeys(negative_hits[:3])))
+    reason = " | ".join(reason_parts) if reason_parts else "Keine eindeutige richtungsweisende Phrase erkannt."
+
+    return {
+        "score": int(raw_score),
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+        "positive_points": int(positive_points),
+        "negative_points": int(negative_points),
+    }
+
+
 def simple_sentiment(text: str) -> tuple[int, str]:
-    lower_text = text.lower()
-    positive = sum(1 for word in POSITIVE_WORDS if word in lower_text)
-    negative = sum(1 for word in NEGATIVE_WORDS if word in lower_text)
-    score = positive - negative
-    label = "positiv" if score > 0 else "negativ" if score < 0 else "neutral"
-    return score, label
+    """Kompatibilitäts-Wrapper für ältere Aufrufstellen."""
+    result = analyze_sentiment(text, "")
+    return int(result["score"]), str(result["label"])
 
 
 def entry_datetime(entry: Any) -> Optional[datetime]:
@@ -1166,6 +2328,8 @@ def fetch_news_for_ticker(ticker: str, company_name: str, days_back: int, max_it
                 "source": source_name,
                 "sentiment_score": score,
                 "sentiment_label": label,
+                "sentiment_confidence": "niedrig",
+                "sentiment_reason": "Legacy-RSS-Auswertung",
             })
 
     if not entries:
@@ -1356,8 +2520,9 @@ def empty_news_frame() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "published", "ticker_yahoo", "title", "link", "source", "source_kind",
-            "matched_alias", "sentiment_score", "sentiment_label", "event_type",
-            "relevance_score", "relevance_label", "relevance_reason", "is_relevant",
+            "matched_alias", "sentiment_score", "sentiment_label", "sentiment_confidence",
+            "sentiment_reason", "event_type", "relevance_score", "relevance_label",
+            "relevance_reason", "is_relevant",
         ]
     )
 
@@ -1366,7 +2531,8 @@ def empty_events_frame() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "date", "ticker_yahoo", "event_type", "title", "source", "link",
-            "sentiment_score", "sentiment_label", "importance", "is_future_event",
+            "sentiment_score", "sentiment_label", "sentiment_confidence",
+            "sentiment_reason", "importance", "is_future_event",
         ]
     )
 
@@ -1568,21 +2734,47 @@ def save_aliases_for_ticker(ticker: str, aliases_text: str) -> None:
     safe_write_csv(alias_frame, ALIAS_PATH)
 
 
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    normalized_text = f" {normalize_for_search(text)} "
+    normalized_phrase = normalize_for_search(phrase)
+    return bool(normalized_phrase and f" {normalized_phrase} " in normalized_text)
+
+
 def classify_event_from_text(text: str) -> str:
-    """Ordnet nur konkrete Finanzereignisse ein; allgemeine News bleiben News."""
-    normalized = normalize_for_search(text)
-    if any(phrase in normalized for phrase in [
-        "quarterly results", "quarterly earnings", "earnings results", "quartalszahlen",
-        "quartalsbericht", "geschaeftszahlen", "geschäftszahlen", "jahreszahlen",
-    ]):
+    """Ordnet nur konkrete Finanzereignisse mit Wortgrenzen ein.
+
+    Das verhindert z. B., dass das Kürzel ``AGM`` versehentlich innerhalb des
+    Wortes ``Dienstagmittag`` als Hauptversammlung erkannt wird.
+    """
+    earnings_phrases = [
+        "quarterly results", "quarterly earnings", "earnings results", "earnings release",
+        "quartalszahlen", "quartalsbericht", "geschaeftszahlen", "jahreszahlen",
+        "full year results", "half year results", "halbjahreszahlen",
+    ]
+    dividend_phrases = [
+        "ex dividend", "ex dividende", "dividend payment", "dividendenzahlung",
+        "dividend increase", "dividend cut", "dividende", "dividend",
+    ]
+    meeting_phrases = [
+        "hauptversammlung", "annual general meeting", "annual meeting", "agm",
+    ]
+    report_phrases = [
+        "geschaeftsbericht", "annual report", "sustainability report", "nachhaltigkeitsbericht",
+    ]
+    analyst_phrases = [
+        "analyst", "analysts", "analysten", "kursziel", "price target", "rating",
+        "upgrade", "downgrade", "outperform", "underperform",
+    ]
+
+    if any(_contains_normalized_phrase(text, phrase) for phrase in earnings_phrases):
         return "earnings"
-    if any(phrase in normalized for phrase in ["ex divid", "dividend", "dividende"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in dividend_phrases):
         return "dividend"
-    if any(phrase in normalized for phrase in ["hauptversammlung", "annual general meeting", "annual meeting", "agm"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in meeting_phrases):
         return "annual_meeting"
-    if any(phrase in normalized for phrase in ["geschaeftsbericht", "geschäftsbericht", "annual report", "quarterly report"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in report_phrases):
         return "report"
-    if any(phrase in normalized for phrase in ["kursziel", "analyst", "upgrade", "downgrade", "outperform", "underperform"]):
+    if any(_contains_normalized_phrase(text, phrase) for phrase in analyst_phrases):
         return "analyst"
     return "news"
 
@@ -1721,7 +2913,9 @@ def fetch_news_bundle(
                 diagnostic["uncertain_matches"] += 1
 
             combined_text = f"{entry['title']} {entry['summary']}"
-            sentiment_score, sentiment_label = simple_sentiment(combined_text)
+            sentiment_result = analyze_sentiment(entry["title"], entry["summary"])
+            sentiment_score = int(sentiment_result["score"])
+            sentiment_label = str(sentiment_result["label"])
             event_type = classify_event_from_text(combined_text) if bool(relevance["is_relevant"]) else "news"
             news_rows.append(
                 {
@@ -1734,6 +2928,8 @@ def fetch_news_bundle(
                     "matched_alias": relevance["matched_alias"],
                     "sentiment_score": sentiment_score,
                     "sentiment_label": sentiment_label,
+                    "sentiment_confidence": sentiment_result["confidence"],
+                    "sentiment_reason": sentiment_result["reason"],
                     "event_type": event_type,
                     "relevance_score": relevance["relevance_score"],
                     "relevance_label": relevance["relevance_label"],
@@ -1899,6 +3095,8 @@ def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
             "link": eligible.get("link", ""),
             "sentiment_score": eligible.get("sentiment_score", 0.0),
             "sentiment_label": eligible.get("sentiment_label", "neutral"),
+            "sentiment_confidence": eligible.get("sentiment_confidence", "niedrig"),
+            "sentiment_reason": eligible.get("sentiment_reason", ""),
             "importance": "mittel",
             "is_future_event": False,
         }
@@ -1960,6 +3158,8 @@ def load_persisted_events(ticker: str, days_back: int = 1825) -> pd.DataFrame:
     for column, default in {
         "sentiment_score": 0.0,
         "sentiment_label": "neutral",
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "",
         "importance": "mittel",
         "is_future_event": False,
         "link": "",
@@ -2254,6 +3454,82 @@ def render_company_profile(ticker: str) -> None:
     )
 
 
+def sentiment_badge(label: Any) -> str:
+    normalized = str(label or "neutral").lower()
+    return {
+        "positiv": "🟢 Positiv",
+        "negativ": "🔴 Negativ",
+        "gemischt": "🟡 Gemischt",
+        "neutral": "⚪ Neutral",
+    }.get(normalized, "⚪ Neutral")
+
+
+def sentiment_cell_style(value: Any) -> str:
+    normalized = str(value or "").lower()
+    if "positiv" in normalized:
+        return "color: #166534; background-color: #dcfce7; font-weight: 700"
+    if "negativ" in normalized:
+        return "color: #991b1b; background-color: #fee2e2; font-weight: 700"
+    if "gemischt" in normalized:
+        return "color: #854d0e; background-color: #fef9c3; font-weight: 700"
+    return "color: #475569; background-color: #f1f5f9"
+
+
+def _event_type_label(value: Any) -> str:
+    event_type = str(value or "news")
+    icon = {
+        "news": "📰",
+        "earnings": "📊",
+        "dividend": "💶",
+        "annual_meeting": "🗳️",
+        "report": "📄",
+        "analyst": "🎯",
+    }.get(event_type, "•")
+    label = EVENT_META.get(event_type, {}).get("label", event_type)
+    return f"{icon} {label}"
+
+
+def _friendly_event_date(value: Any) -> str:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return "–"
+    if timestamp.hour == 0 and timestamp.minute == 0:
+        return timestamp.strftime("%d.%m.%Y")
+    return timestamp.strftime("%d.%m.%Y, %H:%M")
+
+
+def _render_event_table(frame: pd.DataFrame, empty_message: str) -> None:
+    if frame.empty:
+        st.info(empty_message)
+        return
+
+    display = frame.copy()
+    display["Datum"] = display["date"].map(_friendly_event_date)
+    display["Typ"] = display["event_type"].map(_event_type_label)
+    display["Titel"] = display.get("title", "").fillna("")
+    display["Quelle"] = display.get("source", "").fillna("")
+    display["Sentiment"] = display.get("sentiment_label", "neutral").map(sentiment_badge)
+    display["Sicherheit"] = display.get("sentiment_confidence", "niedrig").fillna("niedrig").astype(str).str.capitalize()
+    display["Begründung"] = display.get("sentiment_reason", "").fillna("")
+    display["Artikel"] = display.get("link", "").fillna("")
+
+    visible = ["Datum", "Typ", "Titel", "Quelle", "Sentiment", "Sicherheit", "Begründung", "Artikel"]
+    styled = display[visible].style.map(sentiment_cell_style, subset=["Sentiment"])
+    try:
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Artikel": st.column_config.LinkColumn("Artikel", display_text="Öffnen"),
+                "Titel": st.column_config.TextColumn("Titel", width="large"),
+                "Begründung": st.column_config.TextColumn("Warum?", width="large"),
+            },
+        )
+    except (TypeError, AttributeError):
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 def render_event_calendar(events: pd.DataFrame) -> None:
     st.markdown("#### Ereigniskalender")
     if events is None or events.empty:
@@ -2262,18 +3538,70 @@ def render_event_calendar(events: pd.DataFrame) -> None:
 
     display = events.copy()
     display["date"] = pd.to_datetime(display["date"], errors="coerce")
-    display["Typ"] = display["event_type"].map(lambda value: EVENT_META.get(str(value), {}).get("label", str(value)))
-    future_flags = display["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"})
-    display["Zukunft"] = future_flags.map(lambda value: "Ja" if value else "Nein")
-    visible = ["date", "ticker_yahoo", "Typ", "title", "source", "sentiment_label", "Zukunft", "link"]
-    visible = [column for column in visible if column in display.columns]
-    st.dataframe(
-        display[visible].sort_values("date", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+    display = display.dropna(subset=["date"])
+    if display.empty:
+        st.info("Die gespeicherten Ereignisse enthalten keine gültigen Datumswerte.")
+        return
 
+    event_options = sorted(display["event_type"].dropna().astype(str).unique().tolist())
+    sentiment_options = ["positiv", "negativ", "gemischt", "neutral"]
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        selected_types = st.multiselect(
+            "Ereignistypen",
+            options=event_options,
+            default=event_options,
+            format_func=lambda value: _event_type_label(value),
+            key="calendar_event_types",
+        )
+    with filter_col2:
+        selected_sentiments = st.multiselect(
+            "Sentiment",
+            options=sentiment_options,
+            default=sentiment_options,
+            format_func=sentiment_badge,
+            key="calendar_sentiments",
+        )
 
+    if selected_types:
+        display = display[display["event_type"].astype(str).isin(selected_types)]
+    else:
+        display = display.iloc[0:0]
+    if selected_sentiments:
+        display = display[display.get("sentiment_label", "neutral").fillna("neutral").astype(str).str.lower().isin(selected_sentiments)]
+    else:
+        display = display.iloc[0:0]
+
+    today = pd.Timestamp.now().normalize()
+    future_flags = display.get("is_future_event", False).astype(str).str.lower().isin({"true", "1", "yes", "ja"})
+    upcoming_mask = future_flags | (display["date"].dt.normalize() >= today)
+    upcoming = display[upcoming_mask].sort_values("date", ascending=True)
+    past = display[~upcoming_mask].sort_values("date", ascending=False)
+
+    counts = st.columns(4)
+    counts[0].metric("Kommende Termine", len(upcoming))
+    counts[1].metric("Positive Ereignisse", int((display.get("sentiment_label", "neutral").astype(str).str.lower() == "positiv").sum()))
+    counts[2].metric("Negative Ereignisse", int((display.get("sentiment_label", "neutral").astype(str).str.lower() == "negativ").sum()))
+    counts[3].metric("Gemischt/Neutral", int(display.get("sentiment_label", "neutral").astype(str).str.lower().isin(["gemischt", "neutral"]).sum()))
+
+    st.markdown("##### Kommende Termine")
+    _render_event_table(upcoming, "Keine kommenden Termine für die gewählten Filter.")
+
+    with st.expander(f"Vergangene Ereignisse ({len(past)})", expanded=upcoming.empty):
+        _render_event_table(past, "Keine vergangenen Ereignisse für die gewählten Filter.")
+
+    with st.expander("Wie werden Ereignistyp und Sentiment bestimmt?", expanded=False):
+        st.markdown(
+            """
+- **Ereignistyp** und **Sentiment** sind getrennt: Eine Quartalszahl oder Dividende ist zunächst neutral. Erst Formulierungen wie „Erwartungen übertroffen“, „Prognose angehoben“ oder „Dividende gekürzt“ erzeugen eine Richtung.
+- **Positiv**: u. a. Erwartungsübertreffen, Prognoseanhebung, Dividendenerhöhung, Aktienrückkauf, Analysten-Upgrade, Schuldenabbau.
+- **Negativ**: u. a. Gewinnwarnung, Prognosesenkung, Dividendenkürzung, Erwartungsverfehlung, Analysten-Downgrade, Klage/Untersuchung oder Insolvenz.
+- **Gemischt**: klare positive und negative Signale stehen gleichzeitig in Überschrift/Beschreibung, etwa „Erwartungen übertroffen, aber Prognose gesenkt“.
+- **Neutral**: kein eindeutiges Richtungssignal; ein bloßer Termin oder ein allgemeiner Analystenartikel bleibt neutral.
+
+Die Bewertung nutzt nur RSS-Überschrift und -Beschreibung. Ironie, komplexe Zusammenhänge und der vollständige Artikel können dadurch nicht sicher erfasst werden.
+            """
+        )
 
 
 
@@ -2363,10 +3691,10 @@ def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_
         "Dieser Bereich vergleicht historische Kurs-/Adj-Close-Entwicklung mit einem Benchmark. "
         "Er ist bewusst kein fundamentaler Backtest: Historische Fundamentals, damalige Indexzusammensetzungen und Transaktionskosten fehlen dafür."
     )
-    ticker = st.selectbox("Aktie für Vergleich", df["ticker_yahoo"].tolist(), key="research_ticker")
+    ticker = company_selectbox("Aktie für Vergleich", df, key="research_ticker")
     use_adjusted = st.checkbox("Bereinigte Kurse verwenden (Adj Close)", value=True, key="research_adjusted")
     history = histories.get(ticker, pd.DataFrame())
-    benchmark_ticker = "^GDAXI" if index_name == "DAX 40" else "^GSPC"
+    benchmark_ticker = benchmark_for_index(index_name)
     benchmark = fetch_benchmark_history(benchmark_ticker, period="5y")
     column = "Adj Close" if use_adjusted and "Adj Close" in history.columns else "Close"
     benchmark_column = "Adj Close" if use_adjusted and "Adj Close" in benchmark.columns else "Close"
@@ -2397,7 +3725,7 @@ def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_
     benchmark_metrics = compute_return_metrics(comparison["Benchmark"])
     table = pd.DataFrame(
         [
-            {"Serie": ticker, "Rendite": company_metrics["return_pct"], "Volatilität": company_metrics["volatility_pct"], "Max. Drawdown": company_metrics["max_drawdown_pct"]},
+            {"Serie": f"{df.loc[df["ticker_yahoo"] == ticker, "name"].iloc[0]} ({ticker})", "Rendite": company_metrics["return_pct"], "Volatilität": company_metrics["volatility_pct"], "Max. Drawdown": company_metrics["max_drawdown_pct"]},
             {"Serie": benchmark_ticker, "Rendite": benchmark_metrics["return_pct"], "Volatilität": benchmark_metrics["volatility_pct"], "Max. Drawdown": benchmark_metrics["max_drawdown_pct"]},
         ]
     )
@@ -2448,12 +3776,26 @@ def format_value_trigger(value: Any) -> str:
     return "✓ erfüllt" if bool(value) else "✗ offen"
 
 
+def format_special_trigger(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "–"
+    return "⚠ prüfen" if bool(value) else "–"
+
+
 def colorize_value_trigger(value: Any) -> str:
     """Hebt nur wirklich ausgelöste Trigger grün hervor."""
     if value is None or pd.isna(value):
         return "color: #6b7280"
     if bool(value):
         return "background-color: #dcfce7; color: #166534; font-weight: 700"
+    return "color: #9ca3af"
+
+
+def colorize_special_trigger(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "color: #6b7280"
+    if bool(value):
+        return "background-color: #fef3c7; color: #92400e; font-weight: 700"
     return "color: #9ca3af"
 
 
@@ -2634,23 +3976,112 @@ def show_header() -> None:
     )
 
 
+def render_data_status(summary: dict[str, Any], detail: pd.DataFrame, metrics: pd.DataFrame) -> None:
+    st.subheader("Datenstatus")
+    st.caption(
+        "Hier siehst du, ob der gewählte Index vollständig geladen wurde und welche Datenbereiche je Aktie fehlen."
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Index", str(summary.get("index", "–")))
+    col2.metric("Angefragt", int(summary.get("angefragt", 0)))
+    col3.metric("Analysiert", int(summary.get("analysiert", 0)))
+    col4.metric("Mit Kursdaten", int(summary.get("mit_kursdaten", 0)))
+    avg_cov = safe_float(summary.get("durchschnitt_datenabdeckung"))
+    col5.metric("Ø Datenabdeckung", format_percent(avg_cov, 1) if avg_cov is not None else "–")
+
+    if detail is None or detail.empty:
+        st.info("Noch keine Statusdetails vorhanden.")
+        return
+
+    problems = detail[detail["Status"] != "OK"].copy()
+    if problems.empty:
+        st.success("Alle aktuell angefragten Werte wurden ohne offensichtliche Datenprobleme verarbeitet.")
+    else:
+        st.warning(f"{len(problems)} Werte haben fehlende Kursdaten oder größere Datenlücken.")
+        st.dataframe(
+            problems[["Status", "Name", "Ticker", "Sektor", "Kursdaten", "Datenabdeckung", "Fehler/Hinweis"]].style.format(
+                {"Datenabdeckung": lambda value: format_percent(value, 1)},
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### Abdeckung je Datenbereich")
+    group_cols = list(DATA_STATUS_FIELD_GROUPS.keys())
+    coverage_by_group = []
+    for group in group_cols:
+        coverage_by_group.append({
+            "Datenbereich": group,
+            "Durchschnittliche Abdeckung": safe_float(detail[group].mean()) if group in detail.columns else None,
+        })
+    group_df = pd.DataFrame(coverage_by_group)
+    st.dataframe(
+        group_df.style.format(
+            {"Durchschnittliche Abdeckung": lambda value: format_percent(value, 1)},
+            na_rep="–",
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    chart = alt.Chart(group_df.dropna()).mark_bar().encode(
+        x=alt.X("Durchschnittliche Abdeckung:Q", title="Abdeckung in %", scale=alt.Scale(domain=[0, 100])),
+        y=alt.Y("Datenbereich:N", sort="-x", title="Datenbereich"),
+        tooltip=["Datenbereich:N", alt.Tooltip("Durchschnittliche Abdeckung:Q", format=".1f")],
+    ).properties(height=260)
+    st.altair_chart(chart, use_container_width=True)
+
+    with st.expander("Alle Werte im Detail"):
+        display_cols = [
+            "Status", "Name", "Ticker", "Sektor", "Kursdaten", "Historie Tage", "Datenabdeckung",
+            "Bewertung", "Qualität", "Dividende", "Cashflow", "Deep Value", "Fehler/Hinweis",
+        ]
+        display_cols = [col for col in display_cols if col in detail.columns]
+        st.dataframe(
+            detail[display_cols].style.format(
+                {
+                    "Datenabdeckung": lambda value: format_percent(value, 1),
+                    "Bewertung": lambda value: format_percent(value, 1),
+                    "Qualität": lambda value: format_percent(value, 1),
+                    "Dividende": lambda value: format_percent(value, 1),
+                    "Cashflow": lambda value: format_percent(value, 1),
+                    "Deep Value": lambda value: format_percent(value, 1),
+                },
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Warum ist dieser Tab wichtig?"):
+        st.write(
+            "Viele Fehler im Tool entstehen nicht im UI, sondern durch fehlende oder unvollständige externe Daten. "
+            "Der Datenstatus trennt deshalb klar zwischen Indexbestandteil, Kursdaten, Fundamentaldaten, Dividenden, "
+            "Cashflow und Deep-Value-Kennzahlen. Wenn ein Wert nicht im Scanner auftaucht, findest du hier meistens den Grund."
+        )
+
+
 def render_overview(df: pd.DataFrame) -> None:
     st.subheader("Überblick")
     if df.empty:
         st.info("Keine Daten für die aktuelle Filtereinstellung.")
         return
 
-    metric_columns = st.columns(5)
+    metric_columns = st.columns(6)
     metric_columns[0].metric("Unternehmen", f"{len(df):,}".replace(",", "."))
-    metric_columns[1].metric("Trigger erfüllt", int(df["value_trigger"].fillna(False).sum()))
-    metric_columns[2].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
-    metric_columns[3].metric("Ø Kursrendite 1J", format_percent(df["change_1y"].mean(), 1, signed=True))
-    metric_columns[4].metric("Ø Gesamtrendite 1J*", format_percent(df["total_return_1y"].mean(), 1, signed=True))
+    metric_columns[1].metric("Value-Trigger", int(df["value_trigger"].fillna(False).sum()))
+    metric_columns[2].metric("Deep-Value prüfen", int(df.get("special_situation_trigger", pd.Series(dtype=bool)).fillna(False).sum()))
+    metric_columns[3].metric("Ø Qualitäts-Score", format_number(df["total_score"].mean(), 1))
+    metric_columns[4].metric("Ø Kursrendite 1J", format_percent(df["change_1y"].mean(), 1, signed=True))
+    metric_columns[5].metric("Ø Gesamtrendite 1J*", format_percent(df["total_return_1y"].mean(), 1, signed=True))
 
     columns = [
         "name", "ticker_yahoo", "sector", "currency", "last_price", "change_1d", "change_5d",
         "change_1y", "total_return_1y", "vol_1y", "max_drawdown_1y", "dividend_yield",
-        "total_score", "score_coverage", "value_score", "drawdown_1y_high_pct", "value_trigger",
+        "total_score", "score_coverage", "value_score", "special_situation_score",
+        "special_situation_trigger", "drawdown_1y_high_pct", "drawdown_3y_high_pct", "value_trigger",
     ]
     visible_columns = [column for column in columns if column in df.columns]
     display = df[visible_columns].rename(
@@ -2670,7 +4101,10 @@ def render_overview(df: pd.DataFrame) -> None:
             "total_score": "Qualitäts-Score",
             "score_coverage": "Datenabdeckung",
             "value_score": "Value-Score",
+            "special_situation_score": "Deep-Value-Score",
+            "special_situation_trigger": "Deep-Value",
             "drawdown_1y_high_pct": "Drawdown vom 52W-Hoch",
+            "drawdown_3y_high_pct": "Drawdown vom 3J-Hoch",
             "value_trigger": "Value-Trigger",
         }
     )
@@ -2686,19 +4120,23 @@ def render_overview(df: pd.DataFrame) -> None:
         "Qualitäts-Score": lambda value: format_number(value, 1),
         "Datenabdeckung": lambda value: format_percent(value, 0),
         "Value-Score": lambda value: format_number(value, 1),
+        "Deep-Value-Score": lambda value: format_number(value, 1),
+        "Deep-Value": format_special_trigger,
         "Drawdown vom 52W-Hoch": lambda value: format_percent(value, 1, signed=True),
+        "Drawdown vom 3J-Hoch": lambda value: format_percent(value, 1, signed=True),
         "Value-Trigger": format_value_trigger,
     }
     styled = (
         display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
         .map(colorize_change, subset=[column for column in ["Veränderung 1T", "Veränderung 5T", "Kursrendite 1J", "Gesamtrendite 1J*"] if column in display.columns])
-        .map(colorize_score, subset=[column for column in ["Qualitäts-Score"] if column in display.columns])
+        .map(colorize_score, subset=[column for column in ["Qualitäts-Score", "Deep-Value-Score"] if column in display.columns])
+        .map(colorize_special_trigger, subset=[column for column in ["Deep-Value"] if column in display.columns])
         .map(colorize_value_trigger, subset=[column for column in ["Value-Trigger"] if column in display.columns])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
         "Value-Score und Value-Trigger sind verschieden: Der Score ordnet Kandidaten ein; der Trigger ist ein strenger Filter, "
-        "bei dem alle Regeln erfüllt sein müssen. Details stehen im Tab „Value-Scanner“."
+        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach BAT-ähnlichen Sondersituationen."
     )
     st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
@@ -2732,6 +4170,11 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "payout_ratio": "Ausschüttungsquote",
         "dividend_growth_5y": "Dividendenwachstum 5J",
         "dividend_frequency": "Ausschüttungsrhythmus",
+        "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
+        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt",
+        "free_cashflow": "Free Cashflow",
+        "operating_cashflow": "Operativer Cashflow",
+        "cashflow_dividend_coverage": "FCF/Dividende",
         "debt_to_equity": "Debt/Equity",
         "net_debt_ebitda": "Netto-Schulden/EBITDA",
         "beta": "Beta",
@@ -2756,6 +4199,11 @@ def render_fundamentals(df: pd.DataFrame) -> None:
         "Dividende je Aktie": lambda value: format_number(value, 2),
         "Ausschüttungsquote": lambda value: format_percent(value, 2),
         "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
+        "Ø Div.-Rendite 5J": lambda value: format_percent(value, 2),
+        "Rendite vs. 5J-Schnitt": lambda value: format_percent(value, 0, signed=True),
+        "Free Cashflow": human_market_cap,
+        "Operativer Cashflow": human_market_cap,
+        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
         "Debt/Equity": lambda value: f"{format_number(value, 2)}x",
         "Netto-Schulden/EBITDA": lambda value: f"{format_number(value, 2)}x",
         "Beta": lambda value: format_number(value, 2),
@@ -2811,7 +4259,7 @@ def render_value_trigger_explanation(
 
         if df.empty:
             return
-        ticker = st.selectbox("Trigger für einen Titel prüfen", df["ticker_yahoo"].tolist(), key="value_trigger_explanation_ticker")
+        ticker = company_selectbox("Trigger für einen Titel prüfen", df, key="value_trigger_explanation_ticker")
         row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
         minimum_yield = sector_yield_trigger(row.get("sector"), yield_min)
         drawdown = safe_float(row.get("drawdown_1y_high_pct"))
@@ -2843,6 +4291,128 @@ def render_value_trigger_explanation(
         else:
             st.info("Der Value-Trigger ist noch nicht erfüllt. In der Tabelle siehst du, welches Kriterium fehlt oder welche Kennzahl nicht vorliegt.")
         st.caption(str(row.get("value_reason", "")))
+
+
+def render_special_situation_scanner(df: pd.DataFrame) -> None:
+    st.subheader("Sondersituation / Deep Value")
+    st.caption(
+        "Dieser Scanner sucht nach BAT-ähnlichen Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
+        "und trotzdem positive Cashflows. Das ist ein Research-Hinweis, keine Kaufempfehlung."
+    )
+
+    with st.expander("So funktioniert der BAT-/Deep-Value-Pattern-Score", expanded=True):
+        st.markdown(
+            "Der Score bewertet Fälle, bei denen normale Kennzahlen wie KGV oder Payout Ratio durch Sondereffekte verzerrt sein können. "
+            "Das Muster lautet: **hohe Rendite + starker Drawdown + Cashflow bleibt positiv + Dividende wirkt gedeckt + Verschuldung kontrollierbar**."
+        )
+        rules = pd.DataFrame([
+            {"Baustein": "Dividendenrendite", "Punkte": "bis 20", "Gedanke": "> 7 % ist ein starkes Ertragssignal, kann aber auch Dividendenfalle sein."},
+            {"Baustein": "Drawdown vom 3J-/5J-Hoch", "Punkte": "bis 20", "Gedanke": "Der Markt hat die Aktie deutlich abgestraft."},
+            {"Baustein": "Positiver Cashflow", "Punkte": "15", "Gedanke": "Wichtigster Unterschied zwischen Sondersituation und operativem Kollaps."},
+            {"Baustein": "Dividende durch FCF gedeckt", "Punkte": "bis 15", "Gedanke": "Free Cashflow geteilt durch geschätzte jährliche Dividendenlast."},
+            {"Baustein": "Net Debt / EBITDA", "Punkte": "bis 10", "Gedanke": "Unter 3,5x wird als kontrollierbarer gewertet."},
+            {"Baustein": "KGV oder EPS-Verzerrung", "Punkte": "bis 10", "Gedanke": "Negatives KGV ist kein Ausschluss, wenn Cashflow positiv bleibt."},
+            {"Baustein": "Negatives News-Sentiment", "Punkte": "bis 10", "Gedanke": "Punkte nur, wenn News geladen wurden und der Cashflow nicht kollabiert."},
+        ])
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+        st.info(
+            "Ein Trigger bedeutet: **Bitte prüfen** – nicht kaufen. Besonders wichtig ist die Frage: "
+            "Ist der Gewinnrückgang operativ, oder wurde das Ergebnis durch Abschreibungen/Sondereffekte verzerrt?"
+        )
+
+    if df.empty:
+        st.info("Keine Daten für die aktuelle Filtereinstellung.")
+        return
+
+    required = ["special_situation_score", "special_situation_trigger"]
+    if not all(column in df.columns for column in required):
+        df = enrich_with_special_situations(df)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Prüfen", int(df["special_situation_trigger"].fillna(False).sum()))
+    metric_cols[1].metric("Score ≥ 70", int((pd.to_numeric(df["special_situation_score"], errors="coerce") >= 70).sum()))
+    metric_cols[2].metric("Ø Deep-Value-Score", format_number(pd.to_numeric(df["special_situation_score"], errors="coerce").mean(), 1))
+    metric_cols[3].metric("Ø Drawdown 3/5J", format_percent(pd.to_numeric(df.get("deepest_drawdown_3_5y_pct"), errors="coerce").mean(), 1, signed=True))
+
+    sorted_df = df.sort_values(["special_situation_trigger", "special_situation_score"], ascending=[False, False], na_position="last")
+    columns = [
+        "name", "ticker_yahoo", "sector", "special_situation_score", "special_situation_trigger",
+        "special_situation_status", "dividend_yield", "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct",
+        "deepest_drawdown_3_5y_pct", "free_cashflow", "cashflow_dividend_coverage",
+        "net_debt_ebitda", "pe_ratio", "payout_ratio", "special_situation_reason",
+    ]
+    visible = [column for column in columns if column in sorted_df.columns]
+    display = sorted_df[visible].rename(columns={
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "sector": "Sektor",
+        "special_situation_score": "BAT-/Deep-Value-Score",
+        "special_situation_trigger": "Prüfen",
+        "special_situation_status": "Status",
+        "dividend_yield": "Dividendenrendite",
+        "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
+        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt",
+        "deepest_drawdown_3_5y_pct": "Drawdown 3/5J",
+        "free_cashflow": "Free Cashflow",
+        "cashflow_dividend_coverage": "FCF/Dividende",
+        "net_debt_ebitda": "Net Debt/EBITDA",
+        "pe_ratio": "KGV",
+        "payout_ratio": "Payout",
+        "special_situation_reason": "Begründung",
+    })
+    formats = {
+        "BAT-/Deep-Value-Score": lambda value: format_number(value, 1),
+        "Prüfen": format_special_trigger,
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Ø Div.-Rendite 5J": lambda value: format_percent(value, 2),
+        "Rendite vs. 5J-Schnitt": lambda value: format_percent(value, 0, signed=True),
+        "Drawdown 3/5J": lambda value: format_percent(value, 1, signed=True),
+        "Free Cashflow": human_market_cap,
+        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
+        "Net Debt/EBITDA": lambda value: f"{format_number(value, 2)}x",
+        "KGV": lambda value: format_number(value, 2),
+        "Payout": lambda value: format_percent(value, 1),
+    }
+    styled = (
+        display.style.format({key: value for key, value in formats.items() if key in display.columns}, na_rep="–")
+        .map(colorize_score, subset=[column for column in ["BAT-/Deep-Value-Score"] if column in display.columns])
+        .map(colorize_special_trigger, subset=[column for column in ["Prüfen"] if column in display.columns])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    st.markdown("### Einzelprüfung")
+    ticker = company_selectbox("Titel prüfen", sorted_df, key="special_situation_detail_ticker")
+    row = sorted_df.loc[sorted_df["ticker_yahoo"] == ticker].iloc[0]
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("Score", format_number(row.get("special_situation_score"), 1))
+    detail_cols[1].metric("Dividendenrendite", format_percent(row.get("dividend_yield"), 2))
+    detail_cols[2].metric("Drawdown 3/5J", format_percent(row.get("deepest_drawdown_3_5y_pct"), 1, signed=True))
+    detail_cols[3].metric("FCF/Dividende", f"{format_number(row.get('cashflow_dividend_coverage'), 2)}x")
+
+    if bool(row.get("special_situation_trigger", False)):
+        st.warning(
+            "Sondersituation erkannt: hohe Dividende + starker Drawdown + positive Cashflow-Indizien. "
+            "Bitte prüfen, ob der Gewinnrückgang operativ oder bilanziell/Sondereffekt-getrieben ist."
+        )
+    elif safe_float(row.get("special_situation_score")) is not None and safe_float(row.get("special_situation_score")) >= 55:
+        st.info("Teilweise BAT-ähnliches Profil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
+    else:
+        st.info("Aktuell kein klares BAT-/Deep-Value-Muster nach den hinterlegten Regeln.")
+
+    st.markdown("**Score-Bausteine**")
+    st.code(str(row.get("special_situation_reason", "")))
+    st.markdown("**Zusatzhinweise**")
+    st.code(str(row.get("special_situation_checks", "")))
+
+    with st.expander("BAT-Fallstudie als Denkmodell", expanded=False):
+        st.markdown(
+            "BAT war ein Beispiel für eine Aktie, bei der der Markt stark auf strukturelle Risiken und eine große Abschreibung reagiert hat, "
+            "während Cashflow und Dividendenfähigkeit auf adjustierter Basis nicht im selben Maß kollabierten. Genau solche Spannungen soll dieser Scanner sichtbar machen."
+        )
+        st.markdown(
+            "Für eine belastbare Replikation fehlen weiterhin historische Fundamentaldaten zum damaligen Zeitpunkt. "
+            "Der Scanner ist deshalb ein **Hinweisgeber**, kein Backtest und keine automatische Entscheidung."
+        )
 
 
 def render_value_watchlist(
@@ -2910,8 +4480,11 @@ def render_value_watchlist(
 
 def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
     st.subheader("Einzelanalyse & Chart")
-    ticker = st.selectbox("Aktie auswählen", df["ticker_yahoo"].tolist(), key="analysis_ticker")
+    ticker = company_selectbox("Aktie auswählen", df, key="analysis_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+    company_name = str(row.get("name") or ticker)
+    company_sector = str(row.get("sector") or "Unbekannt")
+    st.caption(f"{company_name} · {ticker} · {company_sector}")
     events = load_persisted_events(ticker, days_back=1825)
 
     columns = st.columns(6)
@@ -2932,9 +4505,9 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
         st.caption(f"{row.get('score_confidence', '–')} · Abdeckung: {format_percent(row.get('score_coverage'), 0)}")
         if st.button("Zur Watchlist hinzufügen", key=f"watch_{ticker}"):
             if add_to_watchlist(ticker, str(row.get("name", ticker)), str(row.get("sector", "Unbekannt"))):
-                st.success(f"{ticker} wurde gespeichert.")
+                st.success(f"{company_name} ({ticker}) wurde gespeichert.")
             else:
-                st.info(f"{ticker} ist bereits auf der Watchlist.")
+                st.info(f"{company_name} ({ticker}) ist bereits auf der Watchlist.")
 
         with st.expander("Unternehmensprofil & Management"):
             render_company_profile(ticker)
@@ -2964,75 +4537,459 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     st.caption("*Gesamtrendite und bereinigter Kurs: Yahoo Adj Close als Näherung, nicht als Broker- oder Steuerberechnung.")
 
 
-def render_sector_view(df: pd.DataFrame) -> None:
-    st.subheader("Sektor-Übersicht")
-    sector_stats = (
-        df.groupby("sector", dropna=False)
-        .agg(
-            Unternehmen=("ticker_yahoo", "count"),
-            Kursrendite_1J=("change_1y", "mean"),
-            Gesamtrendite_1J=("total_return_1y", "mean"),
-            Max_Drawdown_1J=("max_drawdown_1y", "mean"),
-            Qualitäts_Score=("total_score", "mean"),
-            Value_Score=("value_score", "mean"),
-            Trigger=("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
-        )
-        .reset_index()
-        .sort_values("Value_Score", ascending=False, na_position="last")
+
+def _extract_sector_from_chart_event(event: Any, selection_name: str) -> Optional[str]:
+    """Liest eine Sektor-Auswahl robust aus einem Streamlit-/Altair-Event."""
+    if event is None:
+        return None
+
+    try:
+        selection = event.selection
+    except Exception:
+        try:
+            selection = event.get("selection", {})
+        except Exception:
+            return None
+
+    try:
+        payload = selection.get(selection_name, [])
+    except Exception:
+        try:
+            payload = selection[selection_name]
+        except Exception:
+            return None
+
+    if isinstance(payload, list) and payload:
+        candidate = payload[-1]
+        if isinstance(candidate, dict):
+            value = candidate.get("Sektor") or candidate.get("sector")
+            return str(value) if value not in (None, "") else None
+
+    if isinstance(payload, dict):
+        value = payload.get("Sektor") or payload.get("sector")
+        if isinstance(value, list) and value:
+            value = value[-1]
+        return str(value) if value not in (None, "") else None
+
+    return None
+
+
+def _navigate_to_company(page: str, ticker: str) -> None:
+    """Wechselt per Widget-Callback sicher auf eine firmenspezifische Ansicht."""
+    ticker = str(ticker)
+    if page == "Einzelanalyse":
+        st.session_state["analysis_ticker"] = ticker
+    elif page == "News & Events":
+        st.session_state["news_ticker"] = ticker
+    st.session_state["main_navigation"] = page
+
+
+def _render_sector_company_drilldown(df: pd.DataFrame, selected_sector: str) -> None:
+    """Zeigt die Einzelwerte eines Sektors und bietet gezielte Navigation an."""
+    sector_mask = df["sector"].fillna("Unbekannt").astype(str).eq(str(selected_sector))
+    sector_df = df.loc[sector_mask].copy()
+    if sector_df.empty:
+        st.info("Für diesen Sektor sind aktuell keine Aktien verfügbar.")
+        return
+
+    st.markdown(f"### Aktien im Sektor: {selected_sector}")
+    st.caption(
+        "Der Sektor bleibt als Kontext sichtbar. Wähle anschließend eine Aktie und öffne gezielt "
+        "die Einzelanalyse oder den News-Bereich."
     )
-    st.dataframe(
-        sector_stats.style.format(
-            {
-                "Kursrendite_1J": lambda value: format_percent(value, 2, signed=True),
-                "Gesamtrendite_1J": lambda value: format_percent(value, 2, signed=True),
-                "Max_Drawdown_1J": lambda value: format_percent(value, 1, signed=True),
-                "Qualitäts_Score": lambda value: format_number(value, 1),
-                "Value_Score": lambda value: format_number(value, 1),
-            },
-            na_rep="–",
-        ),
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Unternehmen", len(sector_df))
+    metric_cols[1].metric("Ø Qualitäts-Score", format_number(sector_df.get("total_score", pd.Series(dtype=float)).mean(), 1))
+    metric_cols[2].metric("Ø Value-Score", format_number(sector_df.get("value_score", pd.Series(dtype=float)).mean(), 1))
+    metric_cols[3].metric("Ø Kursrendite 1J", format_percent(sector_df.get("change_1y", pd.Series(dtype=float)).mean(), 1, signed=True))
+    metric_cols[4].metric("Ø Dividendenrendite", format_percent(sector_df.get("dividend_yield", pd.Series(dtype=float)).mean(), 2))
+
+    columns = [
+        "name", "ticker_yahoo", "currency", "last_price", "change_1y", "total_return_1y",
+        "dividend_yield", "total_score", "value_score", "value_trigger",
+        "special_situation_score", "vol_1y", "max_drawdown_1y",
+    ]
+    available_columns = [column for column in columns if column in sector_df.columns]
+    detail = sector_df[available_columns].copy()
+    sort_columns = [column for column in ["value_score", "total_score"] if column in detail.columns]
+    if sort_columns:
+        detail = detail.sort_values(sort_columns, ascending=[False] * len(sort_columns), na_position="last")
+
+    display = detail.rename(columns={
+        "name": "Unternehmen",
+        "ticker_yahoo": "Ticker",
+        "currency": "Währung",
+        "last_price": "Letzter Kurs",
+        "change_1y": "Kursrendite 1J",
+        "total_return_1y": "Gesamtrendite 1J*",
+        "dividend_yield": "Dividendenrendite",
+        "total_score": "Qualitäts-Score",
+        "value_score": "Value-Score",
+        "value_trigger": "Value-Trigger",
+        "special_situation_score": "Deep-Value-Score",
+        "vol_1y": "Volatilität 1J",
+        "max_drawdown_1y": "Max. Drawdown 1J",
+    })
+
+    formatters = {
+        "Letzter Kurs": lambda value: format_number(value, 2),
+        "Kursrendite 1J": lambda value: format_percent(value, 1, signed=True),
+        "Gesamtrendite 1J*": lambda value: format_percent(value, 1, signed=True),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Value-Score": lambda value: format_number(value, 1),
+        "Value-Trigger": format_value_trigger,
+        "Deep-Value-Score": lambda value: format_number(value, 1),
+        "Volatilität 1J": lambda value: format_percent(value, 1),
+        "Max. Drawdown 1J": lambda value: format_percent(value, 1, signed=True),
+    }
+    styled = display.style.format(
+        {key: value for key, value in formatters.items() if key in display.columns},
+        na_rep="–",
+    )
+    if "Kursrendite 1J" in display.columns:
+        styled = styled.map(colorize_change, subset=["Kursrendite 1J"])
+    if "Gesamtrendite 1J*" in display.columns:
+        styled = styled.map(colorize_change, subset=["Gesamtrendite 1J*"])
+    score_columns = [column for column in ["Qualitäts-Score", "Deep-Value-Score"] if column in display.columns]
+    if score_columns:
+        styled = styled.map(colorize_score, subset=score_columns)
+    if "Value-Trigger" in display.columns:
+        styled = styled.map(colorize_value_trigger, subset=["Value-Trigger"])
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    selected_ticker = company_selectbox(
+        "Aktie aus diesem Sektor auswählen",
+        sector_df,
+        key="sector_company_ticker",
+    )
+    selected_row = sector_df.loc[sector_df["ticker_yahoo"].astype(str).eq(str(selected_ticker))].iloc[0]
+    selected_name = str(selected_row.get("name") or selected_ticker)
+
+    action_cols = st.columns([1, 1, 3])
+    action_cols[0].button(
+        "Einzelanalyse öffnen",
+        key=f"sector_open_analysis_{selected_ticker}",
+        on_click=_navigate_to_company,
+        args=("Einzelanalyse", selected_ticker),
         use_container_width=True,
-        hide_index=True,
     )
-    metric_choice = st.radio(
-        "Diagramm",
-        ["Kursrendite 1J", "Gesamtrendite 1J", "Value Score"],
+    action_cols[1].button(
+        "News öffnen",
+        key=f"sector_open_news_{selected_ticker}",
+        on_click=_navigate_to_company,
+        args=("News & Events", selected_ticker),
+        use_container_width=True,
+    )
+    action_cols[2].caption(f"Ausgewählt: {selected_name} ({selected_ticker})")
+
+
+def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Sektor-Übersicht 2.1")
+    st.caption(
+        "Vergleicht Sektoren über mehrere Zeiträume. Klicke im Diagramm auf einen Sektor "
+        "oder wähle ihn darunter manuell aus."
+    )
+    if df is None or df.empty:
+        st.info("Keine Daten für die Sektoransicht vorhanden.")
+        return
+
+    sector_stats = sector_timeframe_stats(df, histories)
+    if sector_stats.empty:
+        st.info("Für die geladenen Werte liegen keine ausreichenden Kursdaten vor.")
+        return
+
+    available_sectors = sorted(
+        df["sector"].fillna("Unbekannt").astype(str).drop_duplicates().tolist(),
+        key=str.casefold,
+    )
+    if not available_sectors:
+        st.info("Keine Sektoren verfügbar.")
+        return
+
+    metric_mode = st.radio(
+        "Kennzahl anzeigen",
+        ["Kursrendite", "Gesamtrendite", "Bewertung & Risiko"],
         horizontal=True,
-        key="sector_chart_metric",
+        key="sector_view_metric_mode_v2",
     )
-    field = {
-        "Kursrendite 1J": "Kursrendite_1J",
-        "Gesamtrendite 1J": "Gesamtrendite_1J",
-        "Value Score": "Value_Score",
-    }[metric_choice]
-    chart = alt.Chart(sector_stats.dropna(subset=[field])).mark_bar().encode(
-        x=alt.X(f"{field}:Q", title=metric_choice),
-        y=alt.Y("sector:N", sort="-x", title="Sektor"),
-        tooltip=["sector:N", "Unternehmen:Q", alt.Tooltip(f"{field}:Q", format=".2f")],
-    ).properties(height=max(220, 32 * len(sector_stats)))
-    st.altair_chart(chart, use_container_width=True)
+
+    clicked_sector: Optional[str] = None
+
+    if metric_mode in ("Kursrendite", "Gesamtrendite"):
+        prefix = "Kurs" if metric_mode == "Kursrendite" else "Gesamt"
+        columns = ["sector", "Unternehmen"] + [f"{prefix}_{label}" for label in ["1M", "3M", "6M", "1J", "3J", "5J"]]
+        visible = sector_stats[columns].copy().sort_values(f"{prefix}_1J", ascending=False, na_position="last")
+        rename_map = {
+            "sector": "Sektor",
+            "Unternehmen": "Unternehmen",
+            f"{prefix}_1M": "1M",
+            f"{prefix}_3M": "3M",
+            f"{prefix}_6M": "6M",
+            f"{prefix}_1J": "1J",
+            f"{prefix}_3J": "3J",
+            f"{prefix}_5J": "5J",
+        }
+        display = visible.rename(columns=rename_map)
+        st.dataframe(
+            display.style.format(
+                {col: (lambda value: format_percent(value, 1, signed=True)) for col in ["1M", "3M", "6M", "1J", "3J", "5J"]},
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        chart_period = st.selectbox(
+            "Diagramm-Zeitraum",
+            ["1M", "3M", "6M", "1J", "3J", "5J"],
+            index=3,
+            key=f"sector_chart_period_{prefix}",
+        )
+        chart_data = display.dropna(subset=[chart_period]).copy()
+        selection_name = f"sector_bar_selection_{prefix.lower()}"
+        selector = alt.selection_point(
+            name=selection_name,
+            fields=["Sektor"],
+            on="click",
+            clear="dblclick",
+        )
+        chart = (
+            alt.Chart(chart_data)
+            .mark_bar()
+            .encode(
+                x=alt.X(f"{chart_period}:Q", title=f"{metric_mode} {chart_period} in %"),
+                y=alt.Y("Sektor:N", sort="-x", title="Sektor"),
+                opacity=alt.condition(selector, alt.value(1.0), alt.value(0.55)),
+                tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip(f"{chart_period}:Q", format=".2f")],
+            )
+            .add_params(selector)
+            .properties(height=max(260, 34 * len(chart_data)))
+        )
+        try:
+            event = st.altair_chart(
+                chart,
+                use_container_width=True,
+                key=f"sector_bar_chart_{prefix.lower()}",
+                on_select="rerun",
+                selection_mode=selection_name,
+            )
+            clicked_sector = _extract_sector_from_chart_event(event, selection_name)
+        except TypeError:
+            # Kompatibilitäts-Fallback für ältere Streamlit-Versionen.
+            st.altair_chart(chart, use_container_width=True)
+
+    else:
+        columns = [
+            "sector", "Unternehmen", "Qualitäts_Score", "Value_Score", "Value_Trigger",
+            "Dividendenrendite", "Volatilität_1J", "Max_Drawdown_1J",
+        ]
+        visible = sector_stats[columns].copy().sort_values("Value_Score", ascending=False, na_position="last")
+        display = visible.rename(columns={
+            "sector": "Sektor",
+            "Qualitäts_Score": "Qualitäts-Score",
+            "Value_Score": "Value-Score",
+            "Value_Trigger": "Value-Trigger",
+            "Dividendenrendite": "Dividendenrendite",
+            "Volatilität_1J": "Volatilität 1J",
+            "Max_Drawdown_1J": "Max. Drawdown 1J",
+        })
+        st.dataframe(
+            display.style.format(
+                {
+                    "Qualitäts-Score": lambda value: format_number(value, 1),
+                    "Value-Score": lambda value: format_number(value, 1),
+                    "Dividendenrendite": lambda value: format_percent(value, 2),
+                    "Volatilität 1J": lambda value: format_percent(value, 1),
+                    "Max. Drawdown 1J": lambda value: format_percent(value, 1, signed=True),
+                },
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        scatter_data = display.dropna(subset=["Value-Score", "Volatilität 1J"]).copy()
+        selection_name = "sector_scatter_selection"
+        selector = alt.selection_point(
+            name=selection_name,
+            fields=["Sektor"],
+            on="click",
+            clear="dblclick",
+        )
+        scatter = (
+            alt.Chart(scatter_data)
+            .mark_circle(size=120)
+            .encode(
+                x=alt.X("Volatilität 1J:Q", title="Volatilität 1J in %"),
+                y=alt.Y("Value-Score:Q", title="Value-Score"),
+                size=alt.Size("Unternehmen:Q", title="Unternehmen"),
+                opacity=alt.condition(selector, alt.value(1.0), alt.value(0.55)),
+                tooltip=[
+                    "Sektor:N",
+                    "Unternehmen:Q",
+                    alt.Tooltip("Value-Score:Q", format=".1f"),
+                    alt.Tooltip("Volatilität 1J:Q", format=".1f"),
+                ],
+            )
+            .add_params(selector)
+            .properties(height=420)
+        )
+        try:
+            event = st.altair_chart(
+                scatter,
+                use_container_width=True,
+                key="sector_scatter_chart_interactive",
+                on_select="rerun",
+                selection_mode=selection_name,
+            )
+            clicked_sector = _extract_sector_from_chart_event(event, selection_name)
+        except TypeError:
+            st.altair_chart(scatter, use_container_width=True)
+
+    if clicked_sector in available_sectors:
+        st.session_state["sector_drilldown_selected"] = clicked_sector
+
+    if st.session_state.get("sector_drilldown_selected") not in available_sectors:
+        st.session_state["sector_drilldown_selected"] = available_sectors[0]
+
+    st.divider()
+    selected_sector = st.selectbox(
+        "Sektor für Detailansicht",
+        options=available_sectors,
+        key="sector_drilldown_selected",
+        help="Ein Klick im Diagramm setzt diese Auswahl automatisch. Die manuelle Auswahl dient als zuverlässiger Fallback.",
+    )
+    _render_sector_company_drilldown(df, selected_sector)
+
+    with st.expander("Was sagt diese Ansicht aus?"):
+        st.write(
+            "Die Sektoransicht zeigt, ob ein Scanner-Kandidat nur wegen eines einzelnen Unternehmens auffällt "
+            "oder ob ein kompletter Sektor unter Druck steht. Besonders nützlich ist der Vergleich aus 1J/3J/5J-Rendite, "
+            "Value-Score, Dividendenrendite und Volatilität. Ein hoher Value-Score bei gleichzeitig hohem Drawdown kann "
+            "eine Chance oder eine Value Trap sein – deshalb immer mit News, Cashflow und Verschuldung gegenprüfen."
+        )
+        st.write(
+            "Die Detailansicht springt bewusst nicht sofort aus dem Sektorbereich heraus: Erst wird der Sektor aufgeklappt, "
+            "danach entscheidest du ausdrücklich, ob du eine Aktie in der Einzelanalyse oder im News-Bereich öffnen möchtest."
+        )
+
+
+def _sentiment_badge_html(label: Any) -> str:
+    normalized = str(label or "neutral").lower()
+    styles = {
+        "positiv": ("Positiv", "#166534", "#dcfce7", "#86efac"),
+        "negativ": ("Negativ", "#991b1b", "#fee2e2", "#fca5a5"),
+        "gemischt": ("Gemischt", "#854d0e", "#fef9c3", "#fde047"),
+        "neutral": ("Neutral", "#475569", "#f1f5f9", "#cbd5e1"),
+    }
+    text_label, color, background, border = styles.get(normalized, styles["neutral"])
+    return (
+        f'<span style="display:inline-block;padding:0.18rem 0.55rem;border-radius:999px;'
+        f'font-weight:700;font-size:0.8rem;color:{color};background:{background};'
+        f'border:1px solid {border};">{text_label}</span>'
+    )
 
 
 def render_news_card(item: pd.Series, card_index: int) -> None:
-    """Kompakte, lesbare News-Karte statt einer breiten Rohdaten-Tabelle."""
+    """Kompakte News-Karte mit klarer Sentimentfarbe und Begründung."""
     published = pd.to_datetime(item.get("published"), errors="coerce")
     date_label = published.strftime("%d.%m.%Y, %H:%M") if pd.notna(published) else "Datum unbekannt"
     event_label = EVENT_META.get(str(item.get("event_type", "news")), {}).get("label", "News")
-    sentiment = str(item.get("sentiment_label") or "neutral").capitalize()
+    sentiment_label = str(item.get("sentiment_label") or "neutral").lower()
     relevance = str(item.get("relevance_label") or "–").capitalize()
+    confidence = str(item.get("sentiment_confidence") or "niedrig").capitalize()
 
     with st.container(border=True):
-        st.markdown(f"**{str(item.get('title') or 'Ohne Titel')}**")
+        header_left, header_right = st.columns([5, 1])
+        with header_left:
+            st.markdown(f"**{str(item.get('title') or 'Ohne Titel')}**")
+        with header_right:
+            st.markdown(_sentiment_badge_html(sentiment_label), unsafe_allow_html=True)
+
         st.caption(
-            f"{event_label} · {sentiment} · Relevanz: {relevance} · "
+            f"{event_label} · Relevanz: {relevance} · Sentiment-Sicherheit: {confidence} · "
             f"{str(item.get('source') or 'Quelle unbekannt')} · {date_label}"
         )
-        reason = str(item.get("relevance_reason") or "").strip()
-        if reason:
-            st.caption(f"Warum zugeordnet: {reason}")
+        sentiment_reason = str(item.get("sentiment_reason") or "").strip()
+        if sentiment_reason:
+            st.caption(f"Sentiment-Begründung: {sentiment_reason}")
+        relevance_reason = str(item.get("relevance_reason") or "").strip()
+        if relevance_reason:
+            st.caption(f"Firmenzuordnung: {relevance_reason}")
         link = str(item.get("link") or "").strip()
         if link:
-            st.link_button("Artikel öffnen", link, key=f"news_link_{card_index}_{normalize_for_search(str(item.get('title', '')))}")
+            try:
+                st.link_button(
+                    "Artikel öffnen",
+                    link,
+                    key=f"news_link_{card_index}_{normalize_for_search(str(item.get('title', '')))}",
+                )
+            except TypeError:
+                st.link_button("Artikel öffnen", link)
+
+
+def _sentiment_filter_state_key(ticker: str) -> str:
+    """Eindeutiger Session-State-Key für den klickbaren News-Sentimentfilter."""
+    safe_ticker = re.sub(r"[^A-Za-z0-9_-]+", "_", str(ticker))
+    return f"news_sentiment_filter::{safe_ticker}"
+
+
+def render_clickable_sentiment_filter(relevant_news: pd.DataFrame, ticker: str) -> str:
+    """
+    Zeigt klickbare Sentiment-Zähler und gibt den aktiven Filter zurück.
+
+    ``st.metric`` ist nicht klickbar. Deshalb werden bewusst breite Buttons
+    verwendet, die optisch als kompakte Filterkarten funktionieren.
+    """
+    labels = (
+        relevant_news.get("sentiment_label", pd.Series("neutral", index=relevant_news.index))
+        .fillna("neutral")
+        .astype(str)
+        .str.lower()
+    )
+    counts = {
+        "alle": int(len(relevant_news)),
+        "positiv": int((labels == "positiv").sum()),
+        "negativ": int((labels == "negativ").sum()),
+        "gemischt": int((labels == "gemischt").sum()),
+        "neutral": int((labels == "neutral").sum()),
+    }
+    options = [
+        ("alle", "Alle", "📰"),
+        ("positiv", "Positiv", "🟢"),
+        ("negativ", "Negativ", "🔴"),
+        ("gemischt", "Gemischt", "🟡"),
+        ("neutral", "Neutral", "⚪"),
+    ]
+
+    state_key = _sentiment_filter_state_key(ticker)
+    if st.session_state.get(state_key) not in counts:
+        st.session_state[state_key] = "alle"
+
+    active_filter = st.session_state[state_key]
+    columns = st.columns(len(options))
+    for column, (value, title, icon) in zip(columns, options):
+        active_marker = "✓ " if active_filter == value else ""
+        label = f"{active_marker}{icon} {title} · {counts[value]}"
+        if column.button(
+            label,
+            key=f"sentiment_filter_button::{ticker}::{value}",
+            use_container_width=True,
+            help=f"Nur {title.lower()}e Meldungen anzeigen" if value != "alle" else "Alle relevanten Meldungen anzeigen",
+        ):
+            st.session_state[state_key] = value
+            st.rerun()
+
+    active_filter = st.session_state[state_key]
+    active_title = next(title for value, title, _ in options if value == active_filter)
+    st.caption(
+        f"Aktiver News-Filter: **{active_title}**. "
+        "Der Klick wirkt auf den Tab „Aktuelle News“; der Kalender besitzt eigene Filter."
+    )
+    return active_filter
 
 
 def render_news_summary(
@@ -3042,8 +4999,8 @@ def render_news_summary(
     uncertain_news: pd.DataFrame,
     events: pd.DataFrame,
     diagnostics: pd.DataFrame,
-) -> None:
-    """Zeigt eine sachliche Einordnung ohne daraus ein Handelssignal abzuleiten."""
+) -> str:
+    """Zeigt eine sachliche Einordnung und gibt den aktiven Sentimentfilter zurück."""
     future_events = pd.DataFrame()
     if events is not None and not events.empty:
         future_events = events.copy()
@@ -3059,6 +5016,10 @@ def render_news_summary(
 
     st.markdown("#### Einordnung")
     st.info(headline)
+
+    active_sentiment_filter = "alle"
+    if not relevant_news.empty:
+        active_sentiment_filter = render_clickable_sentiment_filter(relevant_news, ticker)
 
     notes: list[str] = []
     if not future_events.empty:
@@ -3078,6 +5039,8 @@ def render_news_summary(
     for note in notes:
         st.markdown(f"- {note}")
 
+    return active_sentiment_filter
+
 
 def render_news(df: pd.DataFrame) -> None:
     st.subheader("News & Ereignisse")
@@ -3085,8 +5048,21 @@ def render_news(df: pd.DataFrame) -> None:
         "Relevante Unternehmensnews, bestätigte Kalendertermine und technische Quelleninformationen sind getrennt dargestellt. "
         "Mehrdeutige Ticker werden bewusst strenger gefiltert."
     )
+    with st.expander("Sentiment-Logik kurz erklärt", expanded=False):
+        st.markdown(
+            """
+Das Label beschreibt nur den **Ton der RSS-Überschrift und Kurzbeschreibung**, nicht die Qualität der Aktie.
 
-    ticker = st.selectbox("Aktie für News", df["ticker_yahoo"].tolist(), key="news_ticker")
+- 🟢 **Positiv:** klare Verbesserungen wie Prognoseanhebung, Erwartungsübertreffen, Dividendenerhöhung oder Upgrade.
+- 🔴 **Negativ:** klare Verschlechterungen wie Gewinnwarnung, Prognosesenkung, Dividendenkürzung, Verfehlung oder Downgrade.
+- 🟡 **Gemischt:** positive und negative Aussagen gleichzeitig.
+- ⚪ **Neutral:** Termin-/Informationsmeldung ohne klare Richtung.
+
+Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als Beschreibungen. Das Ergebnis ist eine Recherchehilfe, kein Handelssignal.
+            """
+        )
+
+    ticker = company_selectbox("Aktie für News", df, key="news_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
     company_name = str(row.get("name", ticker))
 
@@ -3153,6 +5129,14 @@ def render_news(df: pd.DataFrame) -> None:
     news = bundle["news"].copy()
     diagnostics = bundle["diagnostics"].copy()
     events = bundle["events"].copy()
+    for column, default in {
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "",
+    }.items():
+        if column not in news.columns:
+            news[column] = default
+        if column not in events.columns:
+            events[column] = default
     warning = str(bundle.get("snapshot_warning") or "")
     events_warning = str(bundle.get("events_warning") or "")
     if warning:
@@ -3182,20 +5166,60 @@ def render_news(df: pd.DataFrame) -> None:
     status_columns[2].metric("Abrufbare Quellen", f"{reachable_sources} / {total_sources}" if total_sources else "–")
     status_columns[3].metric("Daten aktualisiert", bundle.get("loaded_at", "–"))
 
-    render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
+    active_sentiment_filter = render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
 
-    tab_news, tab_calendar, tab_sources, tab_export = st.tabs([
-        "Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"
-    ])
+    # Auch die Unternavigation des News-Bereichs bleibt bei Reruns erhalten.
+    news_views = ["Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"]
+    if st.session_state.get("news_navigation") not in news_views:
+        st.session_state["news_navigation"] = news_views[0]
 
-    with tab_news:
+    active_news_view = st.radio(
+        "News-Bereich auswählen",
+        options=news_views,
+        horizontal=True,
+        key="news_navigation",
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if active_news_view == "Aktuelle News":
+        filtered_relevant_news = relevant_news.copy()
+        if active_sentiment_filter != "alle" and not filtered_relevant_news.empty:
+            filtered_relevant_news = filtered_relevant_news[
+                filtered_relevant_news.get(
+                    "sentiment_label",
+                    pd.Series("neutral", index=filtered_relevant_news.index),
+                )
+                .fillna("neutral")
+                .astype(str)
+                .str.lower()
+                .eq(active_sentiment_filter)
+            ]
+
+        filter_titles = {
+            "alle": "Alle relevanten News",
+            "positiv": "Positive News",
+            "negativ": "Negative News",
+            "gemischt": "Gemischte News",
+            "neutral": "Neutrale News",
+        }
+        st.markdown(f"#### {filter_titles.get(active_sentiment_filter, 'Aktuelle News')}")
+
         if relevant_news.empty:
             st.warning(
                 "Keine verlässlich passende Unternehmensmeldung gefunden. "
                 "Prüfe bei Bedarf die Firmen-Aliase oder die Quellen-Diagnose."
             )
+        elif filtered_relevant_news.empty:
+            st.info(
+                "Für den gewählten Sentimentfilter gibt es im aktuellen Zeitraum keine Meldung. "
+                "Klicke oben auf „Alle“ oder wähle einen anderen Filter."
+            )
         else:
-            for index, (_, item) in enumerate(relevant_news.iterrows()):
+            st.caption(
+                f"{len(filtered_relevant_news)} von {len(relevant_news)} relevanten Meldungen werden angezeigt."
+            )
+            for index, (_, item) in enumerate(filtered_relevant_news.iterrows()):
                 render_news_card(item, index)
 
         if not uncertain_news.empty:
@@ -3207,11 +5231,11 @@ def render_news(df: pd.DataFrame) -> None:
                 for index, (_, item) in enumerate(uncertain_news.iterrows(), start=1000):
                     render_news_card(item, index)
 
-    with tab_calendar:
+    elif active_news_view == "Kalender":
         st.caption("Der Kalender enthält Yahoo-Dividenden-/Kalenderdaten sowie nur konkret klassifizierte, relevante Nachrichten.")
         render_event_calendar(events)
 
-    with tab_sources:
+    elif active_news_view == "Quellen & Diagnose":
         st.caption("Dieser Bereich ist für technische Prüfung gedacht. Fehlerhafte oder eingeschränkte Quellen beeinflussen die News-Abdeckung.")
         if diagnostics.empty:
             st.info("Keine Quelle wurde abgefragt.")
@@ -3226,7 +5250,7 @@ def render_news(df: pd.DataFrame) -> None:
             if not failed.empty:
                 st.warning("Mindestens eine Quelle war nicht erreichbar oder lieferte keinen brauchbaren Feed. Das ist ein Quellenproblem, kein Handelssignal.")
 
-    with tab_export:
+    elif active_news_view == "Export":
         st.caption("CSV-Export enthält relevante und unsichere Treffer samt Relevanzbegründung.")
         st.download_button(
             "Alle News als CSV herunterladen",
@@ -3354,24 +5378,180 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     render_portfolio_risk(portfolio_view, all_histories)
 
 
-def render_watchlist(metrics: pd.DataFrame) -> None:
+def render_watchlist(
+    metrics: pd.DataFrame,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
+) -> None:
+    """Zeigt die Watchlist unabhängig vom aktuell gewählten Index.
+
+    Werte, die bereits im geladenen Index enthalten sind, verwenden dessen
+    Marktdaten. Für alle übrigen Watchlist-Ticker können die Daten über einen
+    eigenen Button separat geladen und im Session State zwischengespeichert
+    werden. Dadurch bleiben beispielsweise US-Titel sichtbar, auch wenn gerade
+    der DAX ausgewählt ist.
+    """
     st.subheader("Eigene Watchlist")
     watchlist = read_watchlist()
     if watchlist.empty:
         st.info("Noch keine Titel gespeichert. Nutze in der Einzelanalyse den Button „Zur Watchlist hinzufügen“.")
         return
 
-    merged = watchlist.merge(metrics, on="ticker_yahoo", how="left", suffixes=("", "_market"))
+    watchlist = watchlist.copy()
+    watchlist["ticker_yahoo"] = watchlist["ticker_yahoo"].map(clean_ticker)
+    watchlist = watchlist[watchlist["ticker_yahoo"].astype(bool)].drop_duplicates("ticker_yahoo")
+
+    current_metrics = metrics.copy() if metrics is not None else empty_metrics_frame()
+    if not current_metrics.empty:
+        current_metrics["ticker_yahoo"] = current_metrics["ticker_yahoo"].map(clean_ticker)
+    current_tickers = set(current_metrics.get("ticker_yahoo", pd.Series(dtype=str)).astype(str))
+    watchlist_tickers = set(watchlist["ticker_yahoo"].astype(str))
+    independent_tickers = sorted(watchlist_tickers - current_tickers)
+
+    # Bereits separat geladene Rohdaten beibehalten, aber auf die aktuelle
+    # Watchlist beschränken. Scores werden bei jedem Rerun mit den aktuellen
+    # Scanner-Regeln neu berechnet.
+    extra_raw = st.session_state.get("watchlist_extra_raw_metrics")
+    if extra_raw is None:
+        extra_raw = empty_metrics_frame()
+    else:
+        extra_raw = extra_raw.copy()
+    if not extra_raw.empty:
+        extra_raw["ticker_yahoo"] = extra_raw["ticker_yahoo"].map(clean_ticker)
+        extra_raw = extra_raw[extra_raw["ticker_yahoo"].isin(watchlist_tickers)].copy()
+
+    controls = st.columns([1.35, 1, 1, 1.4])
+    load_clicked = controls[0].button(
+        "Watchlist-Daten laden / aktualisieren",
+        type="primary",
+        use_container_width=True,
+        key="load_watchlist_market_data",
+        help="Lädt nur Watchlist-Titel separat, die nicht bereits im aktuell geladenen Index enthalten sind.",
+    )
+
+    if load_clicked:
+        if independent_tickers:
+            extra_constituents = watchlist[watchlist["ticker_yahoo"].isin(independent_tickers)][
+                ["ticker_yahoo", "name", "sector"]
+            ].copy()
+            extra_constituents["name"] = extra_constituents["name"].replace(r"^\s*$", pd.NA, regex=True)
+            extra_constituents["name"] = extra_constituents["name"].fillna(extra_constituents["ticker_yahoo"])
+            extra_constituents["sector"] = extra_constituents["sector"].replace(r"^\s*$", pd.NA, regex=True).fillna("Unbekannt")
+
+            with st.spinner(f"Lade Marktdaten für {len(extra_constituents)} Watchlist-Titel …"):
+                loaded_raw, loaded_histories, load_errors = collect_metrics(extra_constituents)
+            st.session_state["watchlist_extra_raw_metrics"] = loaded_raw
+            st.session_state["watchlist_extra_histories"] = loaded_histories
+            st.session_state["watchlist_load_errors"] = load_errors
+        else:
+            # Alle Titel sind bereits Bestandteil des aktuell geladenen Index.
+            st.session_state["watchlist_extra_raw_metrics"] = empty_metrics_frame()
+            st.session_state["watchlist_extra_histories"] = {}
+            st.session_state["watchlist_load_errors"] = []
+        st.session_state["watchlist_last_refresh"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+        st.rerun()
+
+    # Nach einem eventuellen Rerun die gespeicherten Daten erneut lesen.
+    extra_raw = st.session_state.get("watchlist_extra_raw_metrics", empty_metrics_frame())
+    if extra_raw is None:
+        extra_raw = empty_metrics_frame()
+    extra_raw = extra_raw.copy()
+    if not extra_raw.empty:
+        extra_raw["ticker_yahoo"] = extra_raw["ticker_yahoo"].map(clean_ticker)
+        extra_raw = extra_raw[extra_raw["ticker_yahoo"].isin(watchlist_tickers)].copy()
+        extra_scored = enrich_with_scores(
+            extra_raw,
+            drawdown_trigger=float(drawdown_trigger),
+            payout_max=float(payout_max),
+            score_min=float(score_min),
+            yield_min=float(yield_min),
+        )
+        extra_scored = enrich_with_special_situations(extra_scored)
+    else:
+        extra_scored = empty_metrics_frame()
+
+    # Separat geladene Daten zuerst, aktuell geladene Indexdaten zuletzt: Bei
+    # Duplikaten haben die frisch sichtbaren Indexdaten Vorrang.
+    combined_metrics = pd.concat([extra_scored, current_metrics], ignore_index=True, sort=False)
+    if not combined_metrics.empty:
+        combined_metrics["ticker_yahoo"] = combined_metrics["ticker_yahoo"].map(clean_ticker)
+        combined_metrics = combined_metrics.drop_duplicates("ticker_yahoo", keep="last")
+
+    merged = watchlist.merge(combined_metrics, on="ticker_yahoo", how="left", suffixes=("", "_market"))
+    loaded_mask = pd.to_numeric(merged.get("last_price"), errors="coerce").notna()
+    loaded_count = int(loaded_mask.sum())
+    total_count = int(len(merged))
+    open_count = max(total_count - loaded_count, 0)
+
+    controls[1].metric("Watchlist-Titel", total_count)
+    controls[2].metric("Daten geladen", loaded_count)
+    controls[3].metric("Letzte separate Abfrage", st.session_state.get("watchlist_last_refresh", "Noch nicht geladen"))
+
+    if open_count:
+        missing_names = merged.loc[~loaded_mask, "name"].fillna(merged.loc[~loaded_mask, "ticker_yahoo"]).astype(str).tolist()
+        st.info(
+            f"Für {open_count} Watchlist-Titel fehlen noch Marktdaten. Klicke auf „Watchlist-Daten laden / aktualisieren“. "
+            f"Offen: {', '.join(missing_names[:8])}" + (" …" if len(missing_names) > 8 else "")
+        )
+    else:
+        st.success("Alle Watchlist-Titel verfügen über Marktdaten – unabhängig vom aktuell ausgewählten Index.")
+
+    load_errors = st.session_state.get("watchlist_load_errors", [])
+    if load_errors:
+        with st.expander(f"Hinweise zu {len(load_errors)} Watchlist-Datenabruf(en)"):
+            for message in load_errors:
+                st.write(f"- {message}")
+
     visible_columns = [
         "ticker_yahoo", "name", "sector", "added_at", "note", "last_price", "currency", "change_1y",
         "dividend_yield", "total_score", "value_score", "value_trigger",
     ]
     visible_columns = [column for column in visible_columns if column in merged.columns]
-    st.dataframe(overview_styler(merged[visible_columns]), use_container_width=True, hide_index=True)
+    display = merged[visible_columns].rename(columns={
+        "ticker_yahoo": "Ticker",
+        "name": "Unternehmen",
+        "sector": "Sektor",
+        "added_at": "Hinzugefügt",
+        "note": "Notiz",
+        "last_price": "Letzter Kurs",
+        "currency": "Währung",
+        "change_1y": "Kursrendite 1J",
+        "dividend_yield": "Dividendenrendite",
+        "total_score": "Qualitäts-Score",
+        "value_score": "Value-Score",
+        "value_trigger": "Value-Trigger",
+    })
 
-    ticker_to_remove = st.selectbox("Titel von Watchlist entfernen", merged["ticker_yahoo"].tolist(), key="remove_watchlist_ticker")
+    display_formats = {
+        "Letzter Kurs": lambda value: format_number(value, 2),
+        "Kursrendite 1J": lambda value: format_percent(value, 2, signed=True),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Value-Score": lambda value: format_number(value, 1),
+    }
+    styled = display.style.format(
+        {key: formatter for key, formatter in display_formats.items() if key in display.columns},
+        na_rep="–",
+    )
+    if "Kursrendite 1J" in display.columns:
+        styled = styled.map(colorize_change, subset=["Kursrendite 1J"])
+    if "Qualitäts-Score" in display.columns:
+        styled = styled.map(colorize_score, subset=["Qualitäts-Score"])
+    if "Value-Trigger" in display.columns:
+        styled = styled.map(colorize_value_trigger, subset=["Value-Trigger"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    ticker_to_remove = company_selectbox("Titel von Watchlist entfernen", merged, key="remove_watchlist_ticker")
     if st.button("Aus Watchlist entfernen", key="remove_watchlist_button"):
         remove_from_watchlist(ticker_to_remove)
+        # Gespeicherte Zusatzdaten beim Entfernen ebenfalls bereinigen.
+        stored = st.session_state.get("watchlist_extra_raw_metrics")
+        if isinstance(stored, pd.DataFrame) and not stored.empty:
+            st.session_state["watchlist_extra_raw_metrics"] = stored[
+                stored["ticker_yahoo"].map(clean_ticker) != clean_ticker(ticker_to_remove)
+            ].copy()
         st.success(f"{ticker_to_remove} wurde entfernt.")
         st.rerun()
 
@@ -3383,11 +5563,19 @@ def main() -> None:
     # ----- Sidebar: Daten, Filter und Scanner-Parameter -----
     with st.sidebar:
         st.header("Analyse-Einstellungen")
-        index_name = st.selectbox("Index", ["DAX 40", "S&P 500"], key="index_name")
-        st.caption("Für maximale Stabilität: data/indices/dax40.csv oder sp500.csv pflegen; Wikipedia bleibt nur Fallback.")
+        index_name = st.selectbox("Index", INDEX_OPTIONS, key="index_name")
+        st.caption(
+            "DAX, MDAX und SDAX werden offline aus integrierten Listen geladen. "
+            "Eigene CSVs unter data/indices/ überschreiben die Vorlage."
+        )
 
         try:
             constituents = load_index_constituents(index_name)
+            st.success(
+                f"{index_name}: {len(constituents)} Unternehmen geladen",
+                icon="✅",
+            )
+            st.caption(f"Indexquelle: {index_source_description(index_name)}")
         except Exception as error:
             st.error(f"Index konnte nicht geladen werden: {error}")
             st.stop()
@@ -3406,12 +5594,20 @@ def main() -> None:
             )
             filtered_constituents = filtered_constituents[mask]
 
-        maximum = min(150 if index_name == "S&P 500" else len(filtered_constituents), len(filtered_constituents))
+        maximum = len(filtered_constituents)
         if maximum <= 0:
             st.error("Der Filter enthält keine Unternehmen.")
             st.stop()
         default_count = min(40, maximum)
-        max_stocks = st.slider("Max. Unternehmen laden", min_value=1, max_value=maximum, value=default_count, step=1)
+        slider_step = 1 if maximum <= 150 else 10
+        max_stocks = st.slider(
+            "Max. Unternehmen laden",
+            min_value=1,
+            max_value=maximum,
+            value=default_count,
+            step=slider_step,
+            help="Mehr Unternehmen bedeuten deutlich längere Ladezeiten, weil viele Fundamentaldaten einzeln abgefragt werden.",
+        )
 
         st.divider()
         st.header("Scanner-Profil")
@@ -3428,10 +5624,34 @@ def main() -> None:
             st.session_state["_applied_strategy_profile"] = profile_name
 
         st.caption(profile["description"])
-        drawdown_trigger = st.slider("Min. Drawdown vom 52W-Hoch", 10, 60, int(profile["drawdown"]), 5, key="scanner_drawdown")
-        payout_max = st.slider("Max. Payout Ratio", 40, 120, int(profile["payout"]), 5, key="scanner_payout")
-        score_min = st.slider("Min. Qualitäts-Score", 0, 100, int(profile["score"]), 5, key="scanner_score")
-        yield_min = st.slider("Min. Dividendenrendite", 1.0, 10.0, float(profile["yield"]), 0.5, key="scanner_yield")
+        drawdown_trigger = st.slider(
+            "Min. Drawdown vom 52W-Hoch",
+            min_value=10,
+            max_value=60,
+            step=5,
+            key="scanner_drawdown",
+        )
+        payout_max = st.slider(
+            "Max. Payout Ratio",
+            min_value=40,
+            max_value=120,
+            step=5,
+            key="scanner_payout",
+        )
+        score_min = st.slider(
+            "Min. Qualitäts-Score",
+            min_value=0,
+            max_value=100,
+            step=5,
+            key="scanner_score",
+        )
+        yield_min = st.slider(
+            "Min. Dividendenrendite",
+            min_value=1.0,
+            max_value=10.0,
+            step=0.5,
+            key="scanner_yield",
+        )
 
         st.divider()
         reload_clicked = st.button("Daten laden / aktualisieren", type="primary", use_container_width=True)
@@ -3447,7 +5667,8 @@ def main() -> None:
             fx_to_eur.clear()
             for state_key in [
                 "metrics_raw", "histories", "loaded_tickers", "portfolio_extra_metrics",
-                "portfolio_extra_histories",
+                "portfolio_extra_histories", "watchlist_extra_raw_metrics",
+                "watchlist_extra_histories", "watchlist_load_errors", "watchlist_last_refresh",
             ]:
                 st.session_state.pop(state_key, None)
             st.success("Zwischenspeicher wurde geleert.")
@@ -3465,6 +5686,8 @@ def main() -> None:
         st.session_state["metrics_raw"] = raw_metrics
         st.session_state["histories"] = histories
         st.session_state["loaded_tickers"] = selected_tickers
+        st.session_state["load_errors"] = errors
+        st.session_state["selected_constituents_snapshot"] = selected_constituents.copy()
         st.session_state["last_refresh"] = datetime.now().strftime("%d.%m.%Y %H:%M")
         if errors:
             st.warning("Einige Daten konnten nicht vollständig geladen werden: " + " | ".join(errors[:8]))
@@ -3482,32 +5705,65 @@ def main() -> None:
         score_min=float(score_min),
         yield_min=float(yield_min),
     )
+    data = enrich_with_special_situations(data)
 
-    last_refresh = st.session_state.get("last_refresh", "–")
-    st.caption(
-        f"Aktualisiert: {last_refresh} · {len(data)} Unternehmen analysiert · "
-        f"Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
+    load_errors = st.session_state.get("load_errors", [])
+    selected_snapshot = st.session_state.get("selected_constituents_snapshot", selected_constituents)
+    status_summary, status_detail = build_data_status(
+        selected_snapshot, data, histories, load_errors, index_name=index_name
     )
 
-    tabs = st.tabs([
-        "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Research",
-    ])
-    with tabs[0]:
+    last_refresh = st.session_state.get("last_refresh", "–")
+    requested_count = int(status_summary.get("angefragt", len(selected_snapshot)))
+    loaded_count = int(status_summary.get("analysiert", len(data)))
+    coverage = safe_float(status_summary.get("abdeckung_prozent"))
+    coverage_label = format_percent(coverage, 1) if coverage is not None else "–"
+    st.caption(
+        f"Aktualisiert: {last_refresh} · {loaded_count}/{requested_count} Unternehmen analysiert "
+        f"({coverage_label} Abdeckung) · Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
+    )
+
+    # Persistente Hauptnavigation: Anders als st.tabs bleibt diese Auswahl bei jedem
+    # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
+    main_pages = [
+        "Überblick", "Datenstatus", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Research",
+    ]
+    if st.session_state.get("main_navigation") not in main_pages:
+        st.session_state["main_navigation"] = main_pages[0]
+
+    active_page = st.radio(
+        "Bereich auswählen",
+        options=main_pages,
+        horizontal=True,
+        key="main_navigation",
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if active_page == "Überblick":
         render_overview(data)
-    with tabs[1]:
+    elif active_page == "Datenstatus":
+        render_data_status(status_summary, status_detail, data)
+    elif active_page == "Fundamentaldaten":
         render_fundamentals(data)
-    with tabs[2]:
+    elif active_page == "Einzelanalyse":
         render_risk_and_chart(data, histories)
-    with tabs[3]:
-        render_sector_view(data)
-    with tabs[4]:
+    elif active_page == "Sektoren":
+        render_sector_view(data, histories)
+    elif active_page == "News & Events":
         render_news(data)
-    with tabs[5]:
+    elif active_page == "Portfolio":
         render_portfolio(data, histories)
-    with tabs[6]:
-        render_watchlist(data)
-    with tabs[7]:
+    elif active_page == "Watchlist":
+        render_watchlist(
+            data,
+            drawdown_trigger=float(drawdown_trigger),
+            payout_max=float(payout_max),
+            score_min=float(score_min),
+            yield_min=float(yield_min),
+        )
+    elif active_page == "Value-Scanner":
         render_value_watchlist(
             data,
             drawdown_trigger=float(drawdown_trigger),
@@ -3516,7 +5772,9 @@ def main() -> None:
             yield_min=float(yield_min),
             profile_name=profile_name,
         )
-    with tabs[8]:
+    elif active_page == "Deep Value":
+        render_special_situation_scanner(data)
+    elif active_page == "Research":
         render_research(data, histories, index_name)
 
 
