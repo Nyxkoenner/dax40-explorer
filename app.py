@@ -3461,7 +3461,7 @@ def render_data_status(summary: dict[str, Any], detail: pd.DataFrame, metrics: p
     with st.expander("Alle Werte im Detail"):
         display_cols = [
             "Status", "Name", "Ticker", "Sektor", "Kursdaten", "Historie Tage", "Datenabdeckung",
-            "Kursdaten", "Bewertung", "Qualität", "Dividende", "Cashflow", "Deep Value", "Fehler/Hinweis",
+            "Bewertung", "Qualität", "Dividende", "Cashflow", "Deep Value", "Fehler/Hinweis",
         ]
         display_cols = [col for col in display_cols if col in detail.columns]
         st.dataframe(
@@ -4488,10 +4488,34 @@ def main() -> None:
             st.session_state["_applied_strategy_profile"] = profile_name
 
         st.caption(profile["description"])
-        drawdown_trigger = st.slider("Min. Drawdown vom 52W-Hoch", 10, 60, int(profile["drawdown"]), 5, key="scanner_drawdown")
-        payout_max = st.slider("Max. Payout Ratio", 40, 120, int(profile["payout"]), 5, key="scanner_payout")
-        score_min = st.slider("Min. Qualitäts-Score", 0, 100, int(profile["score"]), 5, key="scanner_score")
-        yield_min = st.slider("Min. Dividendenrendite", 1.0, 10.0, float(profile["yield"]), 0.5, key="scanner_yield")
+        drawdown_trigger = st.slider(
+            "Min. Drawdown vom 52W-Hoch",
+            min_value=10,
+            max_value=60,
+            step=5,
+            key="scanner_drawdown",
+        )
+        payout_max = st.slider(
+            "Max. Payout Ratio",
+            min_value=40,
+            max_value=120,
+            step=5,
+            key="scanner_payout",
+        )
+        score_min = st.slider(
+            "Min. Qualitäts-Score",
+            min_value=0,
+            max_value=100,
+            step=5,
+            key="scanner_score",
+        )
+        yield_min = st.slider(
+            "Min. Dividendenrendite",
+            min_value=1.0,
+            max_value=10.0,
+            step=0.5,
+            key="scanner_yield",
+        )
 
         st.divider()
         reload_clicked = st.button("Daten laden / aktualisieren", type="primary", use_container_width=True)
