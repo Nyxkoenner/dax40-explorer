@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "3.8"
+APP_VERSION = "4.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -1039,6 +1039,198 @@ def collect_metrics(constituents: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,
         if column not in frame.columns:
             frame[column] = None
     return frame[empty_metrics_frame().columns], histories, errors
+
+
+# -----------------------------------------------------------------------------
+# Datenstatus und Sektor-Zeitreihen
+# -----------------------------------------------------------------------------
+
+DATA_STATUS_FIELD_GROUPS = {
+    "Kursdaten": ["last_price", "change_1d", "change_5d", "change_1y", "vol_1y", "max_drawdown_1y"],
+    "Bewertung": ["market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda"],
+    "Qualität": ["net_margin", "operating_margin", "roe", "roa", "debt_to_equity", "net_debt_ebitda"],
+    "Dividende": ["dividend_yield", "dividend_per_share", "payout_ratio", "dividend_growth_5y", "dividend_frequency"],
+    "Cashflow": ["operating_cashflow", "free_cashflow", "cashflow_dividend_coverage"],
+    "Deep Value": ["drawdown_3y_high_pct", "drawdown_5y_high_pct", "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct"],
+}
+
+
+def _has_value(value: Any) -> bool:
+    """Robuste Prüfung für Datenstatus-Tab."""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    if isinstance(value, str) and value.strip() in ("", "–", "None", "nan"):
+        return False
+    return True
+
+
+def row_coverage(row: pd.Series, fields: list[str]) -> tuple[int, int, float]:
+    present = sum(1 for field in fields if field in row.index and _has_value(row.get(field)))
+    total = len(fields)
+    pct = present / total * 100 if total else 0.0
+    return present, total, pct
+
+
+def build_data_status(
+    constituents: pd.DataFrame,
+    metrics: pd.DataFrame,
+    histories: dict[str, pd.DataFrame],
+    errors: list[str],
+    index_name: str,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Erzeugt eine verständliche Datenabdeckung je Ticker.
+
+    Ziel: Wenn ein Index 40 Werte hat, aber nur 39/40 geladen werden oder einzelne
+    Kennzahlen fehlen, sieht man im Tool sofort warum.
+    """
+    if constituents is None or constituents.empty:
+        return {
+            "index": index_name,
+            "angefragt": 0,
+            "analysiert": 0,
+            "mit_kursdaten": 0,
+            "abdeckung_prozent": 0.0,
+            "fehler": len(errors or []),
+        }, pd.DataFrame()
+
+    wanted = constituents.copy()
+    wanted["ticker_yahoo"] = wanted["ticker_yahoo"].map(clean_ticker)
+    loaded = metrics.copy() if metrics is not None else pd.DataFrame()
+    if not loaded.empty:
+        loaded["ticker_yahoo"] = loaded["ticker_yahoo"].map(clean_ticker)
+
+    merged = wanted[["name", "ticker_yahoo", "sector"]].merge(
+        loaded, on="ticker_yahoo", how="left", suffixes=("_index", "")
+    )
+    if "name" not in merged.columns and "name_index" in merged.columns:
+        merged["name"] = merged["name_index"]
+    if "sector" not in merged.columns and "sector_index" in merged.columns:
+        merged["sector"] = merged["sector_index"]
+
+    error_map: dict[str, list[str]] = {}
+    for err in errors or []:
+        ticker = clean_ticker(str(err).split(":", 1)[0])
+        error_map.setdefault(ticker, []).append(str(err))
+
+    rows: list[dict[str, Any]] = []
+    all_fields = sorted({field for fields in DATA_STATUS_FIELD_GROUPS.values() for field in fields})
+    for _, row in merged.iterrows():
+        ticker = clean_ticker(row.get("ticker_yahoo"))
+        history = histories.get(ticker, pd.DataFrame()) if histories else pd.DataFrame()
+        has_history = history is not None and not history.empty and "Close" in history.columns
+        present, total, pct = row_coverage(row, all_fields)
+        status = "OK"
+        if not has_history:
+            status = "keine Kursdaten"
+        elif pct < 50:
+            status = "viele Kennzahlen fehlen"
+        elif pct < 75:
+            status = "teilweise"
+
+        detail = {
+            "Status": status,
+            "Name": row.get("name") or row.get("name_index"),
+            "Ticker": ticker,
+            "Sektor": row.get("sector") or row.get("sector_index"),
+            "Kursdaten": "Ja" if has_history else "Nein",
+            "Historie Tage": len(history) if history is not None else 0,
+            "Datenabdeckung": pct,
+            "Vorhandene Felder": present,
+            "Mögliche Felder": total,
+            "Fehler/Hinweis": " | ".join(error_map.get(ticker, [])),
+        }
+        for group_name, fields in DATA_STATUS_FIELD_GROUPS.items():
+            g_present, g_total, g_pct = row_coverage(row, fields)
+            detail[group_name] = g_pct
+        rows.append(detail)
+
+    detail_df = pd.DataFrame(rows)
+    requested = len(wanted)
+    analysed = len(loaded) if loaded is not None else 0
+    with_prices = int((detail_df["Kursdaten"] == "Ja").sum()) if not detail_df.empty else 0
+    summary = {
+        "index": index_name,
+        "angefragt": requested,
+        "analysiert": analysed,
+        "mit_kursdaten": with_prices,
+        "abdeckung_prozent": analysed / requested * 100 if requested else 0.0,
+        "kursdaten_prozent": with_prices / requested * 100 if requested else 0.0,
+        "durchschnitt_datenabdeckung": safe_float(detail_df["Datenabdeckung"].mean()) if not detail_df.empty else None,
+        "fehler": len(errors or []),
+    }
+    return summary, detail_df
+
+
+def period_return_from_history(history: pd.DataFrame, trading_days: int, use_adjusted: bool = False) -> Optional[float]:
+    if history is None or history.empty:
+        return None
+    column = "Adj Close" if use_adjusted and "Adj Close" in history.columns else "Close"
+    if column not in history.columns:
+        return None
+    values = pd.to_numeric(history[column], errors="coerce").dropna()
+    if len(values) < 2:
+        return None
+    if len(values) <= trading_days:
+        base = values.iloc[0]
+    else:
+        base = values.iloc[-1 - trading_days]
+    last = values.iloc[-1]
+    base = safe_float(base)
+    last = safe_float(last)
+    if base in (None, 0) or last is None:
+        return None
+    return (last / base - 1) * 100.0
+
+
+def sector_timeframe_stats(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    periods = {
+        "1M": 21,
+        "3M": 63,
+        "6M": 126,
+        "1J": 252,
+        "3J": 756,
+        "5J": 1260,
+    }
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        ticker = clean_ticker(row.get("ticker_yahoo"))
+        history = histories.get(ticker, pd.DataFrame()) if histories else pd.DataFrame()
+        base = {
+            "ticker_yahoo": ticker,
+            "name": row.get("name"),
+            "sector": row.get("sector") or "Unbekannt",
+            "value_trigger": bool(row.get("value_trigger")) if _has_value(row.get("value_trigger")) else False,
+            "total_score": safe_float(row.get("total_score")),
+            "value_score": safe_float(row.get("value_score")),
+            "dividend_yield": safe_float(row.get("dividend_yield")),
+            "vol_1y": safe_float(row.get("vol_1y")),
+            "max_drawdown_1y": safe_float(row.get("max_drawdown_1y")),
+        }
+        for label, days in periods.items():
+            base[f"Kursrendite_{label}"] = period_return_from_history(history, days, use_adjusted=False)
+            base[f"Gesamtrendite_{label}"] = period_return_from_history(history, days, use_adjusted=True)
+        rows.append(base)
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame()
+    agg_map: dict[str, Any] = {
+        "Unternehmen": ("ticker_yahoo", "count"),
+        "Value_Trigger": ("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
+        "Qualitäts_Score": ("total_score", "mean"),
+        "Value_Score": ("value_score", "mean"),
+        "Dividendenrendite": ("dividend_yield", "mean"),
+        "Volatilität_1J": ("vol_1y", "mean"),
+        "Max_Drawdown_1J": ("max_drawdown_1y", "mean"),
+    }
+    for label in periods:
+        agg_map[f"Kurs_{label}"] = (f"Kursrendite_{label}", "mean")
+        agg_map[f"Gesamt_{label}"] = (f"Gesamtrendite_{label}", "mean")
+    return detail.groupby("sector", dropna=False).agg(**agg_map).reset_index()
 
 
 # -----------------------------------------------------------------------------
@@ -3209,6 +3401,93 @@ def show_header() -> None:
     )
 
 
+def render_data_status(summary: dict[str, Any], detail: pd.DataFrame, metrics: pd.DataFrame) -> None:
+    st.subheader("Datenstatus")
+    st.caption(
+        "Hier siehst du, ob der gewählte Index vollständig geladen wurde und welche Datenbereiche je Aktie fehlen."
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Index", str(summary.get("index", "–")))
+    col2.metric("Angefragt", int(summary.get("angefragt", 0)))
+    col3.metric("Analysiert", int(summary.get("analysiert", 0)))
+    col4.metric("Mit Kursdaten", int(summary.get("mit_kursdaten", 0)))
+    avg_cov = safe_float(summary.get("durchschnitt_datenabdeckung"))
+    col5.metric("Ø Datenabdeckung", format_percent(avg_cov, 1) if avg_cov is not None else "–")
+
+    if detail is None or detail.empty:
+        st.info("Noch keine Statusdetails vorhanden.")
+        return
+
+    problems = detail[detail["Status"] != "OK"].copy()
+    if problems.empty:
+        st.success("Alle aktuell angefragten Werte wurden ohne offensichtliche Datenprobleme verarbeitet.")
+    else:
+        st.warning(f"{len(problems)} Werte haben fehlende Kursdaten oder größere Datenlücken.")
+        st.dataframe(
+            problems[["Status", "Name", "Ticker", "Sektor", "Kursdaten", "Datenabdeckung", "Fehler/Hinweis"]].style.format(
+                {"Datenabdeckung": lambda value: format_percent(value, 1)},
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### Abdeckung je Datenbereich")
+    group_cols = list(DATA_STATUS_FIELD_GROUPS.keys())
+    coverage_by_group = []
+    for group in group_cols:
+        coverage_by_group.append({
+            "Datenbereich": group,
+            "Durchschnittliche Abdeckung": safe_float(detail[group].mean()) if group in detail.columns else None,
+        })
+    group_df = pd.DataFrame(coverage_by_group)
+    st.dataframe(
+        group_df.style.format(
+            {"Durchschnittliche Abdeckung": lambda value: format_percent(value, 1)},
+            na_rep="–",
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    chart = alt.Chart(group_df.dropna()).mark_bar().encode(
+        x=alt.X("Durchschnittliche Abdeckung:Q", title="Abdeckung in %", scale=alt.Scale(domain=[0, 100])),
+        y=alt.Y("Datenbereich:N", sort="-x", title="Datenbereich"),
+        tooltip=["Datenbereich:N", alt.Tooltip("Durchschnittliche Abdeckung:Q", format=".1f")],
+    ).properties(height=260)
+    st.altair_chart(chart, use_container_width=True)
+
+    with st.expander("Alle Werte im Detail"):
+        display_cols = [
+            "Status", "Name", "Ticker", "Sektor", "Kursdaten", "Historie Tage", "Datenabdeckung",
+            "Kursdaten", "Bewertung", "Qualität", "Dividende", "Cashflow", "Deep Value", "Fehler/Hinweis",
+        ]
+        display_cols = [col for col in display_cols if col in detail.columns]
+        st.dataframe(
+            detail[display_cols].style.format(
+                {
+                    "Datenabdeckung": lambda value: format_percent(value, 1),
+                    "Bewertung": lambda value: format_percent(value, 1),
+                    "Qualität": lambda value: format_percent(value, 1),
+                    "Dividende": lambda value: format_percent(value, 1),
+                    "Cashflow": lambda value: format_percent(value, 1),
+                    "Deep Value": lambda value: format_percent(value, 1),
+                },
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Warum ist dieser Tab wichtig?"):
+        st.write(
+            "Viele Fehler im Tool entstehen nicht im UI, sondern durch fehlende oder unvollständige externe Daten. "
+            "Der Datenstatus trennt deshalb klar zwischen Indexbestandteil, Kursdaten, Fundamentaldaten, Dividenden, "
+            "Cashflow und Deep-Value-Kennzahlen. Wenn ein Wert nicht im Scanner auftaucht, findest du hier meistens den Grund."
+        )
+
+
 def render_overview(df: pd.DataFrame) -> None:
     st.subheader("Überblick")
     if df.empty:
@@ -3282,7 +3561,7 @@ def render_overview(df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
         "Value-Score und Value-Trigger sind verschieden: Der Score ordnet Kandidaten ein; der Trigger ist ein strenger Filter, "
-        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach Sondersituationen."
+        "bei dem alle Regeln erfüllt sein müssen. Der Deep-Value-Score sucht zusätzlich nach BAT-ähnlichen Sondersituationen."
     )
     st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
@@ -3442,7 +3721,7 @@ def render_value_trigger_explanation(
 def render_special_situation_scanner(df: pd.DataFrame) -> None:
     st.subheader("Sondersituation / Deep Value")
     st.caption(
-        "Dieser Scanner sucht nach Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
+        "Dieser Scanner sucht nach BAT-ähnlichen Situationen: hohe Dividendenrendite, großer Mehrjahres-Drawdown "
         "und trotzdem positive Cashflows. Das ist ein Research-Hinweis, keine Kaufempfehlung."
     )
 
@@ -3541,7 +3820,7 @@ def render_special_situation_scanner(df: pd.DataFrame) -> None:
             "Bitte prüfen, ob der Gewinnrückgang operativ oder bilanziell/Sondereffekt-getrieben ist."
         )
     elif safe_float(row.get("special_situation_score")) is not None and safe_float(row.get("special_situation_score")) >= 55:
-        st.info("Teilweise Sonderprofil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
+        st.info("Teilweise BAT-ähnliches Profil. Noch fehlen aber ein oder mehrere harte Kriterien für den Prüf-Trigger.")
     else:
         st.info("Aktuell kein klares BAT-/Deep-Value-Muster nach den hinterlegten Regeln.")
 
@@ -3680,53 +3959,110 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     st.caption("*Gesamtrendite und bereinigter Kurs: Yahoo Adj Close als Näherung, nicht als Broker- oder Steuerberechnung.")
 
 
-def render_sector_view(df: pd.DataFrame) -> None:
-    st.subheader("Sektor-Übersicht")
-    sector_stats = (
-        df.groupby("sector", dropna=False)
-        .agg(
-            Unternehmen=("ticker_yahoo", "count"),
-            Kursrendite_1J=("change_1y", "mean"),
-            Gesamtrendite_1J=("total_return_1y", "mean"),
-            Max_Drawdown_1J=("max_drawdown_1y", "mean"),
-            Qualitäts_Score=("total_score", "mean"),
-            Value_Score=("value_score", "mean"),
-            Trigger=("value_trigger", lambda values: int(pd.Series(values).fillna(False).sum())),
-        )
-        .reset_index()
-        .sort_values("Value_Score", ascending=False, na_position="last")
+def render_sector_view(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Sektor-Übersicht 2.0")
+    st.caption(
+        "Vergleicht Sektoren über mehrere Zeiträume. Kursrendite = Close, Gesamtrendite = Yahoo Adj Close als Näherung."
     )
-    st.dataframe(
-        sector_stats.style.format(
-            {
-                "Kursrendite_1J": lambda value: format_percent(value, 2, signed=True),
-                "Gesamtrendite_1J": lambda value: format_percent(value, 2, signed=True),
-                "Max_Drawdown_1J": lambda value: format_percent(value, 1, signed=True),
-                "Qualitäts_Score": lambda value: format_number(value, 1),
-                "Value_Score": lambda value: format_number(value, 1),
-            },
-            na_rep="–",
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-    metric_choice = st.radio(
-        "Diagramm",
-        ["Kursrendite 1J", "Gesamtrendite 1J", "Value Score"],
+    if df is None or df.empty:
+        st.info("Keine Daten für die Sektoransicht vorhanden.")
+        return
+
+    sector_stats = sector_timeframe_stats(df, histories)
+    if sector_stats.empty:
+        st.info("Für die geladenen Werte liegen keine ausreichenden Kursdaten vor.")
+        return
+
+    metric_mode = st.radio(
+        "Kennzahl anzeigen",
+        ["Kursrendite", "Gesamtrendite", "Bewertung & Risiko"],
         horizontal=True,
-        key="sector_chart_metric",
+        key="sector_view_metric_mode_v2",
     )
-    field = {
-        "Kursrendite 1J": "Kursrendite_1J",
-        "Gesamtrendite 1J": "Gesamtrendite_1J",
-        "Value Score": "Value_Score",
-    }[metric_choice]
-    chart = alt.Chart(sector_stats.dropna(subset=[field])).mark_bar().encode(
-        x=alt.X(f"{field}:Q", title=metric_choice),
-        y=alt.Y("sector:N", sort="-x", title="Sektor"),
-        tooltip=["sector:N", "Unternehmen:Q", alt.Tooltip(f"{field}:Q", format=".2f")],
-    ).properties(height=max(220, 32 * len(sector_stats)))
-    st.altair_chart(chart, use_container_width=True)
+
+    if metric_mode in ("Kursrendite", "Gesamtrendite"):
+        prefix = "Kurs" if metric_mode == "Kursrendite" else "Gesamt"
+        columns = ["sector", "Unternehmen"] + [f"{prefix}_{label}" for label in ["1M", "3M", "6M", "1J", "3J", "5J"]]
+        visible = sector_stats[columns].copy().sort_values(f"{prefix}_1J", ascending=False, na_position="last")
+        rename_map = {
+            "sector": "Sektor",
+            "Unternehmen": "Unternehmen",
+            f"{prefix}_1M": "1M",
+            f"{prefix}_3M": "3M",
+            f"{prefix}_6M": "6M",
+            f"{prefix}_1J": "1J",
+            f"{prefix}_3J": "3J",
+            f"{prefix}_5J": "5J",
+        }
+        display = visible.rename(columns=rename_map)
+        st.dataframe(
+            display.style.format(
+                {col: (lambda value: format_percent(value, 1, signed=True)) for col in ["1M", "3M", "6M", "1J", "3J", "5J"]},
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        chart_period = st.selectbox(
+            "Diagramm-Zeitraum",
+            ["1M", "3M", "6M", "1J", "3J", "5J"],
+            index=3,
+            key=f"sector_chart_period_{prefix}",
+        )
+        chart_data = display.dropna(subset=[chart_period]).copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X(f"{chart_period}:Q", title=f"{metric_mode} {chart_period} in %"),
+            y=alt.Y("Sektor:N", sort="-x", title="Sektor"),
+            tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip(f"{chart_period}:Q", format=".2f")],
+        ).properties(height=max(260, 34 * len(chart_data)))
+        st.altair_chart(chart, use_container_width=True)
+
+    else:
+        columns = [
+            "sector", "Unternehmen", "Qualitäts_Score", "Value_Score", "Value_Trigger",
+            "Dividendenrendite", "Volatilität_1J", "Max_Drawdown_1J",
+        ]
+        visible = sector_stats[columns].copy().sort_values("Value_Score", ascending=False, na_position="last")
+        display = visible.rename(columns={
+            "sector": "Sektor",
+            "Qualitäts_Score": "Qualitäts-Score",
+            "Value_Score": "Value-Score",
+            "Value_Trigger": "Value-Trigger",
+            "Dividendenrendite": "Dividendenrendite",
+            "Volatilität_1J": "Volatilität 1J",
+            "Max_Drawdown_1J": "Max. Drawdown 1J",
+        })
+        st.dataframe(
+            display.style.format(
+                {
+                    "Qualitäts-Score": lambda value: format_number(value, 1),
+                    "Value-Score": lambda value: format_number(value, 1),
+                    "Dividendenrendite": lambda value: format_percent(value, 2),
+                    "Volatilität 1J": lambda value: format_percent(value, 1),
+                    "Max. Drawdown 1J": lambda value: format_percent(value, 1, signed=True),
+                },
+                na_rep="–",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        scatter = alt.Chart(display.dropna(subset=["Value-Score", "Volatilität 1J"])).mark_circle(size=120).encode(
+            x=alt.X("Volatilität 1J:Q", title="Volatilität 1J in %"),
+            y=alt.Y("Value-Score:Q", title="Value-Score"),
+            size=alt.Size("Unternehmen:Q", title="Unternehmen"),
+            tooltip=["Sektor:N", "Unternehmen:Q", alt.Tooltip("Value-Score:Q", format=".1f"), alt.Tooltip("Volatilität 1J:Q", format=".1f")],
+        ).properties(height=420)
+        st.altair_chart(scatter, use_container_width=True)
+
+    with st.expander("Was sagt diese Ansicht aus?"):
+        st.write(
+            "Die Sektoransicht zeigt, ob ein Scanner-Kandidat nur wegen eines einzelnen Unternehmens auffällt "
+            "oder ob ein kompletter Sektor unter Druck steht. Besonders nützlich ist der Vergleich aus 1J/3J/5J-Rendite, "
+            "Value-Score, Dividendenrendite und Volatilität. Ein hoher Value-Score bei gleichzeitig hohem Drawdown kann "
+            "eine Chance oder eine Value Trap sein – deshalb immer mit News, Cashflow und Verschuldung gegenprüfen."
+        )
 
 
 def render_news_card(item: pd.Series, card_index: int) -> None:
@@ -4189,6 +4525,8 @@ def main() -> None:
         st.session_state["metrics_raw"] = raw_metrics
         st.session_state["histories"] = histories
         st.session_state["loaded_tickers"] = selected_tickers
+        st.session_state["load_errors"] = errors
+        st.session_state["selected_constituents_snapshot"] = selected_constituents.copy()
         st.session_state["last_refresh"] = datetime.now().strftime("%d.%m.%Y %H:%M")
         if errors:
             st.warning("Einige Daten konnten nicht vollständig geladen werden: " + " | ".join(errors[:8]))
@@ -4208,31 +4546,43 @@ def main() -> None:
     )
     data = enrich_with_special_situations(data)
 
+    load_errors = st.session_state.get("load_errors", [])
+    selected_snapshot = st.session_state.get("selected_constituents_snapshot", selected_constituents)
+    status_summary, status_detail = build_data_status(
+        selected_snapshot, data, histories, load_errors, index_name=index_name
+    )
+
     last_refresh = st.session_state.get("last_refresh", "–")
+    requested_count = int(status_summary.get("angefragt", len(selected_snapshot)))
+    loaded_count = int(status_summary.get("analysiert", len(data)))
+    coverage = safe_float(status_summary.get("abdeckung_prozent"))
+    coverage_label = format_percent(coverage, 1) if coverage is not None else "–"
     st.caption(
-        f"Aktualisiert: {last_refresh} · {len(data)} Unternehmen analysiert · "
-        f"Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
+        f"Aktualisiert: {last_refresh} · {loaded_count}/{requested_count} Unternehmen analysiert "
+        f"({coverage_label} Abdeckung) · Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
     )
 
     tabs = st.tabs([
-        "Überblick", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
+        "Überblick", "Datenstatus", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
         "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Research",
     ])
     with tabs[0]:
         render_overview(data)
     with tabs[1]:
-        render_fundamentals(data)
+        render_data_status(status_summary, status_detail, data)
     with tabs[2]:
-        render_risk_and_chart(data, histories)
+        render_fundamentals(data)
     with tabs[3]:
-        render_sector_view(data)
+        render_risk_and_chart(data, histories)
     with tabs[4]:
-        render_news(data)
+        render_sector_view(data, histories)
     with tabs[5]:
-        render_portfolio(data, histories)
+        render_news(data)
     with tabs[6]:
-        render_watchlist(data)
+        render_portfolio(data, histories)
     with tabs[7]:
+        render_watchlist(data)
+    with tabs[8]:
         render_value_watchlist(
             data,
             drawdown_trigger=float(drawdown_trigger),
@@ -4241,9 +4591,9 @@ def main() -> None:
             yield_min=float(yield_min),
             profile_name=profile_name,
         )
-    with tabs[8]:
-        render_special_situation_scanner(data)
     with tabs[9]:
+        render_special_situation_scanner(data)
+    with tabs[10]:
         render_research(data, histories, index_name)
 
 
