@@ -22,3 +22,8 @@ date,ticker_yahoo,event_type,title,source,link,sentiment_score,sentiment_label,i
 2026-02-13,MMM,dividend,"Dividende: 0,7800 je Aktie",Yahoo Finance,,0.0,neutral,mittel,False,,
 2025-11-14,MMM,dividend,"Dividende: 0,7300 je Aktie",Yahoo Finance,,0.0,neutral,mittel,False,,
 2025-08-25,MMM,dividend,"Dividende: 0,7300 je Aktie",Yahoo Finance,,0.0,neutral,mittel,False,,
+2026-07-24,VOW3.DE,earnings,Quartalszahlen / Earnings,Yahoo Finance Calendar,,0.0,neutral,hoch,True,,
+2026-07-10,VOW3.DE,earnings,Halbjahreszahlen: Volkswagen kämpft mit China-Flaute - Automobilwoche,Google News Suche: Volkswagen Group,https://news.google.com/rss/articles/CBMiswFBVV95cUxQRGV2QTJGalhYZzB5M2FyZmxvQi1HdlgwdWs5UW13WmNpVDV0NWtJNkFPMzBWZEdlRmJEM0oxSWZLeGxNT29wY1NhN0MwRnZBUGw3SzJjS1NaZzF4TzRWbHBWYldpOW53cUlwS1JKM282U3lENC1Yd2t5LVQtZVZacUtMV0Z4cHloRmM4TjhVamtiak1Rb2luem52N3pra1NybEpNb1Q2X1dnSlc4aWUzaWxaUQ?oc=5,0.0,neutral,mittel,False,niedrig,Keine eindeutige richtungsweisende Phrase erkannt.
+2026-06-19,VOW3.DE,dividend,"Dividende: 5,2600 je Aktie",Yahoo Finance,,0.0,neutral,mittel,False,,
+2026-06-19,VOW3.DE,dividend,Ex-Dividende,Yahoo Finance Calendar,,0.0,neutral,mittel,False,,
+2026-03-02,VOW3.DE,report,Geschäftsbericht & Ergebnisse Geschäftsjahr 2025 - volkswagen-group.com,Google News Suche: Volkswagen Group,https://news.google.com/rss/articles/CBMimgFBVV95cUxPYmFrTnhtZ1dpNGt2UVFqRElPamNFWXUzOU9KZWtfc1BsSURNdXhhb2k3eURKY3ItaWJpdmlZckJDSDI2dHgyVlB0bUhjTzBnaktzeUxJR0VIN0p3dFQ4YXRNRFJ4cHhnVW9wV01ieEhWOFVKQ04wZGZZd0o2M0lVSzVZOThYTHQ5bjljRmhCS0V0N1Ftd2ktci13?oc=5,0.0,neutral,mittel,False,niedrig,Keine eindeutige richtungsweisende Phrase erkannt.

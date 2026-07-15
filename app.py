@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.6"
+APP_VERSION = "4.7"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4974,24 +4974,180 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     render_portfolio_risk(portfolio_view, all_histories)
 
 
-def render_watchlist(metrics: pd.DataFrame) -> None:
+def render_watchlist(
+    metrics: pd.DataFrame,
+    drawdown_trigger: float,
+    payout_max: float,
+    score_min: float,
+    yield_min: float,
+) -> None:
+    """Zeigt die Watchlist unabhängig vom aktuell gewählten Index.
+
+    Werte, die bereits im geladenen Index enthalten sind, verwenden dessen
+    Marktdaten. Für alle übrigen Watchlist-Ticker können die Daten über einen
+    eigenen Button separat geladen und im Session State zwischengespeichert
+    werden. Dadurch bleiben beispielsweise US-Titel sichtbar, auch wenn gerade
+    der DAX ausgewählt ist.
+    """
     st.subheader("Eigene Watchlist")
     watchlist = read_watchlist()
     if watchlist.empty:
         st.info("Noch keine Titel gespeichert. Nutze in der Einzelanalyse den Button „Zur Watchlist hinzufügen“.")
         return
 
-    merged = watchlist.merge(metrics, on="ticker_yahoo", how="left", suffixes=("", "_market"))
+    watchlist = watchlist.copy()
+    watchlist["ticker_yahoo"] = watchlist["ticker_yahoo"].map(clean_ticker)
+    watchlist = watchlist[watchlist["ticker_yahoo"].astype(bool)].drop_duplicates("ticker_yahoo")
+
+    current_metrics = metrics.copy() if metrics is not None else empty_metrics_frame()
+    if not current_metrics.empty:
+        current_metrics["ticker_yahoo"] = current_metrics["ticker_yahoo"].map(clean_ticker)
+    current_tickers = set(current_metrics.get("ticker_yahoo", pd.Series(dtype=str)).astype(str))
+    watchlist_tickers = set(watchlist["ticker_yahoo"].astype(str))
+    independent_tickers = sorted(watchlist_tickers - current_tickers)
+
+    # Bereits separat geladene Rohdaten beibehalten, aber auf die aktuelle
+    # Watchlist beschränken. Scores werden bei jedem Rerun mit den aktuellen
+    # Scanner-Regeln neu berechnet.
+    extra_raw = st.session_state.get("watchlist_extra_raw_metrics")
+    if extra_raw is None:
+        extra_raw = empty_metrics_frame()
+    else:
+        extra_raw = extra_raw.copy()
+    if not extra_raw.empty:
+        extra_raw["ticker_yahoo"] = extra_raw["ticker_yahoo"].map(clean_ticker)
+        extra_raw = extra_raw[extra_raw["ticker_yahoo"].isin(watchlist_tickers)].copy()
+
+    controls = st.columns([1.35, 1, 1, 1.4])
+    load_clicked = controls[0].button(
+        "Watchlist-Daten laden / aktualisieren",
+        type="primary",
+        use_container_width=True,
+        key="load_watchlist_market_data",
+        help="Lädt nur Watchlist-Titel separat, die nicht bereits im aktuell geladenen Index enthalten sind.",
+    )
+
+    if load_clicked:
+        if independent_tickers:
+            extra_constituents = watchlist[watchlist["ticker_yahoo"].isin(independent_tickers)][
+                ["ticker_yahoo", "name", "sector"]
+            ].copy()
+            extra_constituents["name"] = extra_constituents["name"].replace(r"^\s*$", pd.NA, regex=True)
+            extra_constituents["name"] = extra_constituents["name"].fillna(extra_constituents["ticker_yahoo"])
+            extra_constituents["sector"] = extra_constituents["sector"].replace(r"^\s*$", pd.NA, regex=True).fillna("Unbekannt")
+
+            with st.spinner(f"Lade Marktdaten für {len(extra_constituents)} Watchlist-Titel …"):
+                loaded_raw, loaded_histories, load_errors = collect_metrics(extra_constituents)
+            st.session_state["watchlist_extra_raw_metrics"] = loaded_raw
+            st.session_state["watchlist_extra_histories"] = loaded_histories
+            st.session_state["watchlist_load_errors"] = load_errors
+        else:
+            # Alle Titel sind bereits Bestandteil des aktuell geladenen Index.
+            st.session_state["watchlist_extra_raw_metrics"] = empty_metrics_frame()
+            st.session_state["watchlist_extra_histories"] = {}
+            st.session_state["watchlist_load_errors"] = []
+        st.session_state["watchlist_last_refresh"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+        st.rerun()
+
+    # Nach einem eventuellen Rerun die gespeicherten Daten erneut lesen.
+    extra_raw = st.session_state.get("watchlist_extra_raw_metrics", empty_metrics_frame())
+    if extra_raw is None:
+        extra_raw = empty_metrics_frame()
+    extra_raw = extra_raw.copy()
+    if not extra_raw.empty:
+        extra_raw["ticker_yahoo"] = extra_raw["ticker_yahoo"].map(clean_ticker)
+        extra_raw = extra_raw[extra_raw["ticker_yahoo"].isin(watchlist_tickers)].copy()
+        extra_scored = enrich_with_scores(
+            extra_raw,
+            drawdown_trigger=float(drawdown_trigger),
+            payout_max=float(payout_max),
+            score_min=float(score_min),
+            yield_min=float(yield_min),
+        )
+        extra_scored = enrich_with_special_situations(extra_scored)
+    else:
+        extra_scored = empty_metrics_frame()
+
+    # Separat geladene Daten zuerst, aktuell geladene Indexdaten zuletzt: Bei
+    # Duplikaten haben die frisch sichtbaren Indexdaten Vorrang.
+    combined_metrics = pd.concat([extra_scored, current_metrics], ignore_index=True, sort=False)
+    if not combined_metrics.empty:
+        combined_metrics["ticker_yahoo"] = combined_metrics["ticker_yahoo"].map(clean_ticker)
+        combined_metrics = combined_metrics.drop_duplicates("ticker_yahoo", keep="last")
+
+    merged = watchlist.merge(combined_metrics, on="ticker_yahoo", how="left", suffixes=("", "_market"))
+    loaded_mask = pd.to_numeric(merged.get("last_price"), errors="coerce").notna()
+    loaded_count = int(loaded_mask.sum())
+    total_count = int(len(merged))
+    open_count = max(total_count - loaded_count, 0)
+
+    controls[1].metric("Watchlist-Titel", total_count)
+    controls[2].metric("Daten geladen", loaded_count)
+    controls[3].metric("Letzte separate Abfrage", st.session_state.get("watchlist_last_refresh", "Noch nicht geladen"))
+
+    if open_count:
+        missing_names = merged.loc[~loaded_mask, "name"].fillna(merged.loc[~loaded_mask, "ticker_yahoo"]).astype(str).tolist()
+        st.info(
+            f"Für {open_count} Watchlist-Titel fehlen noch Marktdaten. Klicke auf „Watchlist-Daten laden / aktualisieren“. "
+            f"Offen: {', '.join(missing_names[:8])}" + (" …" if len(missing_names) > 8 else "")
+        )
+    else:
+        st.success("Alle Watchlist-Titel verfügen über Marktdaten – unabhängig vom aktuell ausgewählten Index.")
+
+    load_errors = st.session_state.get("watchlist_load_errors", [])
+    if load_errors:
+        with st.expander(f"Hinweise zu {len(load_errors)} Watchlist-Datenabruf(en)"):
+            for message in load_errors:
+                st.write(f"- {message}")
+
     visible_columns = [
         "ticker_yahoo", "name", "sector", "added_at", "note", "last_price", "currency", "change_1y",
         "dividend_yield", "total_score", "value_score", "value_trigger",
     ]
     visible_columns = [column for column in visible_columns if column in merged.columns]
-    st.dataframe(overview_styler(merged[visible_columns]), use_container_width=True, hide_index=True)
+    display = merged[visible_columns].rename(columns={
+        "ticker_yahoo": "Ticker",
+        "name": "Unternehmen",
+        "sector": "Sektor",
+        "added_at": "Hinzugefügt",
+        "note": "Notiz",
+        "last_price": "Letzter Kurs",
+        "currency": "Währung",
+        "change_1y": "Kursrendite 1J",
+        "dividend_yield": "Dividendenrendite",
+        "total_score": "Qualitäts-Score",
+        "value_score": "Value-Score",
+        "value_trigger": "Value-Trigger",
+    })
+
+    display_formats = {
+        "Letzter Kurs": lambda value: format_number(value, 2),
+        "Kursrendite 1J": lambda value: format_percent(value, 2, signed=True),
+        "Dividendenrendite": lambda value: format_percent(value, 2),
+        "Qualitäts-Score": lambda value: format_number(value, 1),
+        "Value-Score": lambda value: format_number(value, 1),
+    }
+    styled = display.style.format(
+        {key: formatter for key, formatter in display_formats.items() if key in display.columns},
+        na_rep="–",
+    )
+    if "Kursrendite 1J" in display.columns:
+        styled = styled.map(colorize_change, subset=["Kursrendite 1J"])
+    if "Qualitäts-Score" in display.columns:
+        styled = styled.map(colorize_score, subset=["Qualitäts-Score"])
+    if "Value-Trigger" in display.columns:
+        styled = styled.map(colorize_value_trigger, subset=["Value-Trigger"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
     ticker_to_remove = company_selectbox("Titel von Watchlist entfernen", merged, key="remove_watchlist_ticker")
     if st.button("Aus Watchlist entfernen", key="remove_watchlist_button"):
         remove_from_watchlist(ticker_to_remove)
+        # Gespeicherte Zusatzdaten beim Entfernen ebenfalls bereinigen.
+        stored = st.session_state.get("watchlist_extra_raw_metrics")
+        if isinstance(stored, pd.DataFrame) and not stored.empty:
+            st.session_state["watchlist_extra_raw_metrics"] = stored[
+                stored["ticker_yahoo"].map(clean_ticker) != clean_ticker(ticker_to_remove)
+            ].copy()
         st.success(f"{ticker_to_remove} wurde entfernt.")
         st.rerun()
 
@@ -5099,7 +5255,8 @@ def main() -> None:
             fx_to_eur.clear()
             for state_key in [
                 "metrics_raw", "histories", "loaded_tickers", "portfolio_extra_metrics",
-                "portfolio_extra_histories",
+                "portfolio_extra_histories", "watchlist_extra_raw_metrics",
+                "watchlist_extra_histories", "watchlist_load_errors", "watchlist_last_refresh",
             ]:
                 st.session_state.pop(state_key, None)
             st.success("Zwischenspeicher wurde geleert.")
@@ -5187,7 +5344,13 @@ def main() -> None:
     elif active_page == "Portfolio":
         render_portfolio(data, histories)
     elif active_page == "Watchlist":
-        render_watchlist(data)
+        render_watchlist(
+            data,
+            drawdown_trigger=float(drawdown_trigger),
+            payout_max=float(payout_max),
+            score_min=float(score_min),
+            yield_min=float(yield_min),
+        )
     elif active_page == "Value-Scanner":
         render_value_watchlist(
             data,
