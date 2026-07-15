@@ -464,6 +464,38 @@ def safe_float(value: Any) -> Optional[float]:
     return result if pd.notna(result) else None
 
 
+def safe_session_date(
+    value: Any,
+    fallback: Any,
+    min_date: Any = None,
+    max_date: Any = None,
+):
+    """Liest ein Datum aus dem Streamlit Session State robust ein.
+
+    ``pd.Timestamp(None)`` liefert ``NaT`` statt eine Exception auszulösen.
+    Ohne explizite NaT-Prüfung führt ein anschließender Vergleich mit
+    ``datetime.date`` zu ``TypeError: Cannot compare NaT with datetime.date``.
+    """
+    try:
+        fallback_date = pd.Timestamp(fallback).date()
+    except Exception:
+        fallback_date = fallback
+
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return fallback_date
+        result = pd.Timestamp(parsed).date()
+    except Exception:
+        return fallback_date
+
+    if min_date is not None and result < min_date:
+        return fallback_date
+    if max_date is not None and result > max_date:
+        return fallback_date
+    return result
+
+
 def to_percent(value: Any) -> Optional[float]:
     """Yahoo liefert einige Quoten als Dezimalzahl, andere bereits in Prozent."""
     number = safe_float(value)
@@ -4264,12 +4296,12 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     max_date = history.index.max().date()
     suggested_date = max(min_date, min(max_date, datetime(2023, 12, 6).date()))
 
-    try:
-        stored_as_of = pd.Timestamp(st.session_state.get("backtest_as_of")).date()
-    except Exception:
-        stored_as_of = suggested_date
-    if not (min_date <= stored_as_of <= max_date):
-        stored_as_of = suggested_date
+    stored_as_of = safe_session_date(
+        st.session_state.get("backtest_as_of"),
+        fallback=suggested_date,
+        min_date=min_date,
+        max_date=max_date,
+    )
     st.session_state["backtest_as_of"] = stored_as_of
     st.session_state.setdefault("backtest_lag_days", 120)
     st.session_state.setdefault("backtest_use_adjusted", True)
@@ -4395,18 +4427,18 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     earliest_backtest = max(pd.Timestamp(history.index.min()), pd.Timestamp(history.index.max()) - pd.DateOffset(years=10))
     latest_backtest = pd.Timestamp(history.index.max()) - pd.DateOffset(months=12)
     bt_end_default = max(earliest_backtest.date(), latest_backtest.date())
-    try:
-        stored_bt_start = pd.Timestamp(st.session_state.get("historical_bt_start")).date()
-    except Exception:
-        stored_bt_start = earliest_backtest.date()
-    try:
-        stored_bt_end = pd.Timestamp(st.session_state.get("historical_bt_end")).date()
-    except Exception:
-        stored_bt_end = bt_end_default
-    if not (min_date <= stored_bt_start <= max_date):
-        stored_bt_start = earliest_backtest.date()
-    if not (min_date <= stored_bt_end <= max_date):
-        stored_bt_end = bt_end_default
+    stored_bt_start = safe_session_date(
+        st.session_state.get("historical_bt_start"),
+        fallback=earliest_backtest.date(),
+        min_date=min_date,
+        max_date=max_date,
+    )
+    stored_bt_end = safe_session_date(
+        st.session_state.get("historical_bt_end"),
+        fallback=bt_end_default,
+        min_date=min_date,
+        max_date=max_date,
+    )
     st.session_state["historical_bt_start"] = stored_bt_start
     st.session_state["historical_bt_end"] = stored_bt_end
     st.session_state.setdefault("historical_bt_threshold", 65)
