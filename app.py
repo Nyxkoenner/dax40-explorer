@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.7"
+APP_VERSION = "4.8"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -231,9 +231,9 @@ INDEX_LOCAL_FILES = {
     "S&P 500": INDEX_DIR / "sp500.csv",
 }
 
-# Robuster Fallback für DAX 40, falls die Webtabelle unvollständig oder
-# uneinheitlich geparst wird. Stand: Wikipedia-Liste „as of 22 September 2025“.
-# Für maximale Kontrolle kann die Liste jederzeit über data/indices/dax40.csv überschrieben werden.
+# Integrierte Offline-Listen für deutsche Indizes. Stand: 22. Juni 2026.
+# Lokale CSV-Dateien unter data/indices/ überschreiben diese Vorlagen.
+# Dadurch ist der normale App-Start nicht von Wikipedia oder dessen Rate-Limits abhängig.
 DAX40_STATIC_CONSTITUENTS = [
     {"name": "Adidas", "ticker_yahoo": "ADS.DE", "sector": "Apparel"},
     {"name": "Airbus", "ticker_yahoo": "AIR.PA", "sector": "Aerospace & Defence"},
@@ -262,7 +262,7 @@ DAX40_STATIC_CONSTITUENTS = [
     {"name": "Merck", "ticker_yahoo": "MRK.DE", "sector": "Pharmaceuticals"},
     {"name": "MTU Aero Engines", "ticker_yahoo": "MTX.DE", "sector": "Aerospace & Defence"},
     {"name": "Munich Re", "ticker_yahoo": "MUV2.DE", "sector": "Financial Services"},
-    {"name": "Porsche SE", "ticker_yahoo": "PAH3.DE", "sector": "Automotive"},
+    {"name": "Hochtief", "ticker_yahoo": "HOT.DE", "sector": "Construction"},
     {"name": "Qiagen", "ticker_yahoo": "QIA.DE", "sector": "Biotech"},
     {"name": "Rheinmetall", "ticker_yahoo": "RHM.DE", "sector": "Aerospace & Defence"},
     {"name": "RWE", "ticker_yahoo": "RWE.DE", "sector": "Utilities"},
@@ -276,6 +276,148 @@ DAX40_STATIC_CONSTITUENTS = [
     {"name": "Vonovia", "ticker_yahoo": "VNA.DE", "sector": "Real Estate"},
     {"name": "Zalando", "ticker_yahoo": "ZAL.DE", "sector": "E-Commerce"},
 ]
+
+
+MDAX_STATIC_CONSTITUENTS = [
+    {"name": "AIXTRON", "ticker_yahoo": "AIXA.DE", "sector": "Technology"},
+    {"name": "Aroundtown", "ticker_yahoo": "AT1.DE", "sector": "Real Estate"},
+    {"name": "AUMOVIO", "ticker_yahoo": "AMV0.DE", "sector": "Automotive Technology"},
+    {"name": "Aurubis", "ticker_yahoo": "NDA.DE", "sector": "Basic Materials"},
+    {"name": "AUTO1 Group", "ticker_yahoo": "AG1.DE", "sector": "Consumer Cyclical"},
+    {"name": "Bechtle", "ticker_yahoo": "BC8.DE", "sector": "Technology"},
+    {"name": "Bilfinger", "ticker_yahoo": "GBF.DE", "sector": "Industrials"},
+    {"name": "CTS Eventim", "ticker_yahoo": "EVD.DE", "sector": "Communication Services"},
+    {"name": "Delivery Hero", "ticker_yahoo": "DHER.DE", "sector": "Consumer Cyclical"},
+    {"name": "Deutz", "ticker_yahoo": "DEZ.DE", "sector": "Industrials"},
+    {"name": "DWS Group", "ticker_yahoo": "DWS.DE", "sector": "Financial Services"},
+    {"name": "Elmos Semiconductor", "ticker_yahoo": "ELG.DE", "sector": "Technology"},
+    {"name": "Evonik Industries", "ticker_yahoo": "EVK.DE", "sector": "Chemicals"},
+    {"name": "flatexDEGIRO", "ticker_yahoo": "FTK.DE", "sector": "Financial Services"},
+    {"name": "Fraport", "ticker_yahoo": "FRA.DE", "sector": "Industrials"},
+    {"name": "freenet", "ticker_yahoo": "FNTN.DE", "sector": "Communication Services"},
+    {"name": "FUCHS", "ticker_yahoo": "FPE3.DE", "sector": "Chemicals"},
+    {"name": "HELLA", "ticker_yahoo": "HLE.DE", "sector": "Automotive"},
+    {"name": "HENSOLDT", "ticker_yahoo": "HAG.DE", "sector": "Aerospace & Defence"},
+    {"name": "HUGO BOSS", "ticker_yahoo": "BOSS.DE", "sector": "Consumer Cyclical"},
+    {"name": "IONOS Group", "ticker_yahoo": "IOS.DE", "sector": "Technology"},
+    {"name": "Jenoptik", "ticker_yahoo": "JEN.DE", "sector": "Technology"},
+    {"name": "K+S", "ticker_yahoo": "SDF.DE", "sector": "Basic Materials"},
+    {"name": "KION Group", "ticker_yahoo": "KGX.DE", "sector": "Industrials"},
+    {"name": "Knorr-Bremse", "ticker_yahoo": "KBX.DE", "sector": "Industrials"},
+    {"name": "KRONES", "ticker_yahoo": "KRN.DE", "sector": "Industrials"},
+    {"name": "LANXESS", "ticker_yahoo": "LXS.DE", "sector": "Chemicals"},
+    {"name": "LEG Immobilien", "ticker_yahoo": "LEG.DE", "sector": "Real Estate"},
+    {"name": "Lufthansa", "ticker_yahoo": "LHA.DE", "sector": "Industrials"},
+    {"name": "Nemetschek", "ticker_yahoo": "NEM.DE", "sector": "Technology"},
+    {"name": "Nordex", "ticker_yahoo": "NDX1.DE", "sector": "Industrials"},
+    {"name": "Porsche AG", "ticker_yahoo": "P911.DE", "sector": "Automotive"},
+    {"name": "Porsche Automobil Holding", "ticker_yahoo": "PAH3.DE", "sector": "Automotive"},
+    {"name": "PUMA", "ticker_yahoo": "PUM.DE", "sector": "Consumer Cyclical"},
+    {"name": "RATIONAL", "ticker_yahoo": "RAA.DE", "sector": "Industrials"},
+    {"name": "RENK Group", "ticker_yahoo": "R3NK.DE", "sector": "Aerospace & Defence"},
+    {"name": "RTL Group", "ticker_yahoo": "RRTL.DE", "sector": "Communication Services"},
+    {"name": "Salzgitter", "ticker_yahoo": "SZG.DE", "sector": "Basic Materials"},
+    {"name": "Sartorius", "ticker_yahoo": "SRT3.DE", "sector": "Healthcare"},
+    {"name": "Schaeffler", "ticker_yahoo": "SHA0.DE", "sector": "Automotive"},
+    {"name": "Siltronic", "ticker_yahoo": "WAF.DE", "sector": "Technology"},
+    {"name": "SUSS MicroTec", "ticker_yahoo": "SMHN.DE", "sector": "Technology"},
+    {"name": "TAG Immobilien", "ticker_yahoo": "TEG.DE", "sector": "Real Estate"},
+    {"name": "Talanx", "ticker_yahoo": "TLX.DE", "sector": "Financial Services"},
+    {"name": "thyssenkrupp", "ticker_yahoo": "TKA.DE", "sector": "Industrials"},
+    {"name": "TKMS", "ticker_yahoo": "TKMS.DE", "sector": "Aerospace & Defence"},
+    {"name": "TRATON", "ticker_yahoo": "8TRA.DE", "sector": "Automotive"},
+    {"name": "TUI", "ticker_yahoo": "TUI1.DE", "sector": "Consumer Cyclical"},
+    {"name": "United Internet", "ticker_yahoo": "UTDI.DE", "sector": "Communication Services"},
+    {"name": "Wacker Chemie", "ticker_yahoo": "WCH.DE", "sector": "Chemicals"},
+]
+
+SDAX_STATIC_CONSTITUENTS = [
+    {"name": "1&1", "ticker_yahoo": "1U1.DE", "sector": "Communication Services"},
+    {"name": "Adtran Networks", "ticker_yahoo": "ADV.DE", "sector": "Technology"},
+    {"name": "AlzChem Group", "ticker_yahoo": "ACT.DE", "sector": "Chemicals"},
+    {"name": "Asta Energy Solutions", "ticker_yahoo": "1AST.DE", "sector": "Industrials"},
+    {"name": "ATOSS Software", "ticker_yahoo": "AOF.DE", "sector": "Technology"},
+    {"name": "Basler", "ticker_yahoo": "BSL.DE", "sector": "Technology"},
+    {"name": "Befesa", "ticker_yahoo": "BFSA.DE", "sector": "Industrials"},
+    {"name": "CANCOM", "ticker_yahoo": "COK.DE", "sector": "Technology"},
+    {"name": "Carl Zeiss Meditec", "ticker_yahoo": "AFX.DE", "sector": "Healthcare"},
+    {"name": "CEWE", "ticker_yahoo": "CWC.DE", "sector": "Consumer Cyclical"},
+    {"name": "Dermapharm", "ticker_yahoo": "DMP.DE", "sector": "Healthcare"},
+    {"name": "Deutsche Beteiligungs", "ticker_yahoo": "DBAN.DE", "sector": "Financial Services"},
+    {"name": "Deutsche EuroShop", "ticker_yahoo": "DEQ.DE", "sector": "Real Estate"},
+    {"name": "Deutsche Pfandbriefbank", "ticker_yahoo": "PBB.DE", "sector": "Financial Services"},
+    {"name": "Douglas", "ticker_yahoo": "DOU.DE", "sector": "Consumer Cyclical"},
+    {"name": "Drägerwerk", "ticker_yahoo": "DRW3.DE", "sector": "Healthcare"},
+    {"name": "Dürr", "ticker_yahoo": "DUE.DE", "sector": "Industrials"},
+    {"name": "Eckert & Ziegler", "ticker_yahoo": "EUZ.DE", "sector": "Healthcare"},
+    {"name": "Einhell Germany", "ticker_yahoo": "EIN3.DE", "sector": "Consumer Cyclical"},
+    {"name": "Energiekontor", "ticker_yahoo": "EKT.DE", "sector": "Utilities"},
+    {"name": "Evotec", "ticker_yahoo": "EVT.DE", "sector": "Healthcare"},
+    {"name": "Fielmann", "ticker_yahoo": "FIE.DE", "sector": "Consumer Cyclical"},
+    {"name": "Friedrich Vorwerk", "ticker_yahoo": "VH2.DE", "sector": "Industrials"},
+    {"name": "GFT Technologies", "ticker_yahoo": "GFT.DE", "sector": "Technology"},
+    {"name": "Grand City Properties", "ticker_yahoo": "GYC.DE", "sector": "Real Estate"},
+    {"name": "Grenke", "ticker_yahoo": "GLJ.DE", "sector": "Financial Services"},
+    {"name": "Hamborner REIT", "ticker_yahoo": "HABA.DE", "sector": "Real Estate"},
+    {"name": "Heidelberger Druckmaschinen", "ticker_yahoo": "HDP.DE", "sector": "Industrials"},
+    {"name": "HelloFresh", "ticker_yahoo": "HFG.DE", "sector": "Consumer Cyclical"},
+    {"name": "HORNBACH Holding", "ticker_yahoo": "HBM.DE", "sector": "Consumer Cyclical"},
+    {"name": "Hypoport", "ticker_yahoo": "HYQ.DE", "sector": "Financial Services"},
+    {"name": "INDUS Holding", "ticker_yahoo": "INH.DE", "sector": "Industrials"},
+    {"name": "INIT", "ticker_yahoo": "IXX.DE", "sector": "Technology"},
+    {"name": "JOST Werke", "ticker_yahoo": "JST.DE", "sector": "Industrials"},
+    {"name": "Jungheinrich", "ticker_yahoo": "JUN3.DE", "sector": "Industrials"},
+    {"name": "Klöckner & Co", "ticker_yahoo": "KCO.DE", "sector": "Basic Materials"},
+    {"name": "Kontron", "ticker_yahoo": "KTN.DE", "sector": "Technology"},
+    {"name": "KSB", "ticker_yahoo": "KSB.DE", "sector": "Industrials"},
+    {"name": "KWS SAAT", "ticker_yahoo": "KWS.DE", "sector": "Consumer Defensive"},
+    {"name": "LPKF Laser & Electronics", "ticker_yahoo": "LPK.DE", "sector": "Technology"},
+    {"name": "MBB", "ticker_yahoo": "MBB.DE", "sector": "Industrials"},
+    {"name": "Medios", "ticker_yahoo": "ILM1.DE", "sector": "Healthcare"},
+    {"name": "MLP", "ticker_yahoo": "MLP.DE", "sector": "Financial Services"},
+    {"name": "Mutares", "ticker_yahoo": "MUX.DE", "sector": "Financial Services"},
+    {"name": "Nagarro", "ticker_yahoo": "NA9.DE", "sector": "Technology"},
+    {"name": "NORMA Group", "ticker_yahoo": "NOEJ.DE", "sector": "Industrials"},
+    {"name": "Ottobock", "ticker_yahoo": "OBCK.DE", "sector": "Healthcare"},
+    {"name": "PATRIZIA", "ticker_yahoo": "PAT.DE", "sector": "Real Estate"},
+    {"name": "PNE", "ticker_yahoo": "PNE3.DE", "sector": "Utilities"},
+    {"name": "PVA TePla", "ticker_yahoo": "TPE.DE", "sector": "Technology"},
+    {"name": "Redcare Pharmacy", "ticker_yahoo": "RDC.DE", "sector": "Healthcare"},
+    {"name": "SAF-HOLLAND", "ticker_yahoo": "SFQ.DE", "sector": "Industrials"},
+    {"name": "SCHOTT Pharma", "ticker_yahoo": "1SXP.DE", "sector": "Healthcare"},
+    {"name": "secunet Security Networks", "ticker_yahoo": "YSN.DE", "sector": "Technology"},
+    {"name": "SFC Energy", "ticker_yahoo": "F3C.DE", "sector": "Industrials"},
+    {"name": "Shelly Group", "ticker_yahoo": "SLYG.DE", "sector": "Technology"},
+    {"name": "Sixt", "ticker_yahoo": "SIX2.DE", "sector": "Industrials"},
+    {"name": "SMA Solar Technology", "ticker_yahoo": "S92.DE", "sector": "Technology"},
+    {"name": "Springer Nature", "ticker_yahoo": "SPG.DE", "sector": "Communication Services"},
+    {"name": "Stabilus", "ticker_yahoo": "STM.DE", "sector": "Industrials"},
+    {"name": "STO", "ticker_yahoo": "STO3.DE", "sector": "Basic Materials"},
+    {"name": "STRATEC", "ticker_yahoo": "SBS.DE", "sector": "Healthcare"},
+    {"name": "Ströer", "ticker_yahoo": "SAX.DE", "sector": "Communication Services"},
+    {"name": "Südzucker", "ticker_yahoo": "SZU.DE", "sector": "Consumer Defensive"},
+    {"name": "TeamViewer", "ticker_yahoo": "TMV.DE", "sector": "Technology"},
+    {"name": "tonies", "ticker_yahoo": "TNIE.DE", "sector": "Consumer Cyclical"},
+    {"name": "VERBIO", "ticker_yahoo": "VBK.DE", "sector": "Energy"},
+    {"name": "Vincorion", "ticker_yahoo": "V1NC.DE", "sector": "Aerospace & Defence"},
+    {"name": "Vossloh", "ticker_yahoo": "VOS.DE", "sector": "Industrials"},
+    {"name": "Wacker Neuson", "ticker_yahoo": "WAC.DE", "sector": "Industrials"},
+]
+
+STATIC_INDEX_CONSTITUENTS = {
+    "DAX 40": DAX40_STATIC_CONSTITUENTS,
+    "MDAX": MDAX_STATIC_CONSTITUENTS,
+    "SDAX": SDAX_STATIC_CONSTITUENTS,
+}
+
+INDEX_EXPECTED_COUNTS = {
+    "DAX 40": 40,
+    "MDAX": 50,
+    "SDAX": 70,
+    "S&P 500": 500,
+}
+
+INDEX_STATIC_AS_OF = "22.06.2026"
 
 GERMAN_INDEX_SOURCES = {
     "DAX 40": {
@@ -738,49 +880,77 @@ def parse_sp500_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
     raise RuntimeError("Keine passende S&P-500-Tabelle gefunden.")
 
 
+def _valid_local_index(index_name: str) -> Optional[pd.DataFrame]:
+    """Lädt eine lokale Indexdatei nur, wenn sie strukturell plausibel ist."""
+    local_path = INDEX_LOCAL_FILES.get(index_name)
+    if local_path is None or not local_path.exists():
+        return None
+    try:
+        frame = validate_constituents(pd.read_csv(local_path))
+    except Exception:
+        return None
+
+    expected = INDEX_EXPECTED_COUNTS.get(index_name, 0)
+    minimum = expected if index_name in STATIC_INDEX_CONSTITUENTS else max(1, int(expected * 0.8))
+    if len(frame) < minimum:
+        return None
+    return frame.reset_index(drop=True)
+
+
+def index_source_description(index_name: str) -> str:
+    """Kurze, nutzerfreundliche Beschreibung der verwendeten Indexquelle."""
+    if _valid_local_index(index_name) is not None:
+        return f"Lokale CSV: {INDEX_LOCAL_FILES[index_name]}"
+    if index_name in STATIC_INDEX_CONSTITUENTS:
+        return f"Integrierte Offline-Liste · Stand {INDEX_STATIC_AS_OF}"
+    return "Online-Quelle mit lokalem Cache"
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def load_index_constituents(index_name: str) -> pd.DataFrame:
-    """Lädt zuerst eine optionale lokale CSV, sonst Wikipedia als Fallback."""
-    local_path = INDEX_LOCAL_FILES.get(index_name)
-    if local_path and local_path.exists():
-        return validate_constituents(pd.read_csv(local_path))
+    """Lädt Indizes robust, ohne deutsche Listen automatisch von Wikipedia abzurufen.
 
-    if index_name in GERMAN_INDEX_SOURCES:
-        config = GERMAN_INDEX_SOURCES[index_name]
-        errors: list[str] = []
-        best_result = pd.DataFrame()
-        for url in config["urls"]:
-            try:
-                parsed = parse_german_index_tables(
-                    read_html_tables(fetch_html(url)),
-                    min_rows=int(config["min_rows"]),
-                    index_label=index_name,
-                )
-                if len(parsed) > len(best_result):
-                    best_result = parsed
-                # Beim DAX erwarten wir 40 Werte. V3.8 hat Airbus/AIR.PA herausgefiltert
-                # und dadurch schon beim Index-Universum nur 39 Werte geladen.
-                if index_name != "DAX 40" or len(parsed) >= 40:
-                    return parsed.reset_index(drop=True)
-            except Exception as error:
-                errors.append(f"{url}: {error}")
+    Reihenfolge:
+    1. valide lokale CSV unter data/indices/
+    2. integrierte Offline-Liste für DAX, MDAX und SDAX
+    3. S&P 500: lokaler Cache, danach Online-Fallback
+    """
+    local_frame = _valid_local_index(index_name)
+    if local_frame is not None:
+        return local_frame
 
-        if index_name == "DAX 40":
-            static_dax = validate_constituents(pd.DataFrame(DAX40_STATIC_CONSTITUENTS))
-            if not best_result.empty:
-                combined = pd.concat([best_result, static_dax], ignore_index=True)
-                combined = validate_constituents(combined)
-                if len(combined) >= 40:
-                    return combined.head(40).reset_index(drop=True)
-            return static_dax
-
-        if not best_result.empty:
-            return best_result.reset_index(drop=True)
-        raise RuntimeError(f"{index_name} konnte nicht geladen werden. " + " | ".join(errors))
+    if index_name in STATIC_INDEX_CONSTITUENTS:
+        frame = validate_constituents(pd.DataFrame(STATIC_INDEX_CONSTITUENTS[index_name]))
+        expected = INDEX_EXPECTED_COUNTS[index_name]
+        if len(frame) != expected:
+            raise RuntimeError(
+                f"Interne {index_name}-Liste ist unvollständig: {len(frame)} statt {expected} Werte."
+            )
+        return frame.reset_index(drop=True)
 
     if index_name == "S&P 500":
+        cache_path = CACHE_DIR / "sp500_constituents.csv"
+        if cache_path.exists():
+            try:
+                cached = validate_constituents(pd.read_csv(cache_path))
+                if len(cached) >= 400:
+                    return cached.reset_index(drop=True)
+            except Exception:
+                pass
+
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        return parse_sp500_tables(read_html_tables(fetch_html(url)))
+        try:
+            frame = parse_sp500_tables(read_html_tables(fetch_html(url)))
+            try:
+                frame.to_csv(cache_path, index=False)
+            except Exception:
+                pass
+            return frame.reset_index(drop=True)
+        except Exception as error:
+            raise RuntimeError(
+                "S&P 500 konnte online nicht geladen werden und es liegt noch kein lokaler Cache vor. "
+                "Lege alternativ data/indices/sp500.csv an."
+            ) from error
 
     raise ValueError(f"Unbekannter Index: {index_name}")
 
@@ -5160,10 +5330,18 @@ def main() -> None:
     with st.sidebar:
         st.header("Analyse-Einstellungen")
         index_name = st.selectbox("Index", INDEX_OPTIONS, key="index_name")
-        st.caption("Optional stabiler über CSV: data/indices/dax40.csv, mdax.csv, sdax.csv oder sp500.csv. Wikipedia bleibt nur Fallback.")
+        st.caption(
+            "DAX, MDAX und SDAX werden offline aus integrierten Listen geladen. "
+            "Eigene CSVs unter data/indices/ überschreiben die Vorlage."
+        )
 
         try:
             constituents = load_index_constituents(index_name)
+            st.success(
+                f"{index_name}: {len(constituents)} Unternehmen geladen",
+                icon="✅",
+            )
+            st.caption(f"Indexquelle: {index_source_description(index_name)}")
         except Exception as error:
             st.error(f"Index konnte nicht geladen werden: {error}")
             st.stop()
