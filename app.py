@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.0"
+APP_VERSION = "5.0.2"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -52,8 +52,10 @@ CACHE_DIR = ROOT_DIR / ".cache"
 WATCHLIST_PATH = DATA_DIR / "watchlist.csv"
 PORTFOLIO_PATH = ROOT_DIR / "portfolio.csv"
 RESEARCH_CASES_PATH = DATA_DIR / "research_cases.csv"
+BACKTEST_DIR = DATA_DIR / "backtests"
+BACKTEST_RUNS_PATH = BACKTEST_DIR / "backtest_runs.csv"
 
-for directory in (DATA_DIR, INDEX_DIR, CACHE_DIR):
+for directory in (DATA_DIR, INDEX_DIR, CACHE_DIR, BACKTEST_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_HEADERS = {
@@ -3720,7 +3722,7 @@ def render_portfolio_risk(portfolio_view: pd.DataFrame, histories: dict[str, pd.
 
 
 # -----------------------------------------------------------------------------
-# Historisches BAT-/Deep-Value-Backtesting
+# Historisches Deep-Value-Backtesting 2.0
 # -----------------------------------------------------------------------------
 
 
@@ -4106,6 +4108,92 @@ def historical_bat_snapshot(
     return result
 
 
+
+def _future_value_trap_metrics(
+    history: pd.DataFrame,
+    dividends: pd.DataFrame,
+    financials: pd.DataFrame,
+    entry_date: pd.Timestamp,
+    info_lag_days: int,
+    use_adjusted: bool = True,
+) -> dict[str, Any]:
+    """Bewertet nachträglich typische Value-Trap-Signale über zwölf Monate.
+
+    Die Prüfung nutzt ausschließlich Daten nach dem Signal und beeinflusst den
+    historischen Score nicht. Sie dient nur der späteren Ergebnisbewertung.
+    """
+    result: dict[str, Any] = {
+        "max_decline_12m": None,
+        "dividend_change_12m": None,
+        "future_cashflow_positive": None,
+        "value_trap": False,
+        "value_trap_reason": "",
+    }
+    if history is None or history.empty:
+        return result
+
+    frame = ensure_datetime_index(history.copy())
+    price_column = "Adj Close" if use_adjusted and "Adj Close" in frame.columns else "Close"
+    if price_column not in frame.columns:
+        return result
+
+    prices = pd.to_numeric(frame[price_column], errors="coerce").dropna()
+    entry_ts = pd.Timestamp(entry_date).tz_localize(None).normalize()
+    entry_price_date, entry_price = _nearest_series_value(
+        prices, entry_ts, direction="backward", tolerance_days=10
+    )
+    if entry_price_date is None or entry_price in (None, 0):
+        return result
+
+    target_12m = pd.Timestamp(entry_price_date) + pd.DateOffset(months=12)
+    future_window = prices[(prices.index > entry_price_date) & (prices.index <= target_12m)]
+    if not future_window.empty:
+        result["max_decline_12m"] = (float(future_window.min()) / float(entry_price) - 1) * 100
+
+    dividend_at_entry = _trailing_dividend_sum(dividends, pd.Timestamp(entry_price_date))
+    dividend_after_12m = _trailing_dividend_sum(dividends, target_12m)
+    if dividend_at_entry not in (None, 0) and dividend_after_12m is not None:
+        result["dividend_change_12m"] = (
+            float(dividend_after_12m) / float(dividend_at_entry) - 1
+        ) * 100
+
+    future_snapshot = _available_financial_snapshot(financials, target_12m, info_lag_days)
+    if future_snapshot is not None:
+        future_fcf = safe_float(future_snapshot.get("free_cashflow"))
+        future_ocf = safe_float(future_snapshot.get("operating_cashflow"))
+        if future_fcf is not None or future_ocf is not None:
+            result["future_cashflow_positive"] = bool(
+                (future_fcf is not None and future_fcf > 0)
+                or (future_ocf is not None and future_ocf > 0)
+            )
+
+    reasons: list[str] = []
+    if safe_float(result.get("max_decline_12m")) is not None and float(result["max_decline_12m"]) <= -30:
+        reasons.append("nach dem Signal weitere mindestens 30 % gefallen")
+    if safe_float(result.get("dividend_change_12m")) is not None and float(result["dividend_change_12m"]) <= -20:
+        reasons.append("Ausschüttung innerhalb von zwölf Monaten deutlich gesunken")
+    if result.get("future_cashflow_positive") is False:
+        reasons.append("später verfügbarer Cashflow nicht mehr positiv")
+
+    result["value_trap"] = bool(reasons)
+    result["value_trap_reason"] = "; ".join(reasons)
+    return result
+
+
+def _component_summary(snapshot: dict[str, Any]) -> str:
+    components = snapshot.get("components", pd.DataFrame())
+    if not isinstance(components, pd.DataFrame) or components.empty:
+        return ""
+    parts: list[str] = []
+    for _, row in components.iterrows():
+        criterion = str(row.get("Kriterium", "Kriterium"))
+        points = safe_float(row.get("Punkte")) or 0
+        maximum = safe_float(row.get("Maximum")) or 0
+        measurement = str(row.get("Messwert", "–"))
+        parts.append(f"{criterion}: {points:.0f}/{maximum:.0f} ({measurement})")
+    return " | ".join(parts)
+
+
 def forward_performance_table(
     history: pd.DataFrame,
     benchmark: pd.DataFrame,
@@ -4124,7 +4212,7 @@ def forward_performance_table(
         else pd.Series(dtype=float)
     )
     entry_stock_date, entry_stock = _nearest_series_value(stock, entry_date, direction="backward", tolerance_days=10)
-    entry_bench_date, entry_bench = _nearest_series_value(bench, entry_date, direction="backward", tolerance_days=10)
+    _, entry_bench = _nearest_series_value(bench, entry_date, direction="backward", tolerance_days=10)
     if entry_stock is None:
         return pd.DataFrame()
 
@@ -4139,14 +4227,119 @@ def forward_performance_table(
             if exit_bench not in (None, 0) and entry_bench not in (None, 0)
             else None
         )
+        excess_return = stock_return - bench_return if stock_return is not None and bench_return is not None else None
         rows.append({
             "Horizont": f"{months} Monate",
             "Aktienrendite": stock_return,
             "Benchmark": bench_return,
-            "Überrendite": stock_return - bench_return if stock_return is not None and bench_return is not None else None,
+            "Überrendite": excess_return,
+            "Positiv": stock_return is not None and stock_return > 0,
+            "Benchmark geschlagen": excess_return is not None and excess_return > 0,
             "Daten verfügbar": exit_stock is not None,
         })
     return pd.DataFrame(rows)
+
+
+def historical_signal_candidates(
+    ticker: str,
+    history: pd.DataFrame,
+    dividends: pd.DataFrame,
+    financials: pd.DataFrame,
+    benchmark: pd.DataFrame,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    info_lag_days: int,
+) -> pd.DataFrame:
+    """Berechnet alle monatlichen Deep-Value-Momentaufnahmen einmalig.
+
+    Die spätere Schwellen- und Cooldown-Auswahl wird separat angewendet. Dadurch
+    können mehrere Score-Schwellen verglichen werden, ohne die Historie mehrfach
+    vollständig zu berechnen.
+    """
+    if history is None or history.empty:
+        return pd.DataFrame()
+
+    dates = pd.date_range(pd.Timestamp(start_date), pd.Timestamp(end_date), freq="ME")
+    rows: list[dict[str, Any]] = []
+    for date_value in dates:
+        snapshot = historical_bat_snapshot(
+            ticker=ticker,
+            as_of=date_value,
+            history=history,
+            dividends=dividends,
+            financials=financials,
+            info_lag_days=info_lag_days,
+            negative_news_shock=False,
+            special_effect_suspected=False,
+        )
+        if snapshot.get("error"):
+            continue
+
+        signal_date = pd.Timestamp(snapshot["price_date"])
+        forward = forward_performance_table(history, benchmark, signal_date, use_adjusted=True)
+        horizon_values: dict[str, Any] = {}
+        for months in (3, 6, 12, 24):
+            horizon = forward[forward["Horizont"] == f"{months} Monate"] if not forward.empty else pd.DataFrame()
+            horizon_values[f"Rendite {months}M"] = safe_float(horizon["Aktienrendite"].iloc[0]) if not horizon.empty else None
+            horizon_values[f"Benchmark {months}M"] = safe_float(horizon["Benchmark"].iloc[0]) if not horizon.empty else None
+            horizon_values[f"Überrendite {months}M"] = safe_float(horizon["Überrendite"].iloc[0]) if not horizon.empty else None
+            horizon_values[f"Benchmark geschlagen {months}M"] = bool(horizon["Benchmark geschlagen"].iloc[0]) if not horizon.empty else False
+
+        trap = _future_value_trap_metrics(
+            history=history,
+            dividends=dividends,
+            financials=financials,
+            entry_date=signal_date,
+            info_lag_days=info_lag_days,
+            use_adjusted=True,
+        )
+        row = {
+            "Signal-Datum": signal_date,
+            "Deep-Value-Score": safe_float(snapshot.get("bat_pattern_score")) or 0.0,
+            "Kurs": snapshot.get("price"),
+            "Dividendenrendite": snapshot.get("dividend_yield"),
+            "Drawdown": snapshot.get("deepest_drawdown_3_5y_pct"),
+            "FCF/Dividende": snapshot.get("cashflow_dividend_coverage"),
+            "Net Debt/EBITDA": snapshot.get("net_debt_ebitda"),
+            "Max. Rückgang 12M": trap.get("max_decline_12m"),
+            "Dividendenänderung 12M": trap.get("dividend_change_12m"),
+            "Cashflow nach 12M positiv": trap.get("future_cashflow_positive"),
+            "Value Trap": bool(trap.get("value_trap")),
+            "Value-Trap-Grund": trap.get("value_trap_reason", ""),
+            "Score-Erklärung": _component_summary(snapshot),
+            **horizon_values,
+        }
+        row["Positiv nach 12M"] = row.get("Rendite 12M") is not None and float(row["Rendite 12M"]) > 0
+        row["Benchmark geschlagen 12M"] = row.get("Überrendite 12M") is not None and float(row["Überrendite 12M"]) > 0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def filter_historical_signals(
+    candidates: pd.DataFrame,
+    threshold: float,
+    cooldown_months: int,
+) -> pd.DataFrame:
+    """Wendet Score-Schwelle und Mindestabstand auf vorberechnete Kandidaten an."""
+    if candidates is None or candidates.empty:
+        return pd.DataFrame()
+    frame = candidates.copy()
+    frame["Signal-Datum"] = pd.to_datetime(frame["Signal-Datum"], errors="coerce")
+    frame["Deep-Value-Score"] = pd.to_numeric(frame["Deep-Value-Score"], errors="coerce")
+    frame = frame.dropna(subset=["Signal-Datum", "Deep-Value-Score"])
+    frame = frame[frame["Deep-Value-Score"] >= float(threshold)].sort_values("Signal-Datum")
+    if frame.empty:
+        return frame.reset_index(drop=True)
+
+    selected_indices: list[Any] = []
+    last_signal: Optional[pd.Timestamp] = None
+    for idx, row in frame.iterrows():
+        current = pd.Timestamp(row["Signal-Datum"])
+        if last_signal is not None and current < last_signal + pd.DateOffset(months=int(cooldown_months)):
+            continue
+        selected_indices.append(idx)
+        last_signal = current
+    return frame.loc[selected_indices].reset_index(drop=True)
 
 
 def historical_signal_backtest(
@@ -4161,49 +4354,116 @@ def historical_signal_backtest(
     info_lag_days: int,
     cooldown_months: int,
 ) -> pd.DataFrame:
-    """Testet das quantitative BAT-Muster monatlich; News/Sondereffekte bleiben außen vor."""
-    if history is None or history.empty:
-        return pd.DataFrame()
-    dates = pd.date_range(pd.Timestamp(start_date), pd.Timestamp(end_date), freq="ME")
+    """Kompatibilitäts-Wrapper für einen einzelnen Schwellenwert."""
+    candidates = historical_signal_candidates(
+        ticker=ticker,
+        history=history,
+        dividends=dividends,
+        financials=financials,
+        benchmark=benchmark,
+        start_date=start_date,
+        end_date=end_date,
+        info_lag_days=info_lag_days,
+    )
+    return filter_historical_signals(candidates, threshold, cooldown_months)
+
+
+def backtest_threshold_summary(results: dict[float, pd.DataFrame]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    last_signal: Optional[pd.Timestamp] = None
-    for date_value in dates:
-        snapshot = historical_bat_snapshot(
-            ticker=ticker,
-            as_of=date_value,
-            history=history,
-            dividends=dividends,
-            financials=financials,
-            info_lag_days=info_lag_days,
-            negative_news_shock=False,
-            special_effect_suspected=False,
-        )
-        if snapshot.get("error"):
-            continue
-        score = safe_float(snapshot.get("bat_pattern_score")) or 0.0
-        if score < threshold:
-            continue
-        if last_signal is not None and date_value < last_signal + pd.DateOffset(months=int(cooldown_months)):
-            continue
-        forward = forward_performance_table(history, benchmark, pd.Timestamp(snapshot["price_date"]), use_adjusted=True)
-        twelve = forward[forward["Horizont"] == "12 Monate"] if not forward.empty else pd.DataFrame()
-        stock_return = safe_float(twelve["Aktienrendite"].iloc[0]) if not twelve.empty else None
-        benchmark_return = safe_float(twelve["Benchmark"].iloc[0]) if not twelve.empty else None
+    for threshold in sorted(results):
+        frame = results[threshold]
+        valid = frame.dropna(subset=["Rendite 12M"]) if isinstance(frame, pd.DataFrame) and not frame.empty else pd.DataFrame()
         rows.append({
-            "Signal-Datum": pd.Timestamp(snapshot["price_date"]),
-            "BAT-Score": score,
-            "Kurs": snapshot.get("price"),
-            "Dividendenrendite": snapshot.get("dividend_yield"),
-            "Drawdown": snapshot.get("deepest_drawdown_3_5y_pct"),
-            "FCF/Dividende": snapshot.get("cashflow_dividend_coverage"),
-            "Net Debt/EBITDA": snapshot.get("net_debt_ebitda"),
-            "Rendite 12M": stock_return,
-            "Benchmark 12M": benchmark_return,
-            "Überrendite 12M": stock_return - benchmark_return if stock_return is not None and benchmark_return is not None else None,
-            "Positiv nach 12M": stock_return is not None and stock_return > 0,
+            "Schwelle": float(threshold),
+            "Signale": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+            "Mit 12M-Daten": len(valid),
+            "Positive Treffer 12M": float(valid["Positiv nach 12M"].mean() * 100) if not valid.empty else None,
+            "Benchmark geschlagen 12M": float(valid["Benchmark geschlagen 12M"].mean() * 100) if not valid.empty else None,
+            "Value-Trap-Quote": float(valid["Value Trap"].mean() * 100) if not valid.empty else None,
+            "Ø Rendite 12M": safe_float(valid["Rendite 12M"].mean()) if not valid.empty else None,
+            "Ø Überrendite 12M": safe_float(valid["Überrendite 12M"].mean()) if not valid.empty else None,
         })
-        last_signal = date_value
     return pd.DataFrame(rows)
+
+
+def model_signal_equity_curve(signals: pd.DataFrame) -> pd.DataFrame:
+    """Erzeugt eine transparente, modellhafte Kurve aus sequenziellen 12M-Ergebnissen.
+
+    Jeder Signal-Ausgang wird nacheinander auf einen Startwert von 100 angewendet.
+    Das ist keine kalendergenaue Portfoliosimulation und wird im UI entsprechend
+    gekennzeichnet.
+    """
+    if signals is None or signals.empty:
+        return pd.DataFrame()
+    valid = signals.dropna(subset=["Rendite 12M"]).sort_values("Signal-Datum").copy()
+    if valid.empty:
+        return pd.DataFrame()
+    strategy = 100.0
+    benchmark_value = 100.0
+    rows = [{"Signal": 0, "Datum": None, "Deep-Value-Strategie": strategy, "Benchmark": benchmark_value}]
+    for number, (_, row) in enumerate(valid.iterrows(), start=1):
+        strategy *= 1 + float(row["Rendite 12M"]) / 100
+        benchmark_return = safe_float(row.get("Benchmark 12M"))
+        if benchmark_return is not None:
+            benchmark_value *= 1 + benchmark_return / 100
+        rows.append({
+            "Signal": number,
+            "Datum": pd.Timestamp(row["Signal-Datum"]),
+            "Deep-Value-Strategie": strategy,
+            "Benchmark": benchmark_value,
+        })
+    return pd.DataFrame(rows)
+
+
+def persist_backtest_run(
+    ticker: str,
+    company_name: str,
+    benchmark_label: str,
+    benchmark_ticker: str,
+    start_date: Any,
+    end_date: Any,
+    threshold: float,
+    cooldown_months: int,
+    result: pd.DataFrame,
+) -> tuple[bool, str]:
+    if result is None or result.empty:
+        return False, "Es gibt keine Backtest-Ergebnisse zum Speichern."
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_ticker = re.sub(r"[^A-Za-z0-9_-]+", "_", clean_ticker(ticker))
+    detail_path = BACKTEST_DIR / f"{safe_ticker}_threshold_{int(threshold)}_{stamp}.csv"
+    success, message = safe_write_csv(result, detail_path)
+
+    valid = result.dropna(subset=["Rendite 12M"])
+    registry_row = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "ticker_yahoo": clean_ticker(ticker),
+        "company_name": company_name,
+        "benchmark_label": benchmark_label,
+        "benchmark_ticker": benchmark_ticker,
+        "start_date": pd.Timestamp(start_date).date().isoformat(),
+        "end_date": pd.Timestamp(end_date).date().isoformat(),
+        "threshold": float(threshold),
+        "cooldown_months": int(cooldown_months),
+        "signals": len(result),
+        "signals_with_12m": len(valid),
+        "positive_hit_rate_12m": float(valid["Positiv nach 12M"].mean() * 100) if not valid.empty else None,
+        "benchmark_hit_rate_12m": float(valid["Benchmark geschlagen 12M"].mean() * 100) if not valid.empty else None,
+        "value_trap_rate": float(valid["Value Trap"].mean() * 100) if not valid.empty else None,
+        "average_return_12m": safe_float(valid["Rendite 12M"].mean()) if not valid.empty else None,
+        "average_excess_return_12m": safe_float(valid["Überrendite 12M"].mean()) if not valid.empty else None,
+        "detail_file": detail_path.name,
+    }
+    registry = pd.DataFrame(columns=list(registry_row))
+    if BACKTEST_RUNS_PATH.exists():
+        try:
+            registry = pd.read_csv(BACKTEST_RUNS_PATH)
+        except Exception:
+            registry = pd.DataFrame(columns=list(registry_row))
+    updated = pd.concat([registry, pd.DataFrame([registry_row])], ignore_index=True)
+    registry_success, registry_message = safe_write_csv(updated, BACKTEST_RUNS_PATH)
+    if success and registry_success:
+        return True, f"Backtest wurde unter data/backtests/{detail_path.name} gespeichert."
+    return False, message or registry_message
 
 
 def _save_research_case(record: dict[str, Any]) -> tuple[bool, str]:
@@ -4224,25 +4484,31 @@ def _save_research_case(record: dict[str, Any]) -> tuple[bool, str]:
     return safe_write_csv(updated, RESEARCH_CASES_PATH)
 
 
+
 def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
-    st.subheader("BAT-/Deep-Value-Backtesting")
+    st.subheader("Historisches Deep-Value-Backtesting")
     st.caption(
-        "Prüft, ob ein BAT-ähnliches Muster an einem historischen Stichtag sichtbar gewesen wäre. "
-        "Historische Preise und Dividenden sind real; Jahresabschlüsse werden mit einem konservativen "
-        "Veröffentlichungsverzug angenähert. Yahoo ist keine garantierte Point-in-Time-Datenbank."
+        "Prüft, ob ein BAT-ähnliches Deep-Value-Muster an einem historischen Stichtag "
+        "sichtbar gewesen wäre. Preise und Dividenden sind historisch; Jahresabschlüsse "
+        "werden mit einem konservativen Veröffentlichungsverzug angenähert."
     )
 
     with st.expander("Was dieser Backtest kann – und was nicht", expanded=False):
         st.markdown(
             """
-            **Enthalten:** historischer Kurs, 3J-/5J-Drawdown, damalige Ausschüttungen, verfügbare
-            Jahres-Cashflows, FCF-Dividendendeckung, Verschuldung und spätere 3/6/12/24-Monatsrenditen.
+            **Enthalten:** historischer Kurs, 3J-/5J-Drawdown, damalige Ausschüttungen,
+            verfügbare Jahres-Cashflows, FCF-Dividendendeckung, Verschuldung sowie spätere
+            3/6/12/24-Monatsrenditen und Benchmarkvergleiche.
 
-            **Manuell:** Einmalige Abschreibungen und damalige negative Nachrichten müssen bestätigt
-            werden, weil RSS-Feeds kein belastbares Archiv darstellen.
+            **Nachträgliche Value-Trap-Prüfung:** weiterer Kursrückgang von mindestens 30 %,
+            deutliche Dividendenkürzung oder später negativer Cashflow. Diese Informationen
+            fließen nicht in den damaligen Score ein, sondern bewerten nur das Ergebnis.
 
-            **Nicht enthalten:** Steuern, Gebühren, exakte Veröffentlichungszeitpunkte jedes Berichts,
-            historische Analystenschätzungen und eine rechtssichere Total-Return-Berechnung.
+            **Manuell in der Fallstudie:** einmalige Abschreibungen und damalige negative
+            Nachrichten müssen bestätigt werden, weil RSS-Feeds kein belastbares Archiv sind.
+
+            **Nicht enthalten:** Steuern, Gebühren, exakte Point-in-Time-Veröffentlichungsdaten,
+            historische Analystenschätzungen und eine kalendergenaue Portfoliosimulation.
             """
         )
 
@@ -4263,14 +4529,25 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     if source_mode == "Aus geladenem Index":
         ticker = company_selectbox("Unternehmen", df, key="backtest_index_ticker")
     else:
-        if "backtest_custom_ticker" not in st.session_state:
-            st.session_state["backtest_custom_ticker"] = "BATS.L"
+        st.session_state.setdefault("backtest_custom_ticker", "BATS.L")
         ticker = clean_ticker(st.text_input("Yahoo-Ticker", key="backtest_custom_ticker"))
         st.caption("Beispiele: BATS.L (London), BTI (US-ADR), ALV.DE oder MSFT.")
 
     if not ticker:
         st.info("Bitte einen gültigen Yahoo-Ticker eingeben.")
         return
+
+    company_name = ticker
+    if df is not None and not df.empty and {"ticker_yahoo", "name"}.issubset(df.columns):
+        match = df[df["ticker_yahoo"].astype(str) == ticker]
+        if not match.empty:
+            company_name = str(match.iloc[0].get("name") or ticker)
+    if company_name == ticker:
+        try:
+            ticker_info = fetch_ticker_info(ticker)
+            company_name = str(ticker_info.get("longName") or ticker_info.get("shortName") or ticker)
+        except Exception:
+            company_name = ticker
 
     benchmark_choices = {
         f"Aktueller Index ({index_name})": benchmark_for_index(index_name),
@@ -4282,14 +4559,14 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     benchmark_label = st.selectbox("Vergleichsbenchmark", list(benchmark_choices), key="backtest_benchmark_label")
     benchmark_ticker = benchmark_choices[benchmark_label]
 
-    with st.spinner(f"Lade historische Research-Daten für {ticker} …"):
+    with st.spinner(f"Lade historische Research-Daten für {company_name} ({ticker}) …"):
         history = fetch_long_history(ticker)
         dividends = fetch_dividends(ticker)
         financials = fetch_historical_financials(ticker)
         benchmark = fetch_benchmark_history(benchmark_ticker, period="max")
 
     if history.empty or "Close" not in history.columns:
-        st.error(f"Für {ticker} konnten keine historischen Kursdaten geladen werden.")
+        st.error(f"Für {company_name} ({ticker}) konnten keine historischen Kursdaten geladen werden.")
         return
 
     min_date = history.index.min().date()
@@ -4334,6 +4611,11 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
         key="backtest_special_effect",
     )
 
+    identity_cols = st.columns(3)
+    identity_cols[0].info(f"**Geprüfte Aktie**\n\n{company_name} ({ticker})")
+    identity_cols[1].info(f"**Benchmark**\n\n{benchmark_label} ({benchmark_ticker})")
+    identity_cols[2].info(f"**Historischer Stichtag**\n\n{pd.Timestamp(as_of).strftime('%d.%m.%Y')}")
+
     snapshot = historical_bat_snapshot(
         ticker=ticker,
         as_of=as_of,
@@ -4351,7 +4633,7 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     score = safe_float(snapshot.get("bat_pattern_score")) or 0.0
     trigger = bool(snapshot.get("bat_pattern_trigger"))
     score_cols = st.columns(6)
-    score_cols[0].metric("BAT-Pattern-Score", format_number(score, 1))
+    score_cols[0].metric("Deep-Value-Score", format_number(score, 1))
     score_cols[1].metric("Status", "⚠ prüfen" if trigger else "Beobachten" if score >= 55 else "kein Muster")
     score_cols[2].metric("Historischer Kurs", f"{format_number(snapshot.get('price'), 2)} {snapshot.get('currency', '–')}")
     score_cols[3].metric("Dividendenrendite", format_percent(snapshot.get("dividend_yield"), 2))
@@ -4361,10 +4643,11 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     if trigger:
         st.warning(
             "Sondersituation erkannt: hohe Rendite + starker Drawdown + positiver Cashflow. "
-            "Das ist ein Research-Hinweis, kein Kaufsignal. Prüfe Geschäftsmodell, Cashflow-Normalisierung und Risiken."
+            "Das ist ein Research-Hinweis, kein Kaufsignal. Prüfe Geschäftsmodell, "
+            "Cashflow-Normalisierung und Risiken."
         )
     elif score >= 55:
-        st.info("Mehrere BAT-Merkmale sind vorhanden, aber der strenge historische Trigger ist noch nicht vollständig erfüllt.")
+        st.info("Mehrere Deep-Value-Merkmale sind vorhanden, aber der strenge Trigger ist noch nicht vollständig erfüllt.")
 
     st.markdown("#### Score-Bausteine am Stichtag")
     component_table = snapshot.get("components", pd.DataFrame())
@@ -4419,10 +4702,10 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
         st.altair_chart((line + marker).properties(height=330, title="Kursentwicklung rund um den historischen Stichtag"), use_container_width=True)
 
     st.divider()
-    st.markdown("### Quantitative Signalprüfung über die Historie")
+    st.markdown(f"### Quantitative Deep-Value-Prüfung für {company_name} ({ticker})")
     st.caption(
         "Testet den Score an Monatsenden ohne manuelle News- und Sondereffekt-Punkte. "
-        "Dadurch ist die Prüfung reproduzierbar, aber konservativer als die Fallstudie."
+        "Mehrere Schwellenwerte können mit identischen historischen Momentaufnahmen verglichen werden."
     )
     earliest_backtest = max(pd.Timestamp(history.index.min()), pd.Timestamp(history.index.max()) - pd.DateOffset(years=10))
     latest_backtest = pd.Timestamp(history.index.max()) - pd.DateOffset(months=12)
@@ -4443,69 +4726,232 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     st.session_state["historical_bt_end"] = stored_bt_end
     st.session_state.setdefault("historical_bt_threshold", 65)
     st.session_state.setdefault("historical_bt_cooldown", 6)
+    st.session_state.setdefault("historical_bt_compare_thresholds", [55, 65, 75])
 
     bt_cols = st.columns(4)
     bt_start = bt_cols[0].date_input("Start", min_value=min_date, max_value=max_date, key="historical_bt_start")
     bt_end = bt_cols[1].date_input("Ende", min_value=min_date, max_value=max_date, key="historical_bt_end")
-    threshold = bt_cols[2].slider("Score-Schwelle", 45, 85, step=5, key="historical_bt_threshold")
-    cooldown = bt_cols[3].slider("Mindestabstand Signale", 1, 24, step=1, key="historical_bt_cooldown", help="Verhindert, dass derselbe lange Drawdown jeden Monat als neuer Treffer gezählt wird.")
+    primary_threshold = bt_cols[2].slider("Haupt-Schwelle", 45, 85, step=5, key="historical_bt_threshold")
+    cooldown = bt_cols[3].slider(
+        "Mindestabstand Signale", 1, 24, step=1, key="historical_bt_cooldown",
+        help="Verhindert, dass derselbe lange Drawdown jeden Monat als neuer Treffer gezählt wird.",
+    )
+    compare_thresholds = st.multiselect(
+        "Zusätzliche Score-Schwellen vergleichen",
+        options=list(range(45, 90, 5)),
+        key="historical_bt_compare_thresholds",
+        help="Die Haupt-Schwelle wird automatisch ergänzt, auch wenn sie hier nicht ausgewählt ist.",
+    )
 
-    if st.button("Historischen BAT-Score testen", type="primary", key="run_historical_bat_backtest"):
-        with st.spinner("Berechne historische Monats-Signale …"):
-            result = historical_signal_backtest(
-                ticker=ticker,
-                history=history,
-                dividends=dividends,
-                financials=financials,
-                benchmark=benchmark,
-                start_date=pd.Timestamp(bt_start),
-                end_date=pd.Timestamp(bt_end),
-                threshold=float(threshold),
-                info_lag_days=int(lag_days),
-                cooldown_months=int(cooldown),
-            )
-        st.session_state[f"historical_bat_result_{ticker}"] = result
+    run_key = f"deep_value_backtest_bundle_{ticker}_{benchmark_ticker}"
+    if st.button(f"Historischen Deep-Value-Score für {ticker} testen", type="primary", key="run_historical_bat_backtest"):
+        if pd.Timestamp(bt_start) > pd.Timestamp(bt_end):
+            st.error("Das Startdatum muss vor dem Enddatum liegen.")
+        else:
+            with st.spinner("Berechne historische Monats-Momentaufnahmen und Folgerenditen …"):
+                candidates = historical_signal_candidates(
+                    ticker=ticker,
+                    history=history,
+                    dividends=dividends,
+                    financials=financials,
+                    benchmark=benchmark,
+                    start_date=pd.Timestamp(bt_start),
+                    end_date=pd.Timestamp(bt_end),
+                    info_lag_days=int(lag_days),
+                )
+                thresholds = sorted({float(primary_threshold), *[float(v) for v in compare_thresholds]})
+                results = {
+                    threshold: filter_historical_signals(candidates, threshold, int(cooldown))
+                    for threshold in thresholds
+                }
+            st.session_state[run_key] = {
+                "results": results,
+                "candidates": candidates,
+                "start": pd.Timestamp(bt_start),
+                "end": pd.Timestamp(bt_end),
+                "cooldown": int(cooldown),
+                "benchmark_label": benchmark_label,
+                "benchmark_ticker": benchmark_ticker,
+            }
 
-    backtest_result = st.session_state.get(f"historical_bat_result_{ticker}", pd.DataFrame())
-    if isinstance(backtest_result, pd.DataFrame) and not backtest_result.empty:
-        valid_12m = backtest_result.dropna(subset=["Rendite 12M"])
-        stats = st.columns(5)
-        stats[0].metric("Signale", len(backtest_result))
-        stats[1].metric("Mit 12M-Daten", len(valid_12m))
-        hit_rate = float(valid_12m["Positiv nach 12M"].mean() * 100) if not valid_12m.empty else None
-        stats[2].metric("Positive 12M-Treffer", format_percent(hit_rate, 1))
-        stats[3].metric("Ø Rendite 12M", format_percent(valid_12m["Rendite 12M"].mean() if not valid_12m.empty else None, 2, signed=True))
-        stats[4].metric("Ø Überrendite 12M", format_percent(valid_12m["Überrendite 12M"].mean() if not valid_12m.empty else None, 2, signed=True))
+    bundle = st.session_state.get(run_key)
+    if isinstance(bundle, dict) and isinstance(bundle.get("results"), dict):
+        results: dict[float, pd.DataFrame] = bundle["results"]
+        summary = backtest_threshold_summary(results)
 
-        display_result = backtest_result.copy()
-        display_result["Signal-Datum"] = pd.to_datetime(display_result["Signal-Datum"], errors="coerce").dt.strftime("%d.%m.%Y")
+        tested_info = st.columns(3)
+        tested_info[0].success(f"**Geprüfte Aktie:** {company_name} ({ticker})")
+        tested_info[1].success(f"**Benchmark:** {bundle.get('benchmark_label')} ({bundle.get('benchmark_ticker')})")
+        tested_info[2].success(
+            f"**Zeitraum:** {pd.Timestamp(bundle.get('start')).strftime('%d.%m.%Y')} – "
+            f"{pd.Timestamp(bundle.get('end')).strftime('%d.%m.%Y')}"
+        )
+
+        st.markdown("#### Schwellenvergleich")
         st.dataframe(
-            display_result.style.format(
+            summary.style.format(
                 {
-                    "BAT-Score": "{:.1f}",
-                    "Kurs": "{:.2f}",
-                    "Dividendenrendite": lambda value: format_percent(value, 2),
-                    "Drawdown": lambda value: format_percent(value, 1, signed=True),
-                    "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
-                    "Net Debt/EBITDA": lambda value: f"{format_number(value, 2)}x",
-                    "Rendite 12M": lambda value: format_percent(value, 2, signed=True),
-                    "Benchmark 12M": lambda value: format_percent(value, 2, signed=True),
-                    "Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
+                    "Schwelle": "{:.0f}",
+                    "Positive Treffer 12M": lambda value: format_percent(value, 1),
+                    "Benchmark geschlagen 12M": lambda value: format_percent(value, 1),
+                    "Value-Trap-Quote": lambda value: format_percent(value, 1),
+                    "Ø Rendite 12M": lambda value: format_percent(value, 2, signed=True),
+                    "Ø Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
                 },
                 na_rep="–",
-            ).map(colorize_change, subset=["Rendite 12M", "Überrendite 12M"]),
+            ).map(colorize_change, subset=["Ø Rendite 12M", "Ø Überrendite 12M"]),
             use_container_width=True,
             hide_index=True,
         )
-        st.download_button(
-            "Backtest als CSV herunterladen",
-            data=backtest_result.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"bat_backtest_{ticker.replace('.', '_')}.csv",
-            mime="text/csv",
-            key="download_bat_backtest",
+
+        thresholds_available = sorted(results)
+        detail_default = float(primary_threshold) if float(primary_threshold) in thresholds_available else thresholds_available[0]
+        stored_detail_threshold = st.session_state.get("historical_bt_detail_threshold")
+        if stored_detail_threshold not in thresholds_available:
+            st.session_state.pop("historical_bt_detail_threshold", None)
+        detail_threshold = st.selectbox(
+            "Detailansicht für Score-Schwelle",
+            options=thresholds_available,
+            index=thresholds_available.index(detail_default),
+            format_func=lambda value: f"Score ab {value:.0f}",
+            key="historical_bt_detail_threshold",
         )
-    elif isinstance(backtest_result, pd.DataFrame):
-        st.info("Noch kein Signal gefunden oder Backtest noch nicht gestartet.")
+        backtest_result = results[detail_threshold]
+
+        if isinstance(backtest_result, pd.DataFrame) and not backtest_result.empty:
+            valid_12m = backtest_result.dropna(subset=["Rendite 12M"])
+            stats = st.columns(6)
+            stats[0].metric("Signale", len(backtest_result))
+            stats[1].metric("Mit 12M-Daten", len(valid_12m))
+            positive_rate = float(valid_12m["Positiv nach 12M"].mean() * 100) if not valid_12m.empty else None
+            benchmark_rate = float(valid_12m["Benchmark geschlagen 12M"].mean() * 100) if not valid_12m.empty else None
+            trap_rate = float(valid_12m["Value Trap"].mean() * 100) if not valid_12m.empty else None
+            stats[2].metric("Positiv nach 12M", format_percent(positive_rate, 1))
+            stats[3].metric("Benchmark geschlagen", format_percent(benchmark_rate, 1))
+            stats[4].metric("Value-Trap-Quote", format_percent(trap_rate, 1))
+            stats[5].metric("Ø Überrendite 12M", format_percent(valid_12m["Überrendite 12M"].mean() if not valid_12m.empty else None, 2, signed=True))
+
+            display_columns = [
+                "Signal-Datum", "Deep-Value-Score", "Kurs", "Dividendenrendite", "Drawdown",
+                "FCF/Dividende", "Net Debt/EBITDA",
+                "Rendite 3M", "Rendite 6M", "Rendite 12M", "Rendite 24M",
+                "Überrendite 12M", "Benchmark geschlagen 12M",
+                "Max. Rückgang 12M", "Dividendenänderung 12M", "Value Trap", "Value-Trap-Grund",
+            ]
+            display_result = backtest_result[[column for column in display_columns if column in backtest_result.columns]].copy()
+            display_result["Signal-Datum"] = pd.to_datetime(display_result["Signal-Datum"], errors="coerce").dt.strftime("%d.%m.%Y")
+            st.dataframe(
+                display_result.style.format(
+                    {
+                        "Deep-Value-Score": "{:.1f}",
+                        "Kurs": "{:.2f}",
+                        "Dividendenrendite": lambda value: format_percent(value, 2),
+                        "Drawdown": lambda value: format_percent(value, 1, signed=True),
+                        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
+                        "Net Debt/EBITDA": lambda value: f"{format_number(value, 2)}x",
+                        "Rendite 3M": lambda value: format_percent(value, 2, signed=True),
+                        "Rendite 6M": lambda value: format_percent(value, 2, signed=True),
+                        "Rendite 12M": lambda value: format_percent(value, 2, signed=True),
+                        "Rendite 24M": lambda value: format_percent(value, 2, signed=True),
+                        "Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
+                        "Max. Rückgang 12M": lambda value: format_percent(value, 1, signed=True),
+                        "Dividendenänderung 12M": lambda value: format_percent(value, 1, signed=True),
+                    },
+                    na_rep="–",
+                ).map(colorize_change, subset=["Rendite 3M", "Rendite 6M", "Rendite 12M", "Rendite 24M", "Überrendite 12M"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("#### Signal im Detail erklären")
+            signal_options = list(backtest_result.index)
+            selected_signal_index = st.selectbox(
+                "Historisches Signal",
+                options=signal_options,
+                format_func=lambda idx: (
+                    f"{pd.Timestamp(backtest_result.loc[idx, 'Signal-Datum']).strftime('%d.%m.%Y')} · "
+                    f"Score {safe_float(backtest_result.loc[idx, 'Deep-Value-Score']) or 0:.1f}"
+                ),
+                key="historical_bt_signal_explanation",
+            )
+            selected_signal = backtest_result.loc[selected_signal_index]
+            selected_snapshot = historical_bat_snapshot(
+                ticker=ticker,
+                as_of=pd.Timestamp(selected_signal["Signal-Datum"]),
+                history=history,
+                dividends=dividends,
+                financials=financials,
+                info_lag_days=int(lag_days),
+                negative_news_shock=False,
+                special_effect_suspected=False,
+            )
+            explanation_cols = st.columns(3)
+            explanation_cols[0].metric("Score", format_number(selected_signal.get("Deep-Value-Score"), 1))
+            explanation_cols[1].metric("12M-Überrendite", format_percent(selected_signal.get("Überrendite 12M"), 2, signed=True))
+            explanation_cols[2].metric("Nachträgliche Einordnung", "Value Trap" if bool(selected_signal.get("Value Trap")) else "kein Trap-Signal")
+            if bool(selected_signal.get("Value Trap")):
+                st.warning(str(selected_signal.get("Value-Trap-Grund") or "Nachträgliches Value-Trap-Kriterium erfüllt."))
+            components = selected_snapshot.get("components", pd.DataFrame())
+            if isinstance(components, pd.DataFrame) and not components.empty:
+                st.dataframe(components, use_container_width=True, hide_index=True)
+
+            equity = model_signal_equity_curve(backtest_result)
+            if not equity.empty:
+                st.markdown("#### Modellhafte Signal-Kurve")
+                st.caption(
+                    "Startwert 100; jedes historische Signal wird nacheinander mit seiner 12M-Rendite verknüpft. "
+                    "Die Darstellung ist ein Schwellenvergleich und keine kalendergenaue Portfoliosimulation."
+                )
+                equity_long = equity.melt(
+                    id_vars=["Signal", "Datum"],
+                    value_vars=["Deep-Value-Strategie", "Benchmark"],
+                    var_name="Reihe",
+                    value_name="Indexwert",
+                )
+                equity_chart = alt.Chart(equity_long).mark_line(point=True).encode(
+                    x=alt.X("Signal:Q", title="Abgeschlossenes 12M-Signal"),
+                    y=alt.Y("Indexwert:Q", title="Modellhafter Indexwert", scale=alt.Scale(zero=False)),
+                    color=alt.Color("Reihe:N", title=None),
+                    tooltip=["Reihe:N", "Signal:Q", alt.Tooltip("Indexwert:Q", format=".2f")],
+                ).properties(height=320)
+                st.altair_chart(equity_chart, use_container_width=True)
+
+            action_cols = st.columns(2)
+            action_cols[0].download_button(
+                "Backtest als CSV herunterladen",
+                data=backtest_result.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"deep_value_backtest_{ticker.replace('.', '_')}_{int(detail_threshold)}.csv",
+                mime="text/csv",
+                key="download_bat_backtest",
+            )
+            if action_cols[1].button("Backtest dauerhaft speichern", key="persist_deep_value_backtest"):
+                success, message = persist_backtest_run(
+                    ticker=ticker,
+                    company_name=company_name,
+                    benchmark_label=benchmark_label,
+                    benchmark_ticker=benchmark_ticker,
+                    start_date=bundle.get("start"),
+                    end_date=bundle.get("end"),
+                    threshold=float(detail_threshold),
+                    cooldown_months=int(bundle.get("cooldown", cooldown)),
+                    result=backtest_result,
+                )
+                if success:
+                    st.success(message)
+                else:
+                    st.warning(message)
+        else:
+            st.info(f"Für Score ab {detail_threshold:.0f} wurden im gewählten Zeitraum keine Signale gefunden.")
+    else:
+        st.info("Starte die quantitative Prüfung, um Schwellenwerte, Trefferquoten und Value Traps zu vergleichen.")
+
+    if BACKTEST_RUNS_PATH.exists():
+        with st.expander("Gespeicherte Backtest-Läufe", expanded=False):
+            try:
+                saved_runs = pd.read_csv(BACKTEST_RUNS_PATH)
+                st.dataframe(saved_runs.sort_values("saved_at", ascending=False), use_container_width=True, hide_index=True)
+            except Exception as error:
+                st.warning(f"Gespeicherte Backtests konnten nicht gelesen werden: {error}")
 
     st.divider()
     st.markdown("### Fall im eigenen Lernjournal speichern")
