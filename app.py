@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.5"
+APP_VERSION = "4.6"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4764,11 +4764,21 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
 
     active_sentiment_filter = render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
 
-    tab_news, tab_calendar, tab_sources, tab_export = st.tabs([
-        "Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"
-    ])
+    # Auch die Unternavigation des News-Bereichs bleibt bei Reruns erhalten.
+    news_views = ["Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"]
+    if st.session_state.get("news_navigation") not in news_views:
+        st.session_state["news_navigation"] = news_views[0]
 
-    with tab_news:
+    active_news_view = st.radio(
+        "News-Bereich auswählen",
+        options=news_views,
+        horizontal=True,
+        key="news_navigation",
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if active_news_view == "Aktuelle News":
         filtered_relevant_news = relevant_news.copy()
         if active_sentiment_filter != "alle" and not filtered_relevant_news.empty:
             filtered_relevant_news = filtered_relevant_news[
@@ -4817,11 +4827,11 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
                 for index, (_, item) in enumerate(uncertain_news.iterrows(), start=1000):
                     render_news_card(item, index)
 
-    with tab_calendar:
+    elif active_news_view == "Kalender":
         st.caption("Der Kalender enthält Yahoo-Dividenden-/Kalenderdaten sowie nur konkret klassifizierte, relevante Nachrichten.")
         render_event_calendar(events)
 
-    with tab_sources:
+    elif active_news_view == "Quellen & Diagnose":
         st.caption("Dieser Bereich ist für technische Prüfung gedacht. Fehlerhafte oder eingeschränkte Quellen beeinflussen die News-Abdeckung.")
         if diagnostics.empty:
             st.info("Keine Quelle wurde abgefragt.")
@@ -4836,7 +4846,7 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
             if not failed.empty:
                 st.warning("Mindestens eine Quelle war nicht erreichbar oder lieferte keinen brauchbaren Feed. Das ist ein Quellenproblem, kein Handelssignal.")
 
-    with tab_export:
+    elif active_news_view == "Export":
         st.caption("CSV-Export enthält relevante und unsichere Treffer samt Relevanzbegründung.")
         st.download_button(
             "Alle News als CSV herunterladen",
@@ -5144,27 +5154,41 @@ def main() -> None:
         f"({coverage_label} Abdeckung) · Profil: {profile_name} · Portfolio-Basiswährung: {BASE_CURRENCY}"
     )
 
-    tabs = st.tabs([
+    # Persistente Hauptnavigation: Anders als st.tabs bleibt diese Auswahl bei jedem
+    # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
+    main_pages = [
         "Überblick", "Datenstatus", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
         "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Research",
-    ])
-    with tabs[0]:
+    ]
+    if st.session_state.get("main_navigation") not in main_pages:
+        st.session_state["main_navigation"] = main_pages[0]
+
+    active_page = st.radio(
+        "Bereich auswählen",
+        options=main_pages,
+        horizontal=True,
+        key="main_navigation",
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if active_page == "Überblick":
         render_overview(data)
-    with tabs[1]:
+    elif active_page == "Datenstatus":
         render_data_status(status_summary, status_detail, data)
-    with tabs[2]:
+    elif active_page == "Fundamentaldaten":
         render_fundamentals(data)
-    with tabs[3]:
+    elif active_page == "Einzelanalyse":
         render_risk_and_chart(data, histories)
-    with tabs[4]:
+    elif active_page == "Sektoren":
         render_sector_view(data, histories)
-    with tabs[5]:
+    elif active_page == "News & Events":
         render_news(data)
-    with tabs[6]:
+    elif active_page == "Portfolio":
         render_portfolio(data, histories)
-    with tabs[7]:
+    elif active_page == "Watchlist":
         render_watchlist(data)
-    with tabs[8]:
+    elif active_page == "Value-Scanner":
         render_value_watchlist(
             data,
             drawdown_trigger=float(drawdown_trigger),
@@ -5173,9 +5197,9 @@ def main() -> None:
             yield_min=float(yield_min),
             profile_name=profile_name,
         )
-    with tabs[9]:
+    elif active_page == "Deep Value":
         render_special_situation_scanner(data)
-    with tabs[10]:
+    elif active_page == "Research":
         render_research(data, histories, index_name)
 
 
