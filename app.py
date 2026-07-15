@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.0.2"
+APP_VERSION = "5.0.3"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4415,6 +4415,218 @@ def model_signal_equity_curve(signals: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def deep_value_snapshot_coverage(snapshot: dict[str, Any]) -> tuple[int, int, float]:
+    """Bewertet, wie viele zentrale Deep-Value-Bausteine für eine Momentaufnahme vorliegen."""
+    available = [
+        safe_float(snapshot.get("dividend_yield")) is not None,
+        safe_float(snapshot.get("deepest_drawdown_3_5y_pct")) is not None,
+        safe_float(snapshot.get("free_cashflow")) is not None
+        or safe_float(snapshot.get("operating_cashflow")) is not None,
+        safe_float(snapshot.get("cashflow_dividend_coverage")) is not None,
+        safe_float(snapshot.get("net_debt_ebitda")) is not None,
+        safe_float(snapshot.get("pe_approx")) is not None
+        or safe_float(snapshot.get("diluted_eps")) is not None,
+    ]
+    count = sum(bool(value) for value in available)
+    total = len(available)
+    return count, total, round(count / total * 100.0, 1) if total else 0.0
+
+
+def expectation_evidence_label(sample_size: int) -> tuple[str, str]:
+    """Ordnet die statistische Aussagekraft anhand unabhängiger 12M-Fälle ein."""
+    if sample_size <= 2:
+        return "sehr gering", "Nur sehr wenige historische Fälle – keine belastbare Statistik."
+    if sample_size <= 5:
+        return "gering", "Die Stichprobe ist klein; einzelne Ausreißer prägen das Ergebnis stark."
+    if sample_size <= 14:
+        return "mittel", "Mehrere Vergleichsfälle sind vorhanden, die Streuung bleibt aber wichtig."
+    return "höher", "Die Stichprobe ist größer, bleibt aber eine historische Orientierung und keine Prognose."
+
+
+def _cooldown_sample(frame: pd.DataFrame, cooldown_months: int) -> pd.DataFrame:
+    """Reduziert monatliche Kandidaten auf zeitlich getrennte Vergleichsfälle."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    sample = frame.copy()
+    sample["Signal-Datum"] = pd.to_datetime(sample["Signal-Datum"], errors="coerce")
+    sample = sample.dropna(subset=["Signal-Datum"]).sort_values("Signal-Datum")
+    selected: list[Any] = []
+    last_date: Optional[pd.Timestamp] = None
+    for idx, row in sample.iterrows():
+        current = pd.Timestamp(row["Signal-Datum"])
+        if last_date is not None and current < last_date + pd.DateOffset(months=int(cooldown_months)):
+            continue
+        selected.append(idx)
+        last_date = current
+    return sample.loc[selected].reset_index(drop=True)
+
+
+def historical_expectation_for_current_score(
+    candidates: pd.DataFrame,
+    current_score: float,
+    score_band: float = 10.0,
+    cooldown_months: int = 12,
+) -> dict[str, Any]:
+    """Leitet historische 12M-Bandbreiten für ein heutiges Deep-Value-Setup ab.
+
+    Zuerst werden Fälle innerhalb eines Score-Bands um den heutigen Score gesucht.
+    Bei weniger als drei Fällen wird die Auswahl konservativ erweitert. Alle Fälle
+    werden zeitlich ausgedünnt, damit dieselbe lange Krise nicht monatlich mehrfach
+    als unabhängige Beobachtung zählt.
+    """
+    result: dict[str, Any] = {
+        "sample": pd.DataFrame(),
+        "valid": pd.DataFrame(),
+        "expanded": False,
+        "selection_text": "",
+    }
+    if candidates is None or candidates.empty:
+        return result
+
+    frame = candidates.copy()
+    frame["Deep-Value-Score"] = pd.to_numeric(frame.get("Deep-Value-Score"), errors="coerce")
+    frame["Signal-Datum"] = pd.to_datetime(frame.get("Signal-Datum"), errors="coerce")
+    frame = frame.dropna(subset=["Deep-Value-Score", "Signal-Datum"])
+    if frame.empty:
+        return result
+
+    lower = max(0.0, float(current_score) - float(score_band))
+    upper = min(100.0, float(current_score) + float(score_band))
+    sample = frame[frame["Deep-Value-Score"].between(lower, upper, inclusive="both")].copy()
+    selection_text = f"Score {lower:.0f} bis {upper:.0f}"
+
+    # Bei sehr kleiner Stichprobe erweitern, ohne schwache Scores beliebig einzubeziehen.
+    if len(sample) < 3:
+        expanded_lower = max(45.0, float(current_score) - max(15.0, float(score_band)))
+        sample = frame[frame["Deep-Value-Score"] >= expanded_lower].copy()
+        result["expanded"] = True
+        selection_text = f"erweitert: Score ab {expanded_lower:.0f}"
+
+    sample = _cooldown_sample(sample, max(12, int(cooldown_months)))
+    valid = sample.dropna(subset=["Rendite 12M"]).copy() if not sample.empty else pd.DataFrame()
+    result["sample"] = sample
+    result["valid"] = valid
+    result["selection_text"] = selection_text
+
+    if valid.empty:
+        return result
+
+    returns = pd.to_numeric(valid["Rendite 12M"], errors="coerce").dropna()
+    excess = pd.to_numeric(valid.get("Überrendite 12M"), errors="coerce").dropna()
+    max_declines = pd.to_numeric(valid.get("Max. Rückgang 12M"), errors="coerce").dropna()
+    trap_values = valid.get("Value Trap", pd.Series(False, index=valid.index)).fillna(False).astype(bool)
+    benchmark_hits = valid.get("Benchmark geschlagen 12M", pd.Series(False, index=valid.index)).fillna(False).astype(bool)
+
+    result.update({
+        "count": len(valid),
+        "positive_rate": float((returns > 0).mean() * 100) if not returns.empty else None,
+        "benchmark_rate": float(benchmark_hits.mean() * 100) if len(benchmark_hits) else None,
+        "trap_rate": float(trap_values.mean() * 100) if len(trap_values) else None,
+        "average_return": safe_float(returns.mean()) if not returns.empty else None,
+        "median_return": safe_float(returns.median()) if not returns.empty else None,
+        "average_excess": safe_float(excess.mean()) if not excess.empty else None,
+        "weak_scenario": safe_float(returns.quantile(0.20)) if not returns.empty else None,
+        "middle_scenario": safe_float(returns.quantile(0.50)) if not returns.empty else None,
+        "strong_scenario": safe_float(returns.quantile(0.80)) if not returns.empty else None,
+        "worst_return": safe_float(returns.min()) if not returns.empty else None,
+        "best_return": safe_float(returns.max()) if not returns.empty else None,
+        "typical_drawdown": safe_float(max_declines.median()) if not max_declines.empty else None,
+    })
+    return result
+
+
+def classify_historical_expectation(expectation: dict[str, Any]) -> tuple[str, str]:
+    """Erzeugt eine vorsichtige, rein historische Einordnung der Vergleichsfälle."""
+    count = int(expectation.get("count") or 0)
+    if count < 3:
+        return "nicht belastbar", "Es gibt zu wenige unabhängige Vergleichsfälle."
+
+    median_return = safe_float(expectation.get("median_return"))
+    positive_rate = safe_float(expectation.get("positive_rate"))
+    benchmark_rate = safe_float(expectation.get("benchmark_rate"))
+    trap_rate = safe_float(expectation.get("trap_rate"))
+
+    if (
+        median_return is not None and median_return > 5
+        and benchmark_rate is not None and benchmark_rate >= 55
+        and (trap_rate is None or trap_rate <= 25)
+    ):
+        return "historisch positiv", "Die Mehrzahl ähnlicher Fälle war positiv und schlug häufig die Benchmark."
+    if (
+        median_return is not None and median_return > 0
+        and positive_rate is not None and positive_rate >= 55
+        and (trap_rate is None or trap_rate < 40)
+    ):
+        return "vorsichtig positiv", "Ähnliche Fälle waren überwiegend positiv, aber nicht eindeutig überlegen."
+    if (
+        median_return is not None and median_return < 0
+        and ((benchmark_rate is not None and benchmark_rate < 40) or (trap_rate is not None and trap_rate >= 40))
+    ):
+        return "historisch schwach", "Ähnliche Fälle zeigten häufig Verluste, Unterrendite oder Value Traps."
+    return "gemischt", "Die historischen Ergebnisse sind uneinheitlich; Chancen und Risiken liegen eng beieinander."
+
+
+def current_setup_strengths_and_risks(
+    snapshot: dict[str, Any],
+    expectation: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    strengths: list[str] = []
+    risks: list[str] = []
+
+    dividend_yield = safe_float(snapshot.get("dividend_yield"))
+    drawdown = safe_float(snapshot.get("deepest_drawdown_3_5y_pct"))
+    coverage = safe_float(snapshot.get("cashflow_dividend_coverage"))
+    leverage = safe_float(snapshot.get("net_debt_ebitda"))
+    cashflow_positive = bool(snapshot.get("cashflow_positive"))
+    pe_approx = safe_float(snapshot.get("pe_approx"))
+
+    if dividend_yield is not None and dividend_yield >= 5:
+        strengths.append(f"Hohe historische Dividendenrendite von {format_percent(dividend_yield, 2)}.")
+    elif dividend_yield is None:
+        risks.append("Dividendenrendite konnte nicht zuverlässig bestimmt werden.")
+
+    if drawdown is not None and drawdown <= -25:
+        strengths.append(f"Deutlicher Abstand zum 3J-/5J-Hoch ({format_percent(drawdown, 1, signed=True)}).")
+    elif drawdown is not None and drawdown > -15:
+        risks.append("Kein ausgeprägter langfristiger Drawdown – das Setup ist weniger typisch für Deep Value.")
+
+    if cashflow_positive:
+        strengths.append("Der zuletzt konservativ verfügbare operative beziehungsweise freie Cashflow ist positiv.")
+    else:
+        risks.append("Cashflow ist negativ oder nicht ausreichend belegt.")
+
+    if coverage is not None and coverage >= 1.2:
+        strengths.append(f"Free Cashflow deckt die Ausschüttung mit rund {format_number(coverage, 2)}x.")
+    elif coverage is not None and coverage < 1.0:
+        risks.append(f"Free-Cashflow-Deckung der Ausschüttung ist mit {format_number(coverage, 2)}x schwach.")
+    elif coverage is None:
+        risks.append("FCF-Dividendendeckung ist nicht verfügbar.")
+
+    if leverage is not None and leverage < 3.5:
+        strengths.append(f"Net Debt/EBITDA liegt mit {format_number(leverage, 2)}x unter der Deep-Value-Warngrenze.")
+    elif leverage is not None and leverage >= 5:
+        risks.append(f"Net Debt/EBITDA ist mit {format_number(leverage, 2)}x hoch.")
+    elif leverage is None:
+        risks.append("Verschuldungskennzahl Net Debt/EBITDA fehlt.")
+
+    if pe_approx is not None and 0 < pe_approx <= 12:
+        strengths.append(f"Historisch angenähertes KGV ist mit etwa {format_number(pe_approx, 1)} niedrig.")
+    if snapshot.get("reported_eps_negative") and cashflow_positive:
+        risks.append("Berichtetes EPS ist negativ; ein Sondereffekt muss manuell geprüft werden.")
+
+    count = int(expectation.get("count") or 0)
+    trap_rate = safe_float(expectation.get("trap_rate"))
+    benchmark_rate = safe_float(expectation.get("benchmark_rate"))
+    if count < 6:
+        risks.append(f"Nur {count} unabhängige historische 12M-Vergleichsfälle.")
+    if trap_rate is not None and trap_rate >= 30:
+        risks.append(f"Historische Value-Trap-Quote liegt bei {format_percent(trap_rate, 1)}.")
+    if benchmark_rate is not None and benchmark_rate >= 55:
+        strengths.append(f"Ähnliche Fälle schlugen in {format_percent(benchmark_rate, 1)} der Fälle die Benchmark.")
+
+    return strengths[:5], risks[:5]
+
 def persist_backtest_run(
     ticker: str,
     company_name: str,
@@ -4786,6 +4998,161 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
             f"**Zeitraum:** {pd.Timestamp(bundle.get('start')).strftime('%d.%m.%Y')} – "
             f"{pd.Timestamp(bundle.get('end')).strftime('%d.%m.%Y')}"
         )
+
+        st.markdown("#### Aktuelles Setup & historische Erwartung")
+        st.caption(
+            "Verbindet den heutigen quantitativen Deep-Value-Score mit früheren, ähnlich bewerteten "
+            "12M-Fällen derselben Aktie. Die Bandbreiten sind historische Erfahrungswerte – keine Kursziele."
+        )
+
+        latest_date = pd.Timestamp(history.index.max()).tz_localize(None).normalize()
+        current_snapshot = historical_bat_snapshot(
+            ticker=ticker,
+            as_of=latest_date,
+            history=history,
+            dividends=dividends,
+            financials=financials,
+            info_lag_days=int(lag_days),
+            negative_news_shock=False,
+            special_effect_suspected=False,
+        )
+        current_score = safe_float(current_snapshot.get("bat_pattern_score")) or 0.0
+        current_trigger = bool(current_snapshot.get("bat_pattern_trigger"))
+        coverage_count, coverage_total, coverage_pct = deep_value_snapshot_coverage(current_snapshot)
+
+        expectation_band = st.slider(
+            "Ähnlichkeit zum heutigen Score (± Punkte)",
+            min_value=5,
+            max_value=20,
+            value=10,
+            step=5,
+            key="current_expectation_score_band",
+            help="Historische Fälle werden zunächst innerhalb dieses Score-Bands gesucht. Bei zu wenigen Fällen wird die Auswahl transparent erweitert.",
+        )
+        expectation = historical_expectation_for_current_score(
+            candidates=bundle.get("candidates", pd.DataFrame()),
+            current_score=current_score,
+            score_band=float(expectation_band),
+            cooldown_months=int(bundle.get("cooldown", 12)),
+        )
+        evidence_label, evidence_text = expectation_evidence_label(int(expectation.get("count") or 0))
+        expectation_label, expectation_text = classify_historical_expectation(expectation)
+
+        current_cols = st.columns(5)
+        current_cols[0].metric("Deep-Value-Score heute", format_number(current_score, 1))
+        current_cols[1].metric("Aktuelles Signal", "⚠ aktiv" if current_trigger else "nicht aktiv")
+        current_cols[2].metric("Datenabdeckung", f"{coverage_pct:.0f} %")
+        current_cols[3].metric("Historische Fälle", int(expectation.get("count") or 0))
+        current_cols[4].metric("Aussagekraft", evidence_label)
+
+        if current_trigger:
+            st.warning(
+                "Das heutige quantitative Setup erfüllt den strengen Deep-Value-Trigger. "
+                "Das ist ein Research-Hinweis und kein Kauf- oder Renditeversprechen."
+            )
+        elif current_score >= 55:
+            st.info("Mehrere heutige Deep-Value-Merkmale sind vorhanden, der strenge Trigger ist jedoch nicht vollständig erfüllt.")
+        else:
+            st.info("Heute liegt kein ausgeprägtes quantitatives Deep-Value-Setup vor. Die Historie dient nur als Kontext.")
+
+        valid_expectation = expectation.get("valid", pd.DataFrame())
+        if isinstance(valid_expectation, pd.DataFrame) and not valid_expectation.empty:
+            result_cols = st.columns(6)
+            result_cols[0].metric("Positiv nach 12M", format_percent(expectation.get("positive_rate"), 1))
+            result_cols[1].metric("Benchmark geschlagen", format_percent(expectation.get("benchmark_rate"), 1))
+            result_cols[2].metric("Medianrendite 12M", format_percent(expectation.get("median_return"), 2, signed=True))
+            result_cols[3].metric("Ø Rendite 12M", format_percent(expectation.get("average_return"), 2, signed=True))
+            result_cols[4].metric("Value-Trap-Anteil", format_percent(expectation.get("trap_rate"), 1))
+            result_cols[5].metric("Typischer Rückgang", format_percent(expectation.get("typical_drawdown"), 1, signed=True))
+
+            scenario_cols = st.columns(3)
+            scenario_cols[0].metric("Schwaches Szenario · 20 %", format_percent(expectation.get("weak_scenario"), 2, signed=True))
+            scenario_cols[1].metric("Mittleres Szenario · Median", format_percent(expectation.get("middle_scenario"), 2, signed=True))
+            scenario_cols[2].metric("Starkes Szenario · 80 %", format_percent(expectation.get("strong_scenario"), 2, signed=True))
+
+            scenario_frame = pd.DataFrame({
+                "Historische Bandbreite": ["Schwach · 20. Perzentil", "Mitte · Median", "Stark · 80. Perzentil"],
+                "Rendite 12M": [
+                    expectation.get("weak_scenario"),
+                    expectation.get("middle_scenario"),
+                    expectation.get("strong_scenario"),
+                ],
+            }).dropna(subset=["Rendite 12M"])
+            if not scenario_frame.empty:
+                scenario_chart = alt.Chart(scenario_frame).mark_bar().encode(
+                    x=alt.X("Historische Bandbreite:N", title=None, sort=None),
+                    y=alt.Y("Rendite 12M:Q", title="Historische 12M-Rendite (%)"),
+                    tooltip=["Historische Bandbreite:N", alt.Tooltip("Rendite 12M:Q", format="+.2f")],
+                ).properties(height=240)
+                zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4]).encode(y="y:Q")
+                st.altair_chart(scenario_chart + zero_rule, use_container_width=True)
+
+            if expectation_label == "historisch positiv":
+                st.success(f"**Historische Einordnung: {expectation_label}.** {expectation_text}")
+            elif expectation_label == "vorsichtig positiv":
+                st.info(f"**Historische Einordnung: {expectation_label}.** {expectation_text}")
+            elif expectation_label == "historisch schwach":
+                st.error(f"**Historische Einordnung: {expectation_label}.** {expectation_text}")
+            else:
+                st.warning(f"**Historische Einordnung: {expectation_label}.** {expectation_text}")
+
+            st.caption(
+                f"Vergleichsauswahl: {expectation.get('selection_text')}; zeitlicher Abstand mindestens "
+                f"{max(12, int(bundle.get('cooldown', 12)))} Monate. {evidence_text}"
+            )
+            if expectation.get("expanded"):
+                st.warning("Im engen Score-Band gab es weniger als drei Fälle. Die Vergleichsmenge wurde deshalb erweitert.")
+
+            strengths, risks = current_setup_strengths_and_risks(current_snapshot, expectation)
+            strength_col, risk_col = st.columns(2)
+            with strength_col:
+                st.markdown("**Aktuelle Stärken**")
+                if strengths:
+                    for item in strengths:
+                        st.markdown(f"- ✓ {item}")
+                else:
+                    st.caption("Keine klaren Stärken aus den verfügbaren Kennzahlen ableitbar.")
+            with risk_col:
+                st.markdown("**Aktuelle Risiken / offene Prüfungen**")
+                if risks:
+                    for item in risks:
+                        st.markdown(f"- ⚠ {item}")
+                else:
+                    st.caption("Keine zusätzlichen Warnhinweise aus den verfügbaren Kennzahlen.")
+
+            with st.expander("Historische Vergleichsfälle anzeigen", expanded=False):
+                expectation_columns = [
+                    "Signal-Datum", "Deep-Value-Score", "Rendite 12M", "Überrendite 12M",
+                    "Max. Rückgang 12M", "Value Trap", "Value-Trap-Grund",
+                ]
+                expectation_display = valid_expectation[
+                    [column for column in expectation_columns if column in valid_expectation.columns]
+                ].copy()
+                if "Signal-Datum" in expectation_display.columns:
+                    expectation_display["Signal-Datum"] = pd.to_datetime(
+                        expectation_display["Signal-Datum"], errors="coerce"
+                    ).dt.strftime("%d.%m.%Y")
+                st.dataframe(
+                    expectation_display.style.format(
+                        {
+                            "Deep-Value-Score": "{:.1f}",
+                            "Rendite 12M": lambda value: format_percent(value, 2, signed=True),
+                            "Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
+                            "Max. Rückgang 12M": lambda value: format_percent(value, 1, signed=True),
+                        },
+                        na_rep="–",
+                    ).map(
+                        colorize_change,
+                        subset=[column for column in ["Rendite 12M", "Überrendite 12M"] if column in expectation_display.columns],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.warning(
+                "Für den heutigen Score wurden keine unabhängigen historischen Fälle mit vollständigen 12M-Daten gefunden. "
+                "Erweitere den Testzeitraum oder das Score-Band."
+            )
 
         st.markdown("#### Schwellenvergleich")
         st.dataframe(
