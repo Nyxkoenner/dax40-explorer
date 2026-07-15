@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.2"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -326,6 +326,70 @@ def human_market_cap(value: Any) -> str:
     if absolute >= 1_000_000:
         return f"{format_number(number / 1_000_000, 1)} Mio."
     return format_number(number, 0)
+
+
+def company_selectbox(
+    label: str,
+    df: pd.DataFrame,
+    key: str,
+    *,
+    ticker_col: str = "ticker_yahoo",
+    name_col: str = "name",
+    sort_by_name: bool = True,
+    **selectbox_kwargs: Any,
+) -> str:
+    """Zeigt Firmenname und Ticker, gibt intern aber nur den Ticker zurück.
+
+    Beispiel in der Oberfläche: ``Bayer (BAYN.DE)``. Bestehende Berechnungen
+    arbeiten unverändert mit ``BAYN.DE`` weiter. Der Helper räumt außerdem
+    veraltete Session-State-Werte nach einem Index- oder Filterwechsel auf.
+    """
+    if df is None or df.empty or ticker_col not in df.columns:
+        raise ValueError("Für die Aktienauswahl sind keine Ticker verfügbar.")
+
+    columns = [ticker_col]
+    if name_col in df.columns:
+        columns.append(name_col)
+
+    choices = df[columns].copy()
+    choices[ticker_col] = choices[ticker_col].fillna("").astype(str).str.strip()
+    choices = choices[choices[ticker_col].ne("")].drop_duplicates(subset=[ticker_col])
+    if choices.empty:
+        raise ValueError("Für die Aktienauswahl sind keine gültigen Ticker verfügbar.")
+
+    if name_col not in choices.columns:
+        choices[name_col] = choices[ticker_col]
+    else:
+        choices[name_col] = choices[name_col].fillna("").astype(str).str.strip()
+        choices.loc[choices[name_col].eq(""), name_col] = choices.loc[choices[name_col].eq(""), ticker_col]
+
+    if sort_by_name:
+        choices = choices.assign(_sort_name=choices[name_col].str.casefold()).sort_values(
+            ["_sort_name", ticker_col], kind="stable"
+        )
+
+    options = choices[ticker_col].tolist()
+    labels = {
+        row[ticker_col]: (
+            f"{row[name_col]} ({row[ticker_col]})"
+            if row[name_col] != row[ticker_col]
+            else row[ticker_col]
+        )
+        for _, row in choices.iterrows()
+    }
+
+    # Nach Index-/Filterwechseln kann ein alter Ticker im Session State liegen.
+    # Vor Erzeugung des Widgets entfernen, damit Streamlit keinen ungültigen Wert hält.
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+
+    return st.selectbox(
+        label,
+        options=options,
+        format_func=lambda ticker: labels.get(ticker, str(ticker)),
+        key=key,
+        **selectbox_kwargs,
+    )
 
 
 def is_financial_sector(sector: Any) -> bool:
@@ -3116,7 +3180,7 @@ def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_
         "Dieser Bereich vergleicht historische Kurs-/Adj-Close-Entwicklung mit einem Benchmark. "
         "Er ist bewusst kein fundamentaler Backtest: Historische Fundamentals, damalige Indexzusammensetzungen und Transaktionskosten fehlen dafür."
     )
-    ticker = st.selectbox("Aktie für Vergleich", df["ticker_yahoo"].tolist(), key="research_ticker")
+    ticker = company_selectbox("Aktie für Vergleich", df, key="research_ticker")
     use_adjusted = st.checkbox("Bereinigte Kurse verwenden (Adj Close)", value=True, key="research_adjusted")
     history = histories.get(ticker, pd.DataFrame())
     benchmark_ticker = benchmark_for_index(index_name)
@@ -3150,7 +3214,7 @@ def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_
     benchmark_metrics = compute_return_metrics(comparison["Benchmark"])
     table = pd.DataFrame(
         [
-            {"Serie": ticker, "Rendite": company_metrics["return_pct"], "Volatilität": company_metrics["volatility_pct"], "Max. Drawdown": company_metrics["max_drawdown_pct"]},
+            {"Serie": f"{df.loc[df["ticker_yahoo"] == ticker, "name"].iloc[0]} ({ticker})", "Rendite": company_metrics["return_pct"], "Volatilität": company_metrics["volatility_pct"], "Max. Drawdown": company_metrics["max_drawdown_pct"]},
             {"Serie": benchmark_ticker, "Rendite": benchmark_metrics["return_pct"], "Volatilität": benchmark_metrics["volatility_pct"], "Max. Drawdown": benchmark_metrics["max_drawdown_pct"]},
         ]
     )
@@ -3684,7 +3748,7 @@ def render_value_trigger_explanation(
 
         if df.empty:
             return
-        ticker = st.selectbox("Trigger für einen Titel prüfen", df["ticker_yahoo"].tolist(), key="value_trigger_explanation_ticker")
+        ticker = company_selectbox("Trigger für einen Titel prüfen", df, key="value_trigger_explanation_ticker")
         row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
         minimum_yield = sector_yield_trigger(row.get("sector"), yield_min)
         drawdown = safe_float(row.get("drawdown_1y_high_pct"))
@@ -3806,7 +3870,7 @@ def render_special_situation_scanner(df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     st.markdown("### Einzelprüfung")
-    ticker = st.selectbox("Titel prüfen", sorted_df["ticker_yahoo"].tolist(), key="special_situation_detail_ticker")
+    ticker = company_selectbox("Titel prüfen", sorted_df, key="special_situation_detail_ticker")
     row = sorted_df.loc[sorted_df["ticker_yahoo"] == ticker].iloc[0]
     detail_cols = st.columns(4)
     detail_cols[0].metric("Score", format_number(row.get("special_situation_score"), 1))
@@ -3905,8 +3969,11 @@ def render_value_watchlist(
 
 def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
     st.subheader("Einzelanalyse & Chart")
-    ticker = st.selectbox("Aktie auswählen", df["ticker_yahoo"].tolist(), key="analysis_ticker")
+    ticker = company_selectbox("Aktie auswählen", df, key="analysis_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+    company_name = str(row.get("name") or ticker)
+    company_sector = str(row.get("sector") or "Unbekannt")
+    st.caption(f"{company_name} · {ticker} · {company_sector}")
     events = load_persisted_events(ticker, days_back=1825)
 
     columns = st.columns(6)
@@ -3927,9 +3994,9 @@ def render_risk_and_chart(df: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
         st.caption(f"{row.get('score_confidence', '–')} · Abdeckung: {format_percent(row.get('score_coverage'), 0)}")
         if st.button("Zur Watchlist hinzufügen", key=f"watch_{ticker}"):
             if add_to_watchlist(ticker, str(row.get("name", ticker)), str(row.get("sector", "Unbekannt"))):
-                st.success(f"{ticker} wurde gespeichert.")
+                st.success(f"{company_name} ({ticker}) wurde gespeichert.")
             else:
-                st.info(f"{ticker} ist bereits auf der Watchlist.")
+                st.info(f"{company_name} ({ticker}) ist bereits auf der Watchlist.")
 
         with st.expander("Unternehmensprofil & Management"):
             render_company_profile(ticker)
@@ -4138,7 +4205,7 @@ def render_news(df: pd.DataFrame) -> None:
         "Mehrdeutige Ticker werden bewusst strenger gefiltert."
     )
 
-    ticker = st.selectbox("Aktie für News", df["ticker_yahoo"].tolist(), key="news_ticker")
+    ticker = company_selectbox("Aktie für News", df, key="news_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
     company_name = str(row.get("name", ticker))
 
@@ -4421,7 +4488,7 @@ def render_watchlist(metrics: pd.DataFrame) -> None:
     visible_columns = [column for column in visible_columns if column in merged.columns]
     st.dataframe(overview_styler(merged[visible_columns]), use_container_width=True, hide_index=True)
 
-    ticker_to_remove = st.selectbox("Titel von Watchlist entfernen", merged["ticker_yahoo"].tolist(), key="remove_watchlist_ticker")
+    ticker_to_remove = company_selectbox("Titel von Watchlist entfernen", merged, key="remove_watchlist_ticker")
     if st.button("Aus Watchlist entfernen", key="remove_watchlist_button"):
         remove_from_watchlist(ticker_to_remove)
         st.success(f"{ticker_to_remove} wurde entfernt.")
