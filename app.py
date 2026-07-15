@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "4.4"
+APP_VERSION = "4.5"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -4527,6 +4527,67 @@ def render_news_card(item: pd.Series, card_index: int) -> None:
                 st.link_button("Artikel öffnen", link)
 
 
+def _sentiment_filter_state_key(ticker: str) -> str:
+    """Eindeutiger Session-State-Key für den klickbaren News-Sentimentfilter."""
+    safe_ticker = re.sub(r"[^A-Za-z0-9_-]+", "_", str(ticker))
+    return f"news_sentiment_filter::{safe_ticker}"
+
+
+def render_clickable_sentiment_filter(relevant_news: pd.DataFrame, ticker: str) -> str:
+    """
+    Zeigt klickbare Sentiment-Zähler und gibt den aktiven Filter zurück.
+
+    ``st.metric`` ist nicht klickbar. Deshalb werden bewusst breite Buttons
+    verwendet, die optisch als kompakte Filterkarten funktionieren.
+    """
+    labels = (
+        relevant_news.get("sentiment_label", pd.Series("neutral", index=relevant_news.index))
+        .fillna("neutral")
+        .astype(str)
+        .str.lower()
+    )
+    counts = {
+        "alle": int(len(relevant_news)),
+        "positiv": int((labels == "positiv").sum()),
+        "negativ": int((labels == "negativ").sum()),
+        "gemischt": int((labels == "gemischt").sum()),
+        "neutral": int((labels == "neutral").sum()),
+    }
+    options = [
+        ("alle", "Alle", "📰"),
+        ("positiv", "Positiv", "🟢"),
+        ("negativ", "Negativ", "🔴"),
+        ("gemischt", "Gemischt", "🟡"),
+        ("neutral", "Neutral", "⚪"),
+    ]
+
+    state_key = _sentiment_filter_state_key(ticker)
+    if st.session_state.get(state_key) not in counts:
+        st.session_state[state_key] = "alle"
+
+    active_filter = st.session_state[state_key]
+    columns = st.columns(len(options))
+    for column, (value, title, icon) in zip(columns, options):
+        active_marker = "✓ " if active_filter == value else ""
+        label = f"{active_marker}{icon} {title} · {counts[value]}"
+        if column.button(
+            label,
+            key=f"sentiment_filter_button::{ticker}::{value}",
+            use_container_width=True,
+            help=f"Nur {title.lower()}e Meldungen anzeigen" if value != "alle" else "Alle relevanten Meldungen anzeigen",
+        ):
+            st.session_state[state_key] = value
+            st.rerun()
+
+    active_filter = st.session_state[state_key]
+    active_title = next(title for value, title, _ in options if value == active_filter)
+    st.caption(
+        f"Aktiver News-Filter: **{active_title}**. "
+        "Der Klick wirkt auf den Tab „Aktuelle News“; der Kalender besitzt eigene Filter."
+    )
+    return active_filter
+
+
 def render_news_summary(
     ticker: str,
     company_name: str,
@@ -4534,8 +4595,8 @@ def render_news_summary(
     uncertain_news: pd.DataFrame,
     events: pd.DataFrame,
     diagnostics: pd.DataFrame,
-) -> None:
-    """Zeigt eine sachliche Einordnung ohne daraus ein Handelssignal abzuleiten."""
+) -> str:
+    """Zeigt eine sachliche Einordnung und gibt den aktiven Sentimentfilter zurück."""
     future_events = pd.DataFrame()
     if events is not None and not events.empty:
         future_events = events.copy()
@@ -4552,13 +4613,9 @@ def render_news_summary(
     st.markdown("#### Einordnung")
     st.info(headline)
 
+    active_sentiment_filter = "alle"
     if not relevant_news.empty:
-        labels = relevant_news.get("sentiment_label", pd.Series("neutral", index=relevant_news.index)).fillna("neutral").astype(str).str.lower()
-        sentiment_counts = st.columns(4)
-        sentiment_counts[0].metric("🟢 Positiv", int((labels == "positiv").sum()))
-        sentiment_counts[1].metric("🔴 Negativ", int((labels == "negativ").sum()))
-        sentiment_counts[2].metric("🟡 Gemischt", int((labels == "gemischt").sum()))
-        sentiment_counts[3].metric("⚪ Neutral", int((labels == "neutral").sum()))
+        active_sentiment_filter = render_clickable_sentiment_filter(relevant_news, ticker)
 
     notes: list[str] = []
     if not future_events.empty:
@@ -4577,6 +4634,8 @@ def render_news_summary(
 
     for note in notes:
         st.markdown(f"- {note}")
+
+    return active_sentiment_filter
 
 
 def render_news(df: pd.DataFrame) -> None:
@@ -4703,20 +4762,50 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
     status_columns[2].metric("Abrufbare Quellen", f"{reachable_sources} / {total_sources}" if total_sources else "–")
     status_columns[3].metric("Daten aktualisiert", bundle.get("loaded_at", "–"))
 
-    render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
+    active_sentiment_filter = render_news_summary(ticker, company_name, relevant_news, uncertain_news, events, diagnostics)
 
     tab_news, tab_calendar, tab_sources, tab_export = st.tabs([
         "Aktuelle News", "Kalender", "Quellen & Diagnose", "Export"
     ])
 
     with tab_news:
+        filtered_relevant_news = relevant_news.copy()
+        if active_sentiment_filter != "alle" and not filtered_relevant_news.empty:
+            filtered_relevant_news = filtered_relevant_news[
+                filtered_relevant_news.get(
+                    "sentiment_label",
+                    pd.Series("neutral", index=filtered_relevant_news.index),
+                )
+                .fillna("neutral")
+                .astype(str)
+                .str.lower()
+                .eq(active_sentiment_filter)
+            ]
+
+        filter_titles = {
+            "alle": "Alle relevanten News",
+            "positiv": "Positive News",
+            "negativ": "Negative News",
+            "gemischt": "Gemischte News",
+            "neutral": "Neutrale News",
+        }
+        st.markdown(f"#### {filter_titles.get(active_sentiment_filter, 'Aktuelle News')}")
+
         if relevant_news.empty:
             st.warning(
                 "Keine verlässlich passende Unternehmensmeldung gefunden. "
                 "Prüfe bei Bedarf die Firmen-Aliase oder die Quellen-Diagnose."
             )
+        elif filtered_relevant_news.empty:
+            st.info(
+                "Für den gewählten Sentimentfilter gibt es im aktuellen Zeitraum keine Meldung. "
+                "Klicke oben auf „Alle“ oder wähle einen anderen Filter."
+            )
         else:
-            for index, (_, item) in enumerate(relevant_news.iterrows()):
+            st.caption(
+                f"{len(filtered_relevant_news)} von {len(relevant_news)} relevanten Meldungen werden angezeigt."
+            )
+            for index, (_, item) in enumerate(filtered_relevant_news.iterrows()):
                 render_news_card(item, index)
 
         if not uncertain_news.empty:
