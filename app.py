@@ -43,7 +43,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.8"
+APP_VERSION = "5.8.1"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -11677,7 +11677,7 @@ def render_deep_company_profiles(data: pd.DataFrame) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Version 5.8 – Superinvestoren und Fondsbeobachtung via SEC Form 13F
+# Version 5.8.1 – Superinvestoren: SEC-Einheiten, Ampeln und Vergleichslogik
 # -----------------------------------------------------------------------------
 
 SUPERINVESTOR_COLUMNS = [
@@ -11841,7 +11841,28 @@ def _xml_descendant_text(element: ET.Element, local_name: str) -> str:
     return ""
 
 
-def parse_13f_information_table(xml_payload: bytes | str) -> pd.DataFrame:
+def _13f_accession_year(accession: Any) -> Optional[int]:
+    """Liest das Einreichungsjahr aus einer SEC-Accession-Nummer."""
+    match = re.search(r"-(\d{2})-", str(accession or ""))
+    if not match:
+        return None
+    two_digit = int(match.group(1))
+    return 2000 + two_digit if two_digit <= 79 else 1900 + two_digit
+
+
+def _13f_value_scale(accession: Any) -> tuple[float, str]:
+    """
+    SEC-Form-13F-Einheit:
+    - Einreichungen bis 2022: value in Tausend USD
+    - Einreichungen ab 03.01.2023: value auf den nächsten USD
+    """
+    filing_year = _13f_accession_year(accession)
+    if filing_year is not None and filing_year < 2023:
+        return 1000.0, "Tausend USD (Legacy-Format vor 2023)"
+    return 1.0, "USD (SEC-Format ab 2023)"
+
+
+def parse_13f_information_table(xml_payload: bytes | str, value_scale: float = 1.0) -> pd.DataFrame:
     columns = [
         "holding_key", "issuer", "title_of_class", "cusip", "figi", "market_value_usd",
         "shares", "share_type", "put_call", "investment_discretion", "voting_sole",
@@ -11861,14 +11882,14 @@ def parse_13f_information_table(xml_payload: bytes | str) -> pd.DataFrame:
         cusip = _xml_descendant_text(element, "cusip").upper()
         figi = _xml_descendant_text(element, "figi")
         put_call = _xml_descendant_text(element, "putCall").upper()
-        value_thousands = safe_float(_xml_descendant_text(element, "value")) or 0.0
+        value_raw = safe_float(_xml_descendant_text(element, "value")) or 0.0
         shares = safe_float(_xml_descendant_text(element, "sshPrnamt")) or 0.0
         row = {
             "issuer": issuer,
             "title_of_class": title,
             "cusip": cusip,
             "figi": figi,
-            "market_value_usd": value_thousands * 1000.0,
+            "market_value_usd": value_raw * float(value_scale),
             "shares": shares,
             "share_type": _xml_descendant_text(element, "sshPrnamtType"),
             "put_call": put_call,
@@ -11927,7 +11948,8 @@ def fetch_13f_holdings(cik_value: Any, accession: str) -> tuple[pd.DataFrame, di
         xml_url = directory_url + candidate["name"]
         response = requests.get(xml_url, headers=SEC_HEADERS, timeout=35)
         response.raise_for_status()
-        holdings = parse_13f_information_table(response.content)
+        value_scale, value_unit = _13f_value_scale(accession_clean)
+        holdings = parse_13f_information_table(response.content, value_scale=value_scale)
         metadata = {
             "cik": cik,
             "accession": accession_clean,
@@ -11935,6 +11957,9 @@ def fetch_13f_holdings(cik_value: Any, accession: str) -> tuple[pd.DataFrame, di
             "index_url": index_url,
             "xml_url": xml_url,
             "source_file": candidate["name"],
+            "value_scale": value_scale,
+            "value_unit": value_unit,
+            "filing_year": _13f_accession_year(accession_clean),
             "holdings_count": len(holdings),
             "total_value_usd": float(holdings["market_value_usd"].sum()) if not holdings.empty else 0.0,
             "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -12072,16 +12097,55 @@ def map_13f_holdings_to_tickers(holdings: pd.DataFrame, market_data: pd.DataFram
     return result
 
 
-def _human_usd(value: Any) -> str:
+def _human_usd(value: Any, signed: bool = False) -> str:
     number = safe_float(value)
     if number is None:
         return "–"
+    prefix = "+" if signed and number > 0 else ""
     absolute = abs(number)
     if absolute >= 1_000_000_000:
-        return f"{format_number(number / 1_000_000_000, 1)} Mrd. USD"
+        return f"{prefix}{format_number(number / 1_000_000_000, 1)} Mrd. USD"
     if absolute >= 1_000_000:
-        return f"{format_number(number / 1_000_000, 1)} Mio. USD"
-    return f"{format_number(number, 0)} USD"
+        return f"{prefix}{format_number(number / 1_000_000, 1)} Mio. USD"
+    return f"{prefix}{format_number(number, 0)} USD"
+
+
+def _13f_status_badge(status: Any) -> str:
+    return {
+        "Neu": "🟢 Neu",
+        "Aufgestockt": "🟢 Aufgestockt",
+        "Reduziert": "🔴 Reduziert",
+        "Verkauft": "🔴 Verkauft",
+        "Unverändert": "⚪ Unverändert",
+    }.get(str(status), f"⚪ {status}")
+
+
+def _style_13f_status(value: Any) -> str:
+    text = str(value)
+    if "Neu" in text or "Aufgestockt" in text:
+        return "background-color: rgba(34,197,94,0.18); color: #86efac; font-weight: 700"
+    if "Reduziert" in text or "Verkauft" in text:
+        return "background-color: rgba(239,68,68,0.18); color: #fca5a5; font-weight: 700"
+    return "background-color: rgba(148,163,184,0.12); color: #cbd5e1"
+
+
+def _style_signed_change(value: Any) -> str:
+    text = str(value).strip()
+    if text.startswith("+"):
+        return "color: #22c55e; font-weight: 700"
+    if text.startswith("-"):
+        return "color: #ef4444; font-weight: 700"
+    return "color: #94a3b8"
+
+
+def _style_market_value_change(value: Any) -> str:
+    # Meldewertänderungen enthalten auch reine Kursbewegungen und sind kein sicherer Handelsnachweis.
+    text = str(value).strip()
+    if text.startswith("+"):
+        return "color: #60a5fa; font-weight: 600"
+    if text.startswith("-"):
+        return "color: #f59e0b; font-weight: 600"
+    return "color: #94a3b8"
 
 
 def _13f_filing_label(row: pd.Series) -> str:
@@ -12136,6 +12200,12 @@ def _render_13f_top_holdings(holdings: pd.DataFrame, manager_name: str, report_d
 
 def _render_13f_changes(changes: pd.DataFrame, current_label: str, previous_label: str) -> None:
     st.caption(f"Vergleich: {current_label} gegenüber {previous_label}")
+    st.info(
+        "Die Ampel basiert auf der gemeldeten Stückzahl: Grün = neu/aufgestockt, Rot = reduziert/verkauft, "
+        "Grau = Stückzahl unverändert. Die Meldewert-Änderung enthält zusätzlich Kursbewegungen und ist "
+        "deshalb nicht mit einem Kauf- oder Verkaufsbetrag gleichzusetzen.",
+        icon="ℹ️",
+    )
     if changes.empty:
         st.info("Für den Quartalsvergleich liegen keine Daten vor.")
         return
@@ -12144,21 +12214,37 @@ def _render_13f_changes(changes: pd.DataFrame, current_label: str, previous_labe
     view = changes[changes["status"].isin(selected)].copy() if selected else changes.iloc[0:0].copy()
     summary = changes["status"].value_counts()
     cols = st.columns(5)
-    for column, label in zip(cols, ["Neu", "Aufgestockt", "Reduziert", "Verkauft", "Unverändert"]):
-        column.metric(label, int(summary.get(label, 0)))
+    status_meta = [
+        ("Neu", "🟢 Neu"),
+        ("Aufgestockt", "🟢 Aufgestockt"),
+        ("Reduziert", "🔴 Reduziert"),
+        ("Verkauft", "🔴 Verkauft"),
+        ("Unverändert", "⚪ Unverändert"),
+    ]
+    for column, (status, label) in zip(cols, status_meta):
+        column.metric(label, int(summary.get(status, 0)))
     if view.empty:
         st.info("Für den gewählten Filter gibt es keine Positionen.")
         return
+    view["Ampel / Status"] = view["status"].map(_13f_status_badge)
     view["Aktuell"] = view["current_value_usd"].map(_human_usd)
     view["Vorher"] = view["previous_value_usd"].map(_human_usd)
-    view["Wertänderung"] = view["value_change_usd"].map(_human_usd)
+    view["Meldewert-Änderung"] = view["value_change_usd"].map(lambda value: _human_usd(value, signed=True))
+    view["Meldewert-Änderung %"] = view["value_change_pct"].map(lambda value: format_percent(value, 1, signed=True))
     view["Stückänderung"] = view["share_change_pct"].map(lambda value: format_percent(value, 1, signed=True))
     view["Gewichtsänderung"] = view["weight_change_pp"].map(lambda value: format_percent(value, 2, signed=True))
-    display = view.rename(columns={"issuer": "Emittent", "title_of_class": "Klasse", "status": "Status", "put_call": "Put/Call"})
-    st.dataframe(
-        display[["Status", "Emittent", "Klasse", "Put/Call", "Aktuell", "Vorher", "Wertänderung", "Stückänderung", "Gewichtsänderung"]],
-        hide_index=True, use_container_width=True,
+    display = view.rename(columns={"issuer": "Emittent", "title_of_class": "Klasse", "put_call": "Put/Call"})
+    columns = [
+        "Ampel / Status", "Emittent", "Klasse", "Put/Call", "Aktuell", "Vorher",
+        "Meldewert-Änderung", "Meldewert-Änderung %", "Stückänderung", "Gewichtsänderung",
+    ]
+    styled = (
+        display[columns].style
+        .map(_style_13f_status, subset=["Ampel / Status"])
+        .map(_style_market_value_change, subset=["Meldewert-Änderung", "Meldewert-Änderung %"])
+        .map(_style_signed_change, subset=["Stückänderung", "Gewichtsänderung"])
     )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
 
 
 def _render_13f_overlaps(mapped: pd.DataFrame, data: pd.DataFrame) -> None:
@@ -12302,6 +12388,12 @@ def _render_superinvestor_admin() -> None:
 
 
 def render_superinvestors(data: pd.DataFrame) -> None:
+    # Alte, mit dem früheren Tausender-Faktor geparste Session-Daten sicher verwerfen.
+    superinvestor_data_version = "5.8.1-sec-dollar-units"
+    if st.session_state.get("superinvestor_data_version") != superinvestor_data_version:
+        st.session_state.pop("superinvestor_loaded", None)
+        st.session_state["superinvestor_data_version"] = superinvestor_data_version
+
     st.subheader("Superinvestoren & Fonds – SEC Form 13F")
     st.caption(
         "Quartalsweise US-Aktienmeldungen großer institutioneller Manager. Du siehst Top-Positionen, "
@@ -12391,7 +12483,7 @@ def render_superinvestors(data: pd.DataFrame) -> None:
     metadata = loaded_entry.get("metadata", {})
     st.caption(
         f"Quelle: SEC EDGAR · abgerufen {metadata.get('retrieved_at', '–')} · "
-        f"Datei: {metadata.get('source_file', '–')}"
+        f"Datei: {metadata.get('source_file', '–')} · Werteinhalt: {metadata.get('value_unit', 'USD')}"
     )
     if metadata.get("directory_url"):
         st.link_button("Offizielle SEC-Meldung öffnen", metadata["directory_url"])
