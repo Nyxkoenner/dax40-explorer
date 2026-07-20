@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.5.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -2664,6 +2664,19 @@ ALIAS_PATH = DATA_DIR / "company_aliases.csv"
 EVENTS_PATH = DATA_DIR / "events.csv"
 NEWS_SNAPSHOT_DIR = DATA_DIR / "news_snapshots"
 NEWS_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Event-Kalender 2.0: optionale offizielle IR-Feeds/Kalender und manuell
+# bestätigte Termine. Die CSV-Dateien werden automatisch als Vorlagen angelegt.
+IR_SOURCES_PATH = DATA_DIR / "ir_sources.csv"
+MANUAL_EVENTS_PATH = DATA_DIR / "manual_events.csv"
+SEC_TICKER_CACHE_PATH = CACHE_DIR / "sec_company_tickers.json"
+
+SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "contact@example.com")
+SEC_HEADERS = {
+    "User-Agent": f"AktienExplorer/5.5 {SEC_CONTACT_EMAIL}",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "application/json,text/plain,*/*",
+}
 
 GLOBAL_RSS_SOURCES: list[dict[str, str]] = [
     {
@@ -8561,11 +8574,1092 @@ def render_news_summary(
     return active_sentiment_filter
 
 
+
+# -----------------------------------------------------------------------------
+# Version 5.5 – Event-Kalender 2.0 mit Quellenstatus und offiziellen Filings
+# -----------------------------------------------------------------------------
+
+EVENT_COLUMNS_V55 = [
+    "date", "ticker_yahoo", "event_type", "title", "source", "link",
+    "sentiment_score", "sentiment_label", "sentiment_confidence",
+    "sentiment_reason", "importance", "is_future_event",
+    "verification_level", "verification_score", "event_status",
+    "source_type", "source_url", "retrieved_at", "notes", "conflict_note",
+]
+
+IR_SOURCE_COLUMNS = [
+    "ticker_yahoo", "source_name", "source_type", "feed_url", "source_url",
+    "verification_level", "enabled", "notes",
+]
+
+MANUAL_EVENT_COLUMNS = [
+    "date", "ticker_yahoo", "event_type", "title", "source", "link",
+    "importance", "event_status", "verification_level", "notes",
+]
+
+EVENT_META.update({
+    "capital_markets_day": {"label": "Kapitalmarkttag", "shape": "triangle-right"},
+    "conference": {"label": "Investorenkonferenz", "shape": "triangle-left"},
+})
+
+VERIFICATION_META: dict[str, dict[str, Any]] = {
+    "official": {"label": "🟢 Offiziell", "score": 100, "status": "bestätigt"},
+    "official_ir": {"label": "🟢 Unternehmens-IR", "score": 95, "status": "bestätigt"},
+    "manual": {"label": "🔵 Manuell bestätigt", "score": 85, "status": "bestätigt"},
+    "provider": {"label": "🟡 Datenanbieter", "score": 60, "status": "Anbieterangabe"},
+    "derived": {"label": "⚪ Aus News abgeleitet", "score": 40, "status": "abgeleitet"},
+    "unknown": {"label": "⚪ Unbekannt", "score": 20, "status": "prüfen"},
+}
+
+
+def verification_label(value: Any) -> str:
+    level = str(value or "unknown").strip().lower()
+    return str(VERIFICATION_META.get(level, VERIFICATION_META["unknown"])["label"])
+
+
+def verification_score(value: Any) -> int:
+    level = str(value or "unknown").strip().lower()
+    return int(VERIFICATION_META.get(level, VERIFICATION_META["unknown"])["score"])
+
+
+def verification_cell_style(value: Any) -> str:
+    normalized = str(value or "").lower()
+    if "offiziell" in normalized or "unternehmens-ir" in normalized:
+        return "color: #166534; background-color: #dcfce7; font-weight: 700"
+    if "manuell" in normalized:
+        return "color: #1e3a8a; background-color: #dbeafe; font-weight: 700"
+    if "datenanbieter" in normalized:
+        return "color: #854d0e; background-color: #fef3c7; font-weight: 700"
+    return "color: #475569; background-color: #f1f5f9"
+
+
+def event_status_cell_style(value: Any) -> str:
+    normalized = str(value or "").lower()
+    if "bestätigt" in normalized:
+        return "color: #166534; background-color: #dcfce7; font-weight: 700"
+    if "prüfen" in normalized or "konflikt" in normalized:
+        return "color: #991b1b; background-color: #fee2e2; font-weight: 700"
+    if "anbieter" in normalized:
+        return "color: #854d0e; background-color: #fef3c7; font-weight: 700"
+    return "color: #475569; background-color: #f1f5f9"
+
+
+def empty_events_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=EVENT_COLUMNS_V55)
+
+
+def normalize_events_frame(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return empty_events_frame()
+    result = frame.copy()
+    defaults: dict[str, Any] = {
+        "date": pd.NaT,
+        "ticker_yahoo": "",
+        "event_type": "news",
+        "title": "",
+        "source": "",
+        "link": "",
+        "sentiment_score": 0.0,
+        "sentiment_label": "neutral",
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "",
+        "importance": "mittel",
+        "is_future_event": False,
+        "verification_level": "unknown",
+        "verification_score": 20,
+        "event_status": "prüfen",
+        "source_type": "unknown",
+        "source_url": "",
+        "retrieved_at": "",
+        "notes": "",
+        "conflict_note": "",
+    }
+    for column, default in defaults.items():
+        if column not in result.columns:
+            result[column] = default
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    result = result.dropna(subset=["date"]).copy()
+    if not result.empty:
+        try:
+            if getattr(result["date"].dt, "tz", None) is not None:
+                result["date"] = result["date"].dt.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+    result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
+    result["verification_level"] = result["verification_level"].fillna("unknown").astype(str).str.lower()
+    result["verification_score"] = pd.to_numeric(result["verification_score"], errors="coerce")
+    missing_score = result["verification_score"].isna()
+    if missing_score.any():
+        result.loc[missing_score, "verification_score"] = result.loc[missing_score, "verification_level"].map(verification_score)
+    result["verification_score"] = result["verification_score"].fillna(20).astype(int)
+    result["is_future_event"] = result["is_future_event"].astype(str).str.lower().isin({"true", "1", "yes", "ja"}) | (
+        result["date"].dt.normalize() >= pd.Timestamp.now().normalize()
+    )
+    for column in ["title", "source", "link", "sentiment_label", "sentiment_confidence", "sentiment_reason",
+                   "importance", "event_status", "source_type", "source_url", "retrieved_at", "notes", "conflict_note"]:
+        result[column] = result[column].fillna("").astype(str)
+    return result[EVENT_COLUMNS_V55].reset_index(drop=True)
+
+
+def ensure_event_source_files() -> None:
+    if not IR_SOURCES_PATH.exists():
+        safe_write_csv(pd.DataFrame(columns=IR_SOURCE_COLUMNS), IR_SOURCES_PATH)
+    if not MANUAL_EVENTS_PATH.exists():
+        safe_write_csv(pd.DataFrame(columns=MANUAL_EVENT_COLUMNS), MANUAL_EVENTS_PATH)
+
+
+def read_ir_sources() -> pd.DataFrame:
+    ensure_event_source_files()
+    try:
+        frame = pd.read_csv(IR_SOURCES_PATH, dtype=str)
+    except Exception:
+        frame = pd.DataFrame(columns=IR_SOURCE_COLUMNS)
+    for column in IR_SOURCE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame["ticker_yahoo"] = frame["ticker_yahoo"].map(clean_ticker)
+    frame["source_type"] = frame["source_type"].fillna("rss").astype(str).str.lower()
+    frame["verification_level"] = frame["verification_level"].fillna("official_ir").astype(str).str.lower()
+    frame["enabled"] = frame["enabled"].fillna("true").astype(str).str.lower().isin({"true", "1", "yes", "ja", "x"})
+    return frame[IR_SOURCE_COLUMNS].drop_duplicates(
+        ["ticker_yahoo", "source_name", "feed_url"], keep="last"
+    ).reset_index(drop=True)
+
+
+def save_ir_sources(frame: pd.DataFrame) -> tuple[bool, str]:
+    result = frame.copy()
+    for column in IR_SOURCE_COLUMNS:
+        if column not in result.columns:
+            result[column] = ""
+    result["ticker_yahoo"] = result["ticker_yahoo"].map(clean_ticker)
+    result["enabled"] = result["enabled"].astype(bool)
+    return safe_write_csv(result[IR_SOURCE_COLUMNS], IR_SOURCES_PATH)
+
+
+def read_manual_events(ticker: Optional[str] = None) -> pd.DataFrame:
+    ensure_event_source_files()
+    try:
+        frame = pd.read_csv(MANUAL_EVENTS_PATH, dtype=str)
+    except Exception:
+        frame = pd.DataFrame(columns=MANUAL_EVENT_COLUMNS)
+    for column in MANUAL_EVENT_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame["ticker_yahoo"] = frame["ticker_yahoo"].map(clean_ticker)
+    if ticker:
+        frame = frame[frame["ticker_yahoo"] == clean_ticker(ticker)].copy()
+    if frame.empty:
+        return empty_events_frame()
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
+    result = pd.DataFrame({
+        "date": pd.to_datetime(frame["date"], errors="coerce"),
+        "ticker_yahoo": frame["ticker_yahoo"],
+        "event_type": frame["event_type"].replace("", "report"),
+        "title": frame["title"],
+        "source": frame["source"].replace("", "Manuell bestätigt"),
+        "link": frame["link"],
+        "sentiment_score": 0.0,
+        "sentiment_label": "neutral",
+        "sentiment_confidence": "niedrig",
+        "sentiment_reason": "Manueller Kalendereintrag – keine automatische Sentimentbewertung",
+        "importance": frame["importance"].replace("", "mittel"),
+        "is_future_event": False,
+        "verification_level": frame["verification_level"].replace("", "manual"),
+        "verification_score": frame["verification_level"].replace("", "manual").map(verification_score),
+        "event_status": frame["event_status"].replace("", "bestätigt"),
+        "source_type": "manual",
+        "source_url": frame["link"],
+        "retrieved_at": now_text,
+        "notes": frame["notes"],
+        "conflict_note": "",
+    })
+    return normalize_events_frame(result)
+
+
+def append_manual_event(row: dict[str, Any]) -> tuple[bool, str]:
+    ensure_event_source_files()
+    try:
+        existing = pd.read_csv(MANUAL_EVENTS_PATH, dtype=str)
+    except Exception:
+        existing = pd.DataFrame(columns=MANUAL_EVENT_COLUMNS)
+    addition = pd.DataFrame([{column: row.get(column, "") for column in MANUAL_EVENT_COLUMNS}])
+    combined = pd.concat([existing, addition], ignore_index=True)
+    combined = combined.drop_duplicates(["date", "ticker_yahoo", "event_type", "title"], keep="last")
+    return safe_write_csv(combined[MANUAL_EVENT_COLUMNS], MANUAL_EVENTS_PATH)
+
+
+def delete_manual_event(ticker: str, date_value: str, event_type: str, title: str) -> tuple[bool, str]:
+    ensure_event_source_files()
+    try:
+        frame = pd.read_csv(MANUAL_EVENTS_PATH, dtype=str)
+    except Exception:
+        frame = pd.DataFrame(columns=MANUAL_EVENT_COLUMNS)
+    if frame.empty:
+        return True, ""
+    mask = (
+        frame.get("ticker_yahoo", "").map(clean_ticker).eq(clean_ticker(ticker))
+        & frame.get("date", "").astype(str).eq(str(date_value))
+        & frame.get("event_type", "").astype(str).eq(str(event_type))
+        & frame.get("title", "").astype(str).eq(str(title))
+    )
+    return safe_write_csv(frame.loc[~mask, MANUAL_EVENT_COLUMNS], MANUAL_EVENTS_PATH)
+
+
+def _parse_ics_datetime(value: str) -> pd.Timestamp | pd.NaT:
+    raw = str(value or "").strip()
+    if not raw:
+        return pd.NaT
+    formats = ["%Y%m%d", "%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%dT%H%M"]
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return pd.Timestamp(parsed)
+        except ValueError:
+            continue
+    return pd.to_datetime(raw, errors="coerce")
+
+
+def parse_ics_payload(payload: bytes) -> list[dict[str, str]]:
+    try:
+        text_value = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text_value = payload.decode("latin-1", errors="replace")
+    raw_lines = text_value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines: list[str] = []
+    for line in raw_lines:
+        if line.startswith((" ", "\t")) and lines:
+            lines[-1] += line[1:]
+        else:
+            lines.append(line)
+    events: list[dict[str, str]] = []
+    current: Optional[dict[str, str]] = None
+    for line in lines:
+        if line.strip() == "BEGIN:VEVENT":
+            current = {}
+            continue
+        if line.strip() == "END:VEVENT":
+            if current is not None:
+                events.append(current)
+            current = None
+            continue
+        if current is None or ":" not in line:
+            continue
+        key_part, value = line.split(":", 1)
+        key = key_part.split(";", 1)[0].strip().upper()
+        current[key] = value.replace("\\n", " ").replace("\\,", ",").strip()
+    return events
+
+
+def classify_event_from_text_v55(text: str) -> str:
+    normalized = normalize_for_search(text)
+    if any(term in normalized for term in ["capital markets day", "capital market day", "investor day", "kapitalmarkttag"]):
+        return "capital_markets_day"
+    if any(term in normalized for term in ["investor conference", "investorenkonferenz", "conference presentation"]):
+        return "conference"
+    return classify_event_from_text(text)
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def fetch_sec_company_map() -> tuple[dict[str, dict[str, Any]], str]:
+    url = "https://www.sec.gov/files/company_tickers.json"
+    try:
+        response = requests.get(url, headers=SEC_HEADERS, timeout=25)
+        response.raise_for_status()
+        payload = response.json()
+        mapping: dict[str, dict[str, Any]] = {}
+        iterable = payload.values() if isinstance(payload, dict) else payload
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            ticker_value = clean_ticker(item.get("ticker"))
+            cik = item.get("cik_str")
+            if ticker_value and cik is not None:
+                mapping[ticker_value] = {
+                    "cik": int(cik),
+                    "title": str(item.get("title", "")),
+                }
+        return mapping, ""
+    except Exception as error:
+        return {}, f"{type(error).__name__}: {error}"
+
+
+def _sec_form_meta(form: str) -> Optional[tuple[str, str, str]]:
+    normalized = str(form or "").upper().strip()
+    if normalized in {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"}:
+        return "report", f"Jahresbericht / {normalized}", "hoch"
+    if normalized in {"10-Q", "10-Q/A"}:
+        return "earnings", f"Quartalsbericht / {normalized}", "hoch"
+    if normalized in {"8-K", "8-K/A", "6-K", "6-K/A"}:
+        return "report", f"Unternehmensmeldung / {normalized}", "mittel"
+    if normalized in {"DEF 14A", "DEFA14A", "PRE 14A"}:
+        return "annual_meeting", f"Proxy Statement / {normalized}", "hoch"
+    return None
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_sec_filings_events(
+    ticker: str,
+    company_name: str,
+    days_back: int = 730,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ticker_clean = clean_ticker(ticker)
+    diagnostic = {
+        "source": "SEC EDGAR",
+        "kind": "official_regulator",
+        "status": "Nicht verfügbar",
+        "http_status": None,
+        "entries": 0,
+        "matches": 0,
+        "uncertain_matches": 0,
+        "duration_ms": None,
+        "message": "",
+        "url": "https://data.sec.gov/",
+    }
+    # Börsensuffixe wie .DE/.PA sind nicht direkt SEC-gemappt. US-ADRs ohne
+    # Suffix können dagegen vorhanden sein.
+    if "." in ticker_clean:
+        diagnostic["message"] = "SEC-Quelle wird nur für SEC-gemappte US-Ticker/ADRs verwendet."
+        return empty_events_frame(), pd.DataFrame([diagnostic])
+
+    started = time.perf_counter()
+    company_map, map_error = fetch_sec_company_map()
+    if map_error:
+        diagnostic["status"] = "Fehler"
+        diagnostic["message"] = map_error
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        return empty_events_frame(), pd.DataFrame([diagnostic])
+    match = company_map.get(ticker_clean)
+    if not match:
+        diagnostic["message"] = f"Kein SEC-CIK für {ticker_clean} gefunden."
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        return empty_events_frame(), pd.DataFrame([diagnostic])
+
+    cik = int(match["cik"])
+    url = f"https://data.sec.gov/submissions/CIK{cik:010d}.json"
+    diagnostic["url"] = url
+    try:
+        response = requests.get(url, headers=SEC_HEADERS, timeout=25)
+        diagnostic["http_status"] = response.status_code
+        response.raise_for_status()
+        payload = response.json()
+        recent = payload.get("filings", {}).get("recent", {})
+        forms = list(recent.get("form", []))
+        dates = list(recent.get("filingDate", []))
+        accessions = list(recent.get("accessionNumber", []))
+        docs = list(recent.get("primaryDocument", []))
+        descriptions = list(recent.get("primaryDocDescription", []))
+        diagnostic["entries"] = len(forms)
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=int(days_back))
+        rows: list[dict[str, Any]] = []
+        for position, form in enumerate(forms):
+            filing_date = dates[position] if position < len(dates) else None
+            accession = accessions[position] if position < len(accessions) else ""
+            document = docs[position] if position < len(docs) else ""
+            description = descriptions[position] if position < len(descriptions) else ""
+            meta = _sec_form_meta(str(form))
+            if meta is None:
+                continue
+            parsed_date = pd.to_datetime(filing_date, errors="coerce")
+            if pd.isna(parsed_date) or pd.Timestamp(parsed_date).normalize() < cutoff:
+                continue
+            event_type, base_title, importance = meta
+            accession_compact = str(accession).replace("-", "")
+            filing_link = (
+                f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_compact}/{document}"
+                if accession_compact and document else url
+            )
+            detail = str(description or "").strip()
+            title = base_title if not detail else f"{base_title}: {detail}"
+            rows.append({
+                "date": pd.Timestamp(parsed_date).tz_localize(None),
+                "ticker_yahoo": ticker_clean,
+                "event_type": event_type,
+                "title": title,
+                "source": "SEC EDGAR",
+                "link": filing_link,
+                "sentiment_score": 0.0,
+                "sentiment_label": "neutral",
+                "sentiment_confidence": "niedrig",
+                "sentiment_reason": "Offizielles Filing – keine automatische inhaltliche Bewertung",
+                "importance": importance,
+                "is_future_event": False,
+                "verification_level": "official",
+                "verification_score": 100,
+                "event_status": "bestätigt",
+                "source_type": "regulator",
+                "source_url": url,
+                "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "notes": f"SEC-CIK {cik:010d} · {company_name}",
+                "conflict_note": "",
+            })
+        events = normalize_events_frame(pd.DataFrame(rows))
+        diagnostic["matches"] = len(events)
+        diagnostic["status"] = "OK" if not events.empty else "Keine relevanten Filings"
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        return events, pd.DataFrame([diagnostic])
+    except Exception as error:
+        diagnostic["status"] = "Fehler"
+        diagnostic["message"] = f"{type(error).__name__}: {error}"
+        diagnostic["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        return empty_events_frame(), pd.DataFrame([diagnostic])
+
+
+def _ir_feed_to_events(
+    source_row: pd.Series,
+    ticker: str,
+    earliest: pd.Timestamp,
+    latest: pd.Timestamp,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    source_name = str(source_row.get("source_name", "Unternehmens-IR") or "Unternehmens-IR")
+    source_type = str(source_row.get("source_type", "rss") or "rss").lower()
+    feed_url = str(source_row.get("feed_url", "") or "").strip()
+    source_url = str(source_row.get("source_url", "") or "").strip()
+    verification = str(source_row.get("verification_level", "official_ir") or "official_ir").lower()
+    diagnostic: dict[str, Any] = {
+        "source": source_name,
+        "kind": f"ir_{source_type}",
+        "status": "Nicht konfiguriert",
+        "http_status": None,
+        "entries": 0,
+        "matches": 0,
+        "uncertain_matches": 0,
+        "duration_ms": None,
+        "message": "",
+        "url": feed_url or source_url,
+    }
+    if source_type == "web" or not feed_url:
+        diagnostic["status"] = "Nur Link" if source_url else "Nicht konfiguriert"
+        diagnostic["message"] = "Diese Quelle dient als offizieller Referenzlink und wird nicht automatisch ausgelesen."
+        return empty_events_frame(), diagnostic
+
+    payload, request_diag = request_feed(feed_url)
+    diagnostic.update({
+        "status": request_diag.get("status"),
+        "http_status": request_diag.get("http_status"),
+        "duration_ms": request_diag.get("duration_ms"),
+        "message": request_diag.get("message", ""),
+    })
+    if payload is None:
+        return empty_events_frame(), diagnostic
+
+    rows: list[dict[str, Any]] = []
+    if source_type == "ics":
+        parsed = parse_ics_payload(payload)
+        diagnostic["entries"] = len(parsed)
+        for item in parsed:
+            date_value = _parse_ics_datetime(item.get("DTSTART", ""))
+            if pd.isna(date_value) or not (earliest <= pd.Timestamp(date_value) <= latest):
+                continue
+            title = str(item.get("SUMMARY", "Termin") or "Termin")
+            description = str(item.get("DESCRIPTION", "") or "")
+            link = str(item.get("URL", "") or source_url or feed_url)
+            event_type = classify_event_from_text_v55(f"{title} {description}")
+            rows.append({
+                "date": pd.Timestamp(date_value).tz_localize(None),
+                "ticker_yahoo": ticker,
+                "event_type": event_type,
+                "title": title,
+                "source": source_name,
+                "link": link,
+                "sentiment_score": 0.0,
+                "sentiment_label": "neutral",
+                "sentiment_confidence": "niedrig",
+                "sentiment_reason": "Offizieller Kalendertermin – keine automatische inhaltliche Bewertung",
+                "importance": "hoch" if event_type in {"earnings", "annual_meeting", "report"} else "mittel",
+                "is_future_event": pd.Timestamp(date_value).normalize() >= pd.Timestamp.now().normalize(),
+                "verification_level": verification,
+                "verification_score": verification_score(verification),
+                "event_status": VERIFICATION_META.get(verification, VERIFICATION_META["unknown"])["status"],
+                "source_type": "company_calendar",
+                "source_url": source_url or feed_url,
+                "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "notes": description,
+                "conflict_note": "",
+            })
+    else:
+        parsed_entries, parser_error = parse_feed_entries(payload, source_name, "official_ir")
+        diagnostic["entries"] = len(parsed_entries)
+        if parser_error:
+            diagnostic["status"] = "Parser-Fehler"
+            diagnostic["message"] = parser_error
+            return empty_events_frame(), diagnostic
+        for entry in parsed_entries:
+            date_value = pd.Timestamp(entry["published"])
+            if not (earliest <= date_value <= latest):
+                continue
+            combined = f"{entry['title']} {entry['summary']}"
+            event_type = classify_event_from_text_v55(combined)
+            # Allgemeine IR-News bleiben im News-Teil; der Kalender übernimmt
+            # nur klar klassifizierte Ereignisse.
+            if event_type == "news":
+                continue
+            sentiment = analyze_sentiment(entry["title"], entry["summary"])
+            rows.append({
+                "date": date_value,
+                "ticker_yahoo": ticker,
+                "event_type": event_type,
+                "title": entry["title"],
+                "source": source_name,
+                "link": entry["link"] or source_url,
+                "sentiment_score": sentiment["score"],
+                "sentiment_label": sentiment["label"],
+                "sentiment_confidence": sentiment["confidence"],
+                "sentiment_reason": sentiment["reason"],
+                "importance": "hoch" if event_type in {"earnings", "annual_meeting", "report"} else "mittel",
+                "is_future_event": date_value.normalize() >= pd.Timestamp.now().normalize(),
+                "verification_level": verification,
+                "verification_score": verification_score(verification),
+                "event_status": VERIFICATION_META.get(verification, VERIFICATION_META["unknown"])["status"],
+                "source_type": "company_feed",
+                "source_url": source_url or feed_url,
+                "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "notes": entry["summary"],
+                "conflict_note": "",
+            })
+    events = normalize_events_frame(pd.DataFrame(rows))
+    diagnostic["matches"] = len(events)
+    diagnostic["status"] = "OK" if not events.empty else "Keine Kalenderereignisse"
+    return events, diagnostic
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_registered_ir_events(
+    ticker: str,
+    days_back: int = 730,
+    days_forward: int = 730,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sources = read_ir_sources()
+    sources = sources[(sources["ticker_yahoo"] == clean_ticker(ticker)) & sources["enabled"]].copy()
+    if sources.empty:
+        diagnostic = pd.DataFrame([{
+            "source": "Unternehmens-IR",
+            "kind": "ir_registry",
+            "status": "Nicht konfiguriert",
+            "http_status": None,
+            "entries": 0,
+            "matches": 0,
+            "uncertain_matches": 0,
+            "duration_ms": None,
+            "message": "Für diesen Ticker wurde noch kein offizieller RSS-/ICS-Link hinterlegt.",
+            "url": "",
+        }])
+        return empty_events_frame(), diagnostic
+    earliest = pd.Timestamp.now().normalize() - pd.Timedelta(days=int(days_back))
+    latest = pd.Timestamp.now().normalize() + pd.Timedelta(days=int(days_forward))
+    frames: list[pd.DataFrame] = []
+    diagnostics: list[dict[str, Any]] = []
+    for _, source_row in sources.iterrows():
+        events, diagnostic = _ir_feed_to_events(source_row, clean_ticker(ticker), earliest, latest)
+        frames.append(events)
+        diagnostics.append(diagnostic)
+    combined = normalize_events_frame(pd.concat(frames, ignore_index=True)) if frames else empty_events_frame()
+    return combined, pd.DataFrame(diagnostics)
+
+
+def detect_event_conflicts(events: pd.DataFrame, tolerance_days: int = 14) -> pd.DataFrame:
+    result = normalize_events_frame(events)
+    if result.empty:
+        return result
+    result["conflict_note"] = result["conflict_note"].fillna("").astype(str)
+    future = result[result["date"].dt.normalize() >= pd.Timestamp.now().normalize()]
+    for (ticker, event_type), group in future.groupby(["ticker_yahoo", "event_type"]):
+        group = group.sort_values("date")
+        indices = list(group.index)
+        for left_pos, left_index in enumerate(indices):
+            for right_index in indices[left_pos + 1:]:
+                delta = abs((result.at[right_index, "date"].normalize() - result.at[left_index, "date"].normalize()).days)
+                if delta > tolerance_days:
+                    break
+                if delta <= 1:
+                    continue
+                left_source = str(result.at[left_index, "source"])
+                right_source = str(result.at[right_index, "source"])
+                if left_source == right_source:
+                    continue
+                note = (
+                    f"Abweichende Terminangaben innerhalb von {tolerance_days} Tagen: "
+                    f"{result.at[left_index, 'date'].strftime('%d.%m.%Y')} ({left_source}) vs. "
+                    f"{result.at[right_index, 'date'].strftime('%d.%m.%Y')} ({right_source})."
+                )
+                for index in [left_index, right_index]:
+                    result.at[index, "event_status"] = "prüfen"
+                    result.at[index, "conflict_note"] = note
+    return result
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_yahoo_calendar_events(ticker: str, days_back: int = 365, days_forward: int = 365) -> pd.DataFrame:
+    ticker = clean_ticker(ticker)
+    now = datetime.now().replace(tzinfo=None)
+    earliest = now - timedelta(days=int(days_back))
+    latest = now + timedelta(days=int(days_forward))
+    rows: list[dict[str, Any]] = []
+
+    def append_provider_event(date_value: Any, event_type: str, title: str, importance: str = "mittel") -> None:
+        parsed = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(parsed):
+            return
+        event_date = pd.Timestamp(parsed).tz_localize(None).to_pydatetime()
+        if not (earliest <= event_date <= latest):
+            return
+        rows.append({
+            "date": event_date,
+            "ticker_yahoo": ticker,
+            "event_type": event_type,
+            "title": title,
+            "source": "Yahoo Finance",
+            "link": "",
+            "sentiment_score": 0.0,
+            "sentiment_label": "neutral",
+            "sentiment_confidence": "niedrig",
+            "sentiment_reason": "Datenanbieter-Termin – keine automatische inhaltliche Bewertung",
+            "importance": importance,
+            "is_future_event": bool(event_date > now),
+            "verification_level": "provider",
+            "verification_score": 60,
+            "event_status": "Anbieterangabe",
+            "source_type": "market_data_provider",
+            "source_url": "https://finance.yahoo.com/",
+            "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "notes": "Termin kann sich ändern; nach Möglichkeit mit Unternehmens-IR abgleichen.",
+            "conflict_note": "",
+        })
+
+    try:
+        dividends = fetch_dividends(ticker)
+    except Exception:
+        dividends = pd.DataFrame(columns=["date", "amount"])
+    if dividends is not None and not dividends.empty:
+        if isinstance(dividends, pd.DataFrame) and {"date", "amount"}.issubset(dividends.columns):
+            dividend_rows = dividends[["date", "amount"]].copy()
+        else:
+            series = pd.to_numeric(dividends, errors="coerce").dropna()
+            dividend_rows = pd.DataFrame({"date": series.index, "amount": series.values})
+        dividend_rows["date"] = pd.to_datetime(dividend_rows["date"], errors="coerce")
+        dividend_rows["amount"] = pd.to_numeric(dividend_rows["amount"], errors="coerce")
+        for _, dividend_row in dividend_rows.dropna(subset=["date", "amount"]).iterrows():
+            append_provider_event(
+                dividend_row["date"],
+                "dividend",
+                f"Dividende: {format_number(float(dividend_row['amount']), 4)} je Aktie",
+            )
+
+    try:
+        calendar = yf.Ticker(ticker).calendar
+    except Exception:
+        calendar = None
+
+    def add_values(value: Any, event_type: str, title: str) -> None:
+        values = list(value) if isinstance(value, (pd.Series, pd.Index, list, tuple, set)) else [value]
+        for raw_date in values:
+            append_provider_event(raw_date, event_type, title, "hoch" if event_type == "earnings" else "mittel")
+
+    if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+        for index_value, row in calendar.iterrows():
+            lowered = str(index_value).lower()
+            values = row.tolist()
+            if "earning" in lowered:
+                add_values(values, "earnings", "Quartalszahlen / Earnings")
+            elif "ex-dividend" in lowered or "ex dividend" in lowered:
+                add_values(values, "dividend", "Ex-Dividende")
+    elif isinstance(calendar, dict):
+        for key, value in calendar.items():
+            lowered = str(key).lower()
+            if "earning" in lowered:
+                add_values(value, "earnings", "Quartalszahlen / Earnings")
+            elif "ex-dividend" in lowered or "ex dividend" in lowered:
+                add_values(value, "dividend", "Ex-Dividende")
+    return normalize_events_frame(pd.DataFrame(rows))
+
+
+def news_to_events(news: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if news is None or news.empty:
+        return empty_events_frame()
+    eligible = news.copy()
+    if "is_relevant" in eligible.columns:
+        eligible = eligible[eligible["is_relevant"].fillna(False)]
+    if "event_type" in eligible.columns:
+        eligible = eligible[eligible["event_type"].astype(str) != "news"]
+    if eligible.empty:
+        return empty_events_frame()
+    result = pd.DataFrame({
+        "date": pd.to_datetime(eligible["published"], errors="coerce"),
+        "ticker_yahoo": clean_ticker(ticker),
+        "event_type": eligible.get("event_type", "news"),
+        "title": eligible.get("title", ""),
+        "source": eligible.get("source", ""),
+        "link": eligible.get("link", ""),
+        "sentiment_score": eligible.get("sentiment_score", 0.0),
+        "sentiment_label": eligible.get("sentiment_label", "neutral"),
+        "sentiment_confidence": eligible.get("sentiment_confidence", "niedrig"),
+        "sentiment_reason": eligible.get("sentiment_reason", ""),
+        "importance": "mittel",
+        "is_future_event": False,
+        "verification_level": "derived",
+        "verification_score": 40,
+        "event_status": "abgeleitet",
+        "source_type": "news_derived",
+        "source_url": eligible.get("link", ""),
+        "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "notes": eligible.get("relevance_reason", "Aus relevanter Nachricht abgeleitet"),
+        "conflict_note": "",
+    })
+    return normalize_events_frame(result)
+
+
+def combine_events(
+    news: pd.DataFrame,
+    calendar_events: pd.DataFrame,
+    ticker: str,
+    extra_events: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    frames = [news_to_events(news, ticker), normalize_events_frame(calendar_events)]
+    if extra_events is not None:
+        frames.append(normalize_events_frame(extra_events))
+    combined = normalize_events_frame(pd.concat(frames, ignore_index=True))
+    if combined.empty:
+        return combined
+    combined["_title_key"] = combined["title"].map(normalize_for_search)
+    combined["_date_key"] = combined["date"].dt.strftime("%Y-%m-%d")
+    combined = (
+        combined.sort_values(["verification_score", "retrieved_at"], ascending=[False, False])
+        .drop_duplicates(["ticker_yahoo", "_date_key", "event_type", "_title_key"], keep="first")
+        .drop(columns=["_title_key", "_date_key"])
+        .sort_values("date", ascending=False)
+        .reset_index(drop=True)
+    )
+    return detect_event_conflicts(combined)
+
+
+def persist_events(events: pd.DataFrame, replace_ticker: Optional[str] = None) -> tuple[bool, str]:
+    events = normalize_events_frame(events)
+    existing = empty_events_frame()
+    if EVENTS_PATH.exists():
+        try:
+            existing = normalize_events_frame(pd.read_csv(EVENTS_PATH))
+        except Exception:
+            existing = empty_events_frame()
+    if replace_ticker and not existing.empty:
+        existing = existing[existing["ticker_yahoo"] != clean_ticker(replace_ticker)].copy()
+    combined = normalize_events_frame(pd.concat([existing, events], ignore_index=True))
+    if combined.empty:
+        return safe_write_csv(pd.DataFrame(columns=EVENT_COLUMNS_V55), EVENTS_PATH)
+    combined["date"] = combined["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    combined = combined.drop_duplicates(
+        ["ticker_yahoo", "date", "event_type", "title", "source"], keep="last"
+    ).sort_values(["ticker_yahoo", "date"], ascending=[True, False])
+    return safe_write_csv(combined[EVENT_COLUMNS_V55], EVENTS_PATH)
+
+
+def load_persisted_events(ticker: str, days_back: int = 1825) -> pd.DataFrame:
+    if not EVENTS_PATH.exists():
+        return empty_events_frame()
+    try:
+        events = normalize_events_frame(pd.read_csv(EVENTS_PATH))
+    except Exception:
+        return empty_events_frame()
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=int(days_back))
+    events = events[(events["ticker_yahoo"] == clean_ticker(ticker)) & (events["date"] >= cutoff)].copy()
+    return detect_event_conflicts(events.sort_values("date", ascending=False).reset_index(drop=True))
+
+
+def fetch_verified_event_bundle(
+    ticker: str,
+    company_name: str,
+    days_back: int,
+    days_forward: int = 730,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sec_events, sec_diagnostics = fetch_sec_filings_events(ticker, company_name, days_back=max(days_back, 730))
+    ir_events, ir_diagnostics = fetch_registered_ir_events(ticker, days_back=max(days_back, 730), days_forward=days_forward)
+    manual_events = read_manual_events(ticker)
+    manual_diagnostic = pd.DataFrame([{
+        "source": "Manuell bestätigte Termine",
+        "kind": "manual",
+        "status": "Lokal",
+        "http_status": None,
+        "entries": len(manual_events),
+        "matches": len(manual_events),
+        "uncertain_matches": 0,
+        "duration_ms": 0,
+        "message": "Termine aus data/manual_events.csv",
+        "url": str(MANUAL_EVENTS_PATH),
+    }])
+    events = normalize_events_frame(pd.concat([sec_events, ir_events, manual_events], ignore_index=True))
+    diagnostics = pd.concat([sec_diagnostics, ir_diagnostics, manual_diagnostic], ignore_index=True)
+    return events, diagnostics
+
+
+def _event_type_label(value: Any) -> str:
+    event_type = str(value or "news")
+    icon = {
+        "news": "📰", "earnings": "📊", "dividend": "💶", "annual_meeting": "🗳️",
+        "report": "📄", "analyst": "🎯", "capital_markets_day": "🏛️", "conference": "🎤",
+    }.get(event_type, "•")
+    label = EVENT_META.get(event_type, {}).get("label", event_type)
+    return f"{icon} {label}"
+
+
+def _render_event_table(frame: pd.DataFrame, empty_message: str) -> None:
+    frame = normalize_events_frame(frame)
+    if frame.empty:
+        st.info(empty_message)
+        return
+    display = frame.copy()
+    display["Datum"] = display["date"].map(_friendly_event_date)
+    display["Typ"] = display["event_type"].map(_event_type_label)
+    display["Titel"] = display["title"]
+    display["Quelle"] = display["source"]
+    display["Verifiziert"] = display["verification_level"].map(verification_label)
+    display["Status"] = display["event_status"].replace("", "prüfen")
+    display["Sentiment"] = display["sentiment_label"].map(sentiment_badge)
+    display["Priorität"] = display["importance"].str.capitalize()
+    display["Hinweis"] = display["conflict_note"].where(display["conflict_note"].ne(""), display["notes"])
+    display["Quelle öffnen"] = display["link"].where(display["link"].ne(""), display["source_url"])
+    visible = ["Datum", "Typ", "Titel", "Quelle", "Verifiziert", "Status", "Sentiment", "Priorität", "Hinweis", "Quelle öffnen"]
+    styled = (
+        display[visible].style
+        .map(sentiment_cell_style, subset=["Sentiment"])
+        .map(verification_cell_style, subset=["Verifiziert"])
+        .map(event_status_cell_style, subset=["Status"])
+    )
+    try:
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Quelle öffnen": st.column_config.LinkColumn("Quelle", display_text="Öffnen"),
+                "Titel": st.column_config.TextColumn("Titel", width="large"),
+                "Hinweis": st.column_config.TextColumn("Hinweis", width="large"),
+            },
+        )
+    except (TypeError, AttributeError):
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def render_event_calendar(events: pd.DataFrame) -> None:
+    st.markdown("#### Ereigniskalender 2.0")
+    display = normalize_events_frame(events)
+    if display.empty:
+        st.info("Noch keine Ereignisse gespeichert. Aktualisiere die Aktie oder ergänze einen bestätigten Termin.")
+        return
+    event_options = sorted(display["event_type"].dropna().astype(str).unique().tolist())
+    sentiment_options = ["positiv", "negativ", "gemischt", "neutral"]
+    verification_options = sorted(display["verification_level"].dropna().astype(str).unique().tolist())
+    status_options = sorted(display["event_status"].replace("", "prüfen").dropna().astype(str).unique().tolist())
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    with filter_col1:
+        selected_types = st.multiselect(
+            "Ereignistypen", event_options, default=event_options,
+            format_func=_event_type_label, key="calendar_event_types_v55",
+        )
+    with filter_col2:
+        selected_sentiments = st.multiselect(
+            "Sentiment", sentiment_options, default=sentiment_options,
+            format_func=sentiment_badge, key="calendar_sentiments_v55",
+        )
+    with filter_col3:
+        selected_verifications = st.multiselect(
+            "Quellenqualität", verification_options, default=verification_options,
+            format_func=verification_label, key="calendar_verifications_v55",
+        )
+    with filter_col4:
+        selected_statuses = st.multiselect(
+            "Status", status_options, default=status_options, key="calendar_statuses_v55",
+        )
+    display = display[
+        display["event_type"].isin(selected_types)
+        & display["sentiment_label"].str.lower().isin(selected_sentiments)
+        & display["verification_level"].isin(selected_verifications)
+        & display["event_status"].replace("", "prüfen").isin(selected_statuses)
+    ]
+    today = pd.Timestamp.now().normalize()
+    upcoming = display[display["date"].dt.normalize() >= today].sort_values(["date", "verification_score"], ascending=[True, False])
+    past = display[display["date"].dt.normalize() < today].sort_values(["date", "verification_score"], ascending=[False, False])
+    counts = st.columns(4)
+    counts[0].metric("Kommende Termine", len(upcoming))
+    counts[1].metric("Offiziell bestätigt", int(display["verification_level"].isin(["official", "official_ir"]).sum()))
+    counts[2].metric("Datenanbieter / abgeleitet", int(display["verification_level"].isin(["provider", "derived"]).sum()))
+    counts[3].metric("Bitte prüfen", int(display["event_status"].str.lower().eq("prüfen").sum()))
+    conflicts = display[display["conflict_note"].str.len() > 0]
+    if not conflicts.empty:
+        st.warning(
+            f"{len(conflicts)} Terminangabe(n) haben abweichende Quellen. "
+            "Prüfe vor einer Entscheidung bevorzugt die offizielle Unternehmensquelle."
+        )
+    st.markdown("##### Kommende Termine")
+    _render_event_table(upcoming, "Keine kommenden Termine für die gewählten Filter.")
+    with st.expander(f"Vergangene Ereignisse ({len(past)})", expanded=upcoming.empty):
+        _render_event_table(past, "Keine vergangenen Ereignisse für die gewählten Filter.")
+    with st.expander("Quellenqualität und Status verstehen", expanded=False):
+        st.markdown(
+            """
+- **🟢 Offiziell:** Einreichung bei einer Behörde, aktuell SEC EDGAR.
+- **🟢 Unternehmens-IR:** RSS-/ICS-Quelle, die du als offizielle Investor-Relations-Quelle hinterlegt hast.
+- **🔵 Manuell bestätigt:** Von dir mit Datum und Quelle eingetragener Termin.
+- **🟡 Datenanbieter:** Best-Effort-Termin von Yahoo; bitte vor wichtigen Entscheidungen mit der IR-Seite abgleichen.
+- **⚪ Aus News abgeleitet:** Ereignistyp wurde aus einer relevanten Überschrift/Beschreibung erkannt.
+- **Status „prüfen“:** Quellen nennen nahe beieinanderliegende, aber unterschiedliche Termine.
+
+Ein offizielles Filing bestätigt, dass ein Dokument eingereicht wurde. Es ist nicht automatisch ein positives oder negatives Signal.
+            """
+        )
+
+
+def render_event_source_management(ticker: str, company_name: str) -> None:
+    ensure_event_source_files()
+    with st.expander("Verifizierte Event-Quellen & manuelle Termine", expanded=False):
+        st.caption(
+            "US-Ticker werden automatisch mit SEC EDGAR abgeglichen. Für andere Unternehmen kannst du "
+            "offizielle RSS-/Atom-Feeds oder ICS-Kalender der Investor-Relations-Seite hinterlegen."
+        )
+        current = read_ir_sources()
+        current = current[current["ticker_yahoo"] == clean_ticker(ticker)].copy()
+        if current.empty:
+            st.info("Für diese Aktie ist noch keine Unternehmens-IR-Quelle hinterlegt.")
+        else:
+            st.dataframe(
+                current[["source_name", "source_type", "feed_url", "source_url", "verification_level", "enabled", "notes"]],
+                use_container_width=True, hide_index=True,
+            )
+
+        with st.form(f"add_ir_source_{ticker}", clear_on_submit=True):
+            source_cols = st.columns(2)
+            source_name = source_cols[0].text_input("Quellenname", placeholder=f"{company_name} Investor Relations")
+            source_type_label = source_cols[1].selectbox("Format", ["RSS / Atom", "ICS-Kalender", "Webseite (nur Link)"])
+            feed_url = st.text_input("Feed-/Kalender-URL", placeholder="https://...")
+            source_url = st.text_input("Offizielle Quellseite", placeholder="https://.../investor-relations")
+            verification_choice = st.selectbox(
+                "Quellenstatus", ["Offizielle Unternehmens-IR", "Andere/noch zu prüfende Quelle"]
+            )
+            notes = st.text_input("Notiz", placeholder="z. B. Finanzkalender des Unternehmens")
+            submitted = st.form_submit_button("Quelle speichern")
+            if submitted:
+                source_type = {"RSS / Atom": "rss", "ICS-Kalender": "ics", "Webseite (nur Link)": "web"}[source_type_label]
+                if not source_name.strip() or (source_type != "web" and not feed_url.strip()) or (source_type == "web" and not source_url.strip()):
+                    st.error("Bitte Quellenname und eine passende URL angeben.")
+                else:
+                    all_sources = read_ir_sources()
+                    addition = pd.DataFrame([{
+                        "ticker_yahoo": clean_ticker(ticker),
+                        "source_name": source_name.strip(),
+                        "source_type": source_type,
+                        "feed_url": feed_url.strip(),
+                        "source_url": source_url.strip(),
+                        "verification_level": "official_ir" if verification_choice.startswith("Offizielle") else "unknown",
+                        "enabled": True,
+                        "notes": notes.strip(),
+                    }])
+                    all_sources = pd.concat([all_sources, addition], ignore_index=True).drop_duplicates(
+                        ["ticker_yahoo", "source_name", "feed_url"], keep="last"
+                    )
+                    ok, message = save_ir_sources(all_sources)
+                    fetch_registered_ir_events.clear()
+                    if ok:
+                        st.success("Event-Quelle wurde gespeichert.")
+                        st.rerun()
+                    else:
+                        st.warning(message)
+
+        if not current.empty:
+            delete_labels = {
+                index: f"{row['source_name']} · {row['source_type']} · {row['feed_url'] or row['source_url']}"
+                for index, row in current.iterrows()
+            }
+            delete_index = st.selectbox(
+                "Quelle entfernen", options=list(delete_labels), format_func=lambda value: delete_labels[value],
+                key=f"delete_ir_source_select_{ticker}",
+            )
+            if st.button("Ausgewählte Quelle entfernen", key=f"delete_ir_source_{ticker}"):
+                all_sources = read_ir_sources()
+                target = current.loc[delete_index]
+                mask = (
+                    all_sources["ticker_yahoo"].eq(clean_ticker(ticker))
+                    & all_sources["source_name"].eq(str(target["source_name"]))
+                    & all_sources["feed_url"].eq(str(target["feed_url"]))
+                )
+                ok, message = save_ir_sources(all_sources.loc[~mask].copy())
+                fetch_registered_ir_events.clear()
+                if ok:
+                    st.success("Quelle wurde entfernt.")
+                    st.rerun()
+                else:
+                    st.warning(message)
+
+        st.divider()
+        st.markdown("##### Bestätigten Termin manuell ergänzen")
+        with st.form(f"manual_event_form_{ticker}", clear_on_submit=True):
+            manual_cols = st.columns(3)
+            manual_date = manual_cols[0].date_input("Datum", value=datetime.now().date())
+            manual_type = manual_cols[1].selectbox(
+                "Ereignistyp", options=list(EVENT_META), format_func=lambda value: _event_type_label(value)
+            )
+            manual_importance = manual_cols[2].selectbox("Priorität", ["hoch", "mittel", "niedrig"], index=1)
+            manual_title = st.text_input("Titel", placeholder="z. B. Hauptversammlung 2027")
+            manual_source = st.text_input("Quelle", value=f"{company_name} Investor Relations")
+            manual_link = st.text_input("Quellenlink", placeholder="https://...")
+            manual_notes = st.text_area("Notiz", height=70)
+            save_manual = st.form_submit_button("Termin speichern")
+            if save_manual:
+                if not manual_title.strip():
+                    st.error("Bitte einen Titel eintragen.")
+                else:
+                    ok, message = append_manual_event({
+                        "date": pd.Timestamp(manual_date).strftime("%Y-%m-%d"),
+                        "ticker_yahoo": clean_ticker(ticker),
+                        "event_type": manual_type,
+                        "title": manual_title.strip(),
+                        "source": manual_source.strip() or "Manuell bestätigt",
+                        "link": manual_link.strip(),
+                        "importance": manual_importance,
+                        "event_status": "bestätigt",
+                        "verification_level": "manual",
+                        "notes": manual_notes.strip(),
+                    })
+                    if ok:
+                        st.success("Termin wurde gespeichert. Aktualisiere danach News & Ereignisse.")
+                        st.rerun()
+                    else:
+                        st.warning(message)
+
+        manual = read_manual_events(ticker)
+        if not manual.empty:
+            manual = manual.sort_values("date", ascending=False).reset_index(drop=True)
+            labels = {
+                index: f"{row['date'].strftime('%d.%m.%Y')} · {_event_type_label(row['event_type'])} · {row['title']}"
+                for index, row in manual.iterrows()
+            }
+            delete_manual_index = st.selectbox(
+                "Manuellen Termin entfernen", options=list(labels), format_func=lambda value: labels[value],
+                key=f"delete_manual_event_select_{ticker}",
+            )
+            if st.button("Ausgewählten Termin entfernen", key=f"delete_manual_event_{ticker}"):
+                target = manual.loc[delete_manual_index]
+                ok, message = delete_manual_event(
+                    ticker,
+                    target["date"].strftime("%Y-%m-%d"),
+                    str(target["event_type"]),
+                    str(target["title"]),
+                )
+                if ok:
+                    st.success("Termin wurde entfernt.")
+                    st.rerun()
+                else:
+                    st.warning(message)
+
+        st.download_button(
+            "IR-Quellen-Vorlage herunterladen",
+            data=pd.DataFrame(columns=IR_SOURCE_COLUMNS).to_csv(index=False).encode("utf-8-sig"),
+            file_name="ir_sources_template.csv",
+            mime="text/csv",
+            key=f"download_ir_template_{ticker}",
+        )
+
 def render_news(df: pd.DataFrame) -> None:
     st.subheader("News & Ereignisse")
     st.caption(
-        "Relevante Unternehmensnews, bestätigte Kalendertermine und technische Quelleninformationen sind getrennt dargestellt. "
-        "Mehrdeutige Ticker werden bewusst strenger gefiltert."
+        "Relevante Unternehmensnews und Kalendertermine werden nach Quellenqualität getrennt. "
+        "SEC-Filings, Unternehmens-IR, manuelle Bestätigungen, Datenanbieter und abgeleitete News sind klar gekennzeichnet."
     )
     with st.expander("Sentiment-Logik kurz erklärt", expanded=False):
         st.markdown(
@@ -8612,8 +9706,10 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
             st.success("Aliase wurden gespeichert. Aktualisiere danach die News.")
             st.rerun()
 
+    render_event_source_management(ticker, company_name)
+
     if st.button("News & Ereignisse aktualisieren", key=f"refresh_news_{ticker}", type="primary"):
-        with st.spinner("RSS-Feeds, Such-Fallback und Yahoo-Kalender werden geladen …"):
+        with st.spinner("News, Yahoo-Kalender, offizielle Filings und hinterlegte IR-Quellen werden geladen …"):
             news, diagnostics = fetch_news_bundle(
                 ticker=ticker,
                 company_name=company_name,
@@ -8621,8 +9717,12 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
                 include_google_news=include_google,
                 locale=locale_code,
             )
-            calendar_events = fetch_yahoo_calendar_events(ticker, days_back=max(365, days_back), days_forward=365)
-            events = combine_events(news, calendar_events, ticker)
+            calendar_events = fetch_yahoo_calendar_events(ticker, days_back=max(365, days_back), days_forward=730)
+            verified_events, event_diagnostics = fetch_verified_event_bundle(
+                ticker=ticker, company_name=company_name, days_back=max(730, days_back), days_forward=730
+            )
+            diagnostics = pd.concat([diagnostics, event_diagnostics], ignore_index=True, sort=False)
+            events = combine_events(news, calendar_events, ticker, extra_events=verified_events)
             events_ok, events_message = persist_events(events, replace_ticker=ticker)
             snapshot_path = NEWS_SNAPSHOT_DIR / f"{ticker.replace('.', '_')}.csv"
             snapshot_ok, snapshot_message = safe_write_csv(news, snapshot_path)
@@ -8676,8 +9776,12 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
 
     reachable_sources = 0
     total_sources = len(diagnostics)
-    if not diagnostics.empty and "http_status" in diagnostics.columns:
-        reachable_sources = int(diagnostics["http_status"].fillna(0).astype(int).between(200, 299).sum())
+    if not diagnostics.empty:
+        http_ok = diagnostics.get("http_status", pd.Series(index=diagnostics.index, dtype=float)).fillna(0).astype(int).between(200, 299)
+        local_ok = diagnostics.get("status", pd.Series(index=diagnostics.index, dtype=str)).fillna("").astype(str).isin(
+            ["OK", "Lokal", "Nur Link", "Keine relevanten Filings", "Keine Kalenderereignisse"]
+        )
+        reachable_sources = int((http_ok | local_ok).sum())
 
     status_columns = st.columns(4)
     status_columns[0].metric("Relevante News", int(len(relevant_news)))
@@ -8751,7 +9855,7 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
                     render_news_card(item, index)
 
     elif active_news_view == "Kalender":
-        st.caption("Der Kalender enthält Yahoo-Dividenden-/Kalenderdaten sowie nur konkret klassifizierte, relevante Nachrichten.")
+        st.caption("Bevorzuge grün markierte offizielle Quellen. Yahoo-Termine und aus News abgeleitete Ereignisse dienen als Ergänzung und sollten gegengeprüft werden.")
         render_event_calendar(events)
 
     elif active_news_view == "Quellen & Diagnose":
@@ -8765,9 +9869,15 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
             ]
             visible_diagnostics = [column for column in diagnostic_columns if column in diagnostics.columns]
             st.dataframe(diagnostics[visible_diagnostics], use_container_width=True, hide_index=True)
-            failed = diagnostics[~diagnostics.get("http_status", pd.Series(dtype=float)).fillna(0).astype(int).between(200, 299)]
+            http_series = diagnostics.get("http_status", pd.Series(index=diagnostics.index, dtype=float))
+            status_series = diagnostics.get("status", pd.Series(index=diagnostics.index, dtype=str)).fillna("").astype(str)
+            attempted_http = http_series.notna()
+            failed = diagnostics[attempted_http & ~http_series.fillna(0).astype(int).between(200, 299)]
             if not failed.empty:
-                st.warning("Mindestens eine Quelle war nicht erreichbar oder lieferte keinen brauchbaren Feed. Das ist ein Quellenproblem, kein Handelssignal.")
+                st.warning("Mindestens eine Onlinequelle war nicht erreichbar oder lieferte keinen brauchbaren Feed. Das ist ein Quellenproblem, kein Handelssignal.")
+            not_configured = diagnostics[status_series.eq("Nicht konfiguriert")]
+            if not not_configured.empty:
+                st.info("Für mindestens eine optionale offizielle Quelle ist noch kein IR-Feed/Kalender hinterlegt.")
 
     elif active_news_view == "Export":
         st.caption("CSV-Export enthält relevante und unsichere Treffer samt Relevanzbegründung.")
@@ -8789,7 +9899,7 @@ Starke Phrasen werden höher gewichtet und Überschriften zählen stärker als B
 
     st.caption(
         "News-Relevanz wird aus Firmenalias und Finanz-/Unternehmenskontext abgeleitet. "
-        "Sie ist eine Filterhilfe; Quellen, Inhalte und Termine können unvollständig sein."
+        "Sie ist eine Filterhilfe. Für Termine zeigt der Kalender deshalb zusätzlich Quellenqualität, Bestätigungsstatus und mögliche Konflikte."
     )
 
 
@@ -9185,6 +10295,9 @@ def main() -> None:
             fetch_news_for_ticker.clear()
             fetch_news_bundle.clear()
             fetch_yahoo_calendar_events.clear()
+            fetch_sec_company_map.clear()
+            fetch_sec_filings_events.clear()
+            fetch_registered_ir_events.clear()
             fetch_benchmark_history.clear()
             fetch_long_history.clear()
             fetch_historical_financials.clear()
