@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.4.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -5385,22 +5385,61 @@ def persist_backtest_run(
     return False, message or registry_message
 
 
-def _save_research_case(record: dict[str, Any]) -> tuple[bool, str]:
-    columns = [
-        "saved_at", "ticker_yahoo", "as_of", "price", "currency", "bat_pattern_score",
-        "trigger", "return_12m", "benchmark_12m", "label", "notes",
-    ]
-    existing = pd.DataFrame(columns=columns)
+RESEARCH_CASE_COLUMNS = [
+    "case_id", "saved_at", "ticker_yahoo", "company_name", "sector", "as_of",
+    "price", "currency", "deep_value_score", "bat_pattern_score", "trigger",
+    "return_3m", "return_6m", "return_12m", "return_24m",
+    "benchmark_12m", "excess_return_12m", "label", "notes",
+    "dividend_yield", "drawdown_3_5y", "fcf_dividend_coverage",
+    "net_debt_ebitda", "pe_approx", "volatility_1y", "cashflow_positive",
+    "reported_eps_negative", "special_effect_suspected", "negative_news_shock",
+    "quality_score", "value_score", "growth_score", "momentum_score", "safety_score",
+]
+
+
+def load_research_cases() -> pd.DataFrame:
+    """Lädt und migriert das persönliche Lernjournal ohne alte Dateien zu zerstören."""
+    frame = pd.DataFrame(columns=RESEARCH_CASE_COLUMNS)
     if RESEARCH_CASES_PATH.exists():
         try:
-            existing = pd.read_csv(RESEARCH_CASES_PATH)
+            frame = pd.read_csv(RESEARCH_CASES_PATH)
         except Exception:
-            existing = pd.DataFrame(columns=columns)
-    for column in columns:
-        if column not in existing.columns:
-            existing[column] = None
-    updated = pd.concat([existing[columns], pd.DataFrame([{column: record.get(column) for column in columns}])], ignore_index=True)
-    return safe_write_csv(updated, RESEARCH_CASES_PATH)
+            frame = pd.DataFrame(columns=RESEARCH_CASE_COLUMNS)
+    frame = deduplicate_dataframe_columns(frame)
+    for column in RESEARCH_CASE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = None
+
+    # Alte Versionen speicherten nur bat_pattern_score. Beide Namen bleiben zur
+    # Rückwärtskompatibilität erhalten, der neue Name wird bevorzugt.
+    deep = pd.to_numeric(frame["deep_value_score"], errors="coerce")
+    legacy = pd.to_numeric(frame["bat_pattern_score"], errors="coerce")
+    frame["deep_value_score"] = deep.fillna(legacy)
+    frame["bat_pattern_score"] = legacy.fillna(deep)
+
+    if frame["case_id"].isna().any() or frame["case_id"].astype(str).str.strip().eq("").any():
+        for idx in frame.index:
+            current = str(frame.at[idx, "case_id"] or "").strip()
+            if not current or current.lower() == "nan":
+                ticker = clean_ticker(frame.at[idx, "ticker_yahoo"])
+                date_part = str(frame.at[idx, "as_of"] or "unknown").replace("-", "")
+                frame.at[idx, "case_id"] = f"{ticker or 'CASE'}_{date_part}_{idx + 1}"
+    return frame[RESEARCH_CASE_COLUMNS].copy()
+
+
+def _save_research_case(record: dict[str, Any]) -> tuple[bool, str]:
+    existing = load_research_cases()
+    case_id = str(record.get("case_id") or "").strip()
+    if not case_id:
+        ticker = clean_ticker(record.get("ticker_yahoo")) or "CASE"
+        date_part = str(record.get("as_of") or datetime.now().date().isoformat()).replace("-", "")
+        case_id = f"{ticker}_{date_part}_{int(time.time())}"
+    payload = {column: record.get(column) for column in RESEARCH_CASE_COLUMNS}
+    payload["case_id"] = case_id
+    payload["deep_value_score"] = record.get("deep_value_score", record.get("bat_pattern_score"))
+    payload["bat_pattern_score"] = record.get("bat_pattern_score", record.get("deep_value_score"))
+    updated = pd.concat([existing, pd.DataFrame([payload])], ignore_index=True)
+    return safe_write_csv(updated[RESEARCH_CASE_COLUMNS], RESEARCH_CASES_PATH)
 
 
 
@@ -5989,16 +6028,19 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
         return
 
     company_name = ticker
+    company_sector = "Unbekannt"
     if df is not None and not df.empty and {"ticker_yahoo", "name"}.issubset(df.columns):
         match = df[df["ticker_yahoo"].astype(str) == ticker]
         if not match.empty:
             company_name = str(match.iloc[0].get("name") or ticker)
-    if company_name == ticker:
+            company_sector = str(match.iloc[0].get("sector") or "Unbekannt")
+    if company_name == ticker or company_sector == "Unbekannt":
         try:
             ticker_info = fetch_ticker_info(ticker)
-            company_name = str(ticker_info.get("longName") or ticker_info.get("shortName") or ticker)
+            company_name = str(ticker_info.get("longName") or ticker_info.get("shortName") or company_name)
+            company_sector = str(ticker_info.get("sector") or company_sector)
         except Exception:
-            company_name = ticker
+            company_name = company_name or ticker
 
     benchmark_choices = {
         f"Aktueller Index ({index_name})": benchmark_for_index(index_name),
@@ -6571,25 +6613,44 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     label = journal_cols[0].selectbox("Eigene Einordnung", ["offen", "guter Treffer", "Value Trap", "zu riskant", "verpasst"], key="research_case_label")
     notes = journal_cols[1].text_input("Notiz", placeholder="Was war damals besonders?", key="research_case_notes")
     if st.button("Fall speichern", key="save_research_case"):
-        return_12m = None
-        benchmark_12m = None
-        if not forward.empty:
-            row_12m = forward[forward["Horizont"] == "12 Monate"]
-            if not row_12m.empty:
-                return_12m = row_12m.iloc[0].get("Aktienrendite")
-                benchmark_12m = row_12m.iloc[0].get("Benchmark")
+        def _forward_metric(horizon: str, column: str) -> Any:
+            if forward is None or forward.empty:
+                return None
+            match_row = forward[forward["Horizont"] == horizon]
+            return match_row.iloc[0].get(column) if not match_row.empty else None
+
+        return_12m = _forward_metric("12 Monate", "Aktienrendite")
+        benchmark_12m = _forward_metric("12 Monate", "Benchmark")
+        excess_12m = _forward_metric("12 Monate", "Überrendite")
         success, message = _save_research_case({
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "ticker_yahoo": ticker,
+            "company_name": company_name,
+            "sector": company_sector,
             "as_of": pd.Timestamp(snapshot["price_date"]).date().isoformat(),
             "price": snapshot.get("price"),
             "currency": snapshot.get("currency"),
+            "deep_value_score": score,
             "bat_pattern_score": score,
             "trigger": trigger,
+            "return_3m": _forward_metric("3 Monate", "Aktienrendite"),
+            "return_6m": _forward_metric("6 Monate", "Aktienrendite"),
             "return_12m": return_12m,
+            "return_24m": _forward_metric("24 Monate", "Aktienrendite"),
             "benchmark_12m": benchmark_12m,
+            "excess_return_12m": excess_12m,
             "label": label,
             "notes": notes,
+            "dividend_yield": snapshot.get("dividend_yield"),
+            "drawdown_3_5y": snapshot.get("deepest_drawdown_3_5y_pct"),
+            "fcf_dividend_coverage": snapshot.get("cashflow_dividend_coverage"),
+            "net_debt_ebitda": snapshot.get("net_debt_ebitda"),
+            "pe_approx": snapshot.get("pe_approx"),
+            "volatility_1y": snapshot.get("volatility_1y"),
+            "cashflow_positive": snapshot.get("cashflow_positive"),
+            "reported_eps_negative": snapshot.get("reported_eps_negative"),
+            "special_effect_suspected": snapshot.get("special_effect_suspected"),
+            "negative_news_shock": snapshot.get("negative_news_shock"),
         })
         if success:
             st.success("Fall wurde unter data/research_cases.csv gespeichert.")
@@ -6599,10 +6660,434 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     if RESEARCH_CASES_PATH.exists():
         with st.expander("Gespeicherte Lernfälle", expanded=False):
             try:
-                cases = pd.read_csv(RESEARCH_CASES_PATH)
+                cases = load_research_cases()
                 st.dataframe(cases, use_container_width=True, hide_index=True)
             except Exception as error:
                 st.warning(f"Lernjournal konnte nicht gelesen werden: {error}")
+
+
+# -----------------------------------------------------------------------------
+# Persönliches Lernmodul
+# -----------------------------------------------------------------------------
+
+LEARNING_FEATURES: dict[str, dict[str, Any]] = {
+    "deep_value_score": {"label": "Deep-Value-Score", "scale": 35.0, "format": "number"},
+    "dividend_yield": {"label": "Dividendenrendite", "scale": 8.0, "format": "percent"},
+    "drawdown_3_5y": {"label": "3J-/5J-Drawdown", "scale": 45.0, "format": "percent"},
+    "fcf_dividend_coverage": {"label": "FCF/Dividende", "scale": 2.0, "format": "multiple"},
+    "net_debt_ebitda": {"label": "Net Debt/EBITDA", "scale": 5.0, "format": "multiple"},
+    "pe_approx": {"label": "Historisches KGV", "scale": 25.0, "format": "number"},
+    "volatility_1y": {"label": "Volatilität 1J", "scale": 40.0, "format": "percent"},
+    "quality_score": {"label": "Qualitäts-Score", "scale": 50.0, "format": "number"},
+    "value_score": {"label": "Value-Score", "scale": 50.0, "format": "number"},
+    "growth_score": {"label": "Growth-Score", "scale": 50.0, "format": "number"},
+    "momentum_score": {"label": "Momentum-Score", "scale": 50.0, "format": "number"},
+    "safety_score": {"label": "Safety-Score", "scale": 50.0, "format": "number"},
+}
+
+
+def _normalise_learning_label(value: Any) -> str:
+    text_value = str(value or "offen").strip().lower()
+    aliases = {
+        "guter treffer": "guter Treffer",
+        "erfolg": "guter Treffer",
+        "value trap": "Value Trap",
+        "value-trap": "Value Trap",
+        "zu riskant": "zu riskant",
+        "verpasst": "verpasst",
+        "offen": "offen",
+    }
+    return aliases.get(text_value, str(value or "offen").strip() or "offen")
+
+
+def prepare_learning_cases(cases: pd.DataFrame) -> pd.DataFrame:
+    """Bereitet manuelle und automatisch auswertbare Lernfälle einheitlich auf."""
+    if cases is None or cases.empty:
+        return pd.DataFrame(columns=RESEARCH_CASE_COLUMNS)
+    frame = deduplicate_dataframe_columns(cases).copy()
+    for column in RESEARCH_CASE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = None
+    numeric_columns = [
+        "price", "deep_value_score", "bat_pattern_score", "return_3m", "return_6m",
+        "return_12m", "return_24m", "benchmark_12m", "excess_return_12m",
+        *LEARNING_FEATURES.keys(),
+    ]
+    for column in dict.fromkeys(numeric_columns):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["deep_value_score"] = frame["deep_value_score"].fillna(frame["bat_pattern_score"])
+    frame["excess_return_12m"] = frame["excess_return_12m"].fillna(
+        frame["return_12m"] - frame["benchmark_12m"]
+    )
+    frame["label"] = frame["label"].map(_normalise_learning_label)
+    frame["as_of"] = pd.to_datetime(frame["as_of"], errors="coerce")
+
+    def classify(row: pd.Series) -> str:
+        label = _normalise_learning_label(row.get("label"))
+        if label == "guter Treffer":
+            return "Erfolg"
+        if label == "Value Trap":
+            return "Value Trap"
+        return_12m = safe_float(row.get("return_12m"))
+        excess = safe_float(row.get("excess_return_12m"))
+        if return_12m is not None and excess is not None:
+            if return_12m > 0 and excess > 0:
+                return "Erfolg (automatisch)"
+            if return_12m < 0 and excess < 0:
+                return "Schwach (automatisch)"
+        return "Offen"
+
+    frame["learning_outcome"] = frame.apply(classify, axis=1)
+    frame["binary_outcome"] = frame["learning_outcome"].map({
+        "Erfolg": 1.0,
+        "Erfolg (automatisch)": 1.0,
+        "Value Trap": 0.0,
+        "Schwach (automatisch)": 0.0,
+    })
+    available_feature_columns = [column for column in LEARNING_FEATURES if column in frame.columns]
+    frame["feature_count"] = frame[available_feature_columns].notna().sum(axis=1) if available_feature_columns else 0
+    frame["feature_coverage"] = frame["feature_count"] / max(len(LEARNING_FEATURES), 1) * 100
+    return frame
+
+
+def learning_evidence_label(count: int) -> tuple[str, str]:
+    if count < 3:
+        return "sehr gering", "Weniger als drei auswertbare Fälle – nur als Notizsammlung verwenden."
+    if count < 6:
+        return "gering", "Erste Tendenzen sind sichtbar, aber einzelne Fälle dominieren das Ergebnis."
+    if count < 15:
+        return "mittel", "Mehrere unabhängige Fälle erlauben eine vorsichtige statistische Einordnung."
+    if count < 30:
+        return "gut", "Die Stichprobe ist für ein persönliches Regelwerk brauchbar, bleibt aber selektiv."
+    return "höher", "Die Stichprobe ist vergleichsweise breit; Datenqualität und Auswahlverzerrung bleiben wichtig."
+
+
+def learning_feature_summary(cases: pd.DataFrame) -> pd.DataFrame:
+    """Vergleicht robuste Mediane erfolgreicher und schwacher Fälle je Merkmal."""
+    prepared = prepare_learning_cases(cases)
+    binary = prepared.dropna(subset=["binary_outcome"]).copy()
+    if binary.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for column, config in LEARNING_FEATURES.items():
+        if column not in binary.columns:
+            continue
+        success = pd.to_numeric(binary.loc[binary["binary_outcome"] == 1, column], errors="coerce").dropna()
+        weak = pd.to_numeric(binary.loc[binary["binary_outcome"] == 0, column], errors="coerce").dropna()
+        if success.empty or weak.empty:
+            continue
+        success_median = safe_float(success.median())
+        weak_median = safe_float(weak.median())
+        difference = success_median - weak_median if success_median is not None and weak_median is not None else None
+        scale = float(config.get("scale", 1.0) or 1.0)
+        separation = min(abs(difference or 0.0) / scale * 100.0, 100.0)
+        direction = "bei Erfolgen höher" if (difference or 0) > 0 else "bei Erfolgen niedriger" if (difference or 0) < 0 else "kein Unterschied"
+        count = len(success) + len(weak)
+        evidence, _ = learning_evidence_label(count)
+        rows.append({
+            "Merkmal": config["label"],
+            "Spalte": column,
+            "Median gute Treffer": success_median,
+            "Median schwache Fälle": weak_median,
+            "Differenz": difference,
+            "Trennschärfe": separation,
+            "Beobachtung": direction,
+            "Erfolg-Fälle": len(success),
+            "Schwache Fälle": len(weak),
+            "Aussagekraft": evidence,
+        })
+    return pd.DataFrame(rows).sort_values(["Trennschärfe", "Erfolg-Fälle"], ascending=[False, False]).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def _current_learning_snapshot(row: pd.Series) -> dict[str, Any]:
+    return {
+        "ticker_yahoo": clean_ticker(row.get("ticker_yahoo")),
+        "company_name": row.get("name") or row.get("ticker_yahoo"),
+        "sector": row.get("sector") or "Unbekannt",
+        "deep_value_score": safe_float(row.get("special_situation_score")),
+        "dividend_yield": safe_float(row.get("dividend_yield")),
+        "drawdown_3_5y": safe_float(row.get("deepest_drawdown_3_5y_pct")),
+        "fcf_dividend_coverage": safe_float(row.get("cashflow_dividend_coverage")),
+        "net_debt_ebitda": safe_float(row.get("net_debt_ebitda")),
+        "pe_approx": safe_float(row.get("pe_ratio")),
+        "volatility_1y": safe_float(row.get("vol_1y")),
+        "quality_score": safe_float(row.get("total_score")),
+        "value_score": safe_float(row.get("value_profile_score", row.get("value_score"))),
+        "growth_score": safe_float(row.get("growth_score")),
+        "momentum_score": safe_float(row.get("momentum_score")),
+        "safety_score": safe_float(row.get("safety_score")),
+    }
+
+
+def learning_case_similarity(current: dict[str, Any], case: pd.Series) -> dict[str, Any]:
+    components: list[float] = []
+    details: list[str] = []
+    for column, config in LEARNING_FEATURES.items():
+        current_value = safe_float(current.get(column))
+        historical_value = safe_float(case.get(column))
+        if current_value is None or historical_value is None:
+            continue
+        scale = float(config.get("scale", 1.0) or 1.0)
+        similarity = max(0.0, min(1.0, 1.0 - abs(current_value - historical_value) / scale))
+        components.append(similarity)
+        details.append(f"{config['label']}: {similarity * 100:.0f} %")
+    if not components:
+        return {"similarity": None, "coverage": 0.0, "details": "Keine gemeinsamen Merkmale"}
+    similarity = sum(components) / len(components)
+    current_sector = str(current.get("sector") or "").strip().lower()
+    historical_sector = str(case.get("sector") or "").strip().lower()
+    if current_sector and historical_sector and current_sector == historical_sector:
+        similarity = min(1.0, similarity + 0.05)
+        details.append("Sektorbonus: +5 Punkte")
+    return {
+        "similarity": similarity * 100.0,
+        "coverage": len(components) / max(len(LEARNING_FEATURES), 1) * 100.0,
+        "details": " | ".join(details),
+    }
+
+
+def current_learning_comparison(current: dict[str, Any], cases: pd.DataFrame, min_coverage: float = 20.0) -> pd.DataFrame:
+    prepared = prepare_learning_cases(cases)
+    if prepared.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for _, case in prepared.iterrows():
+        similarity = learning_case_similarity(current, case)
+        if similarity.get("similarity") is None or float(similarity.get("coverage") or 0) < float(min_coverage):
+            continue
+        rows.append({
+            "Fall-ID": case.get("case_id"),
+            "Ticker": case.get("ticker_yahoo"),
+            "Unternehmen": case.get("company_name") or case.get("ticker_yahoo"),
+            "Sektor": case.get("sector") or "Unbekannt",
+            "Stichtag": case.get("as_of"),
+            "Ähnlichkeit": similarity.get("similarity"),
+            "Merkmalsabdeckung": similarity.get("coverage"),
+            "Einordnung": case.get("learning_outcome"),
+            "Rendite 12M": case.get("return_12m"),
+            "Überrendite 12M": case.get("excess_return_12m"),
+            "Notiz": case.get("notes"),
+            "Ähnlichkeitsdetails": similarity.get("details"),
+        })
+    return pd.DataFrame(rows).sort_values(["Ähnlichkeit", "Merkmalsabdeckung"], ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def weighted_learning_expectation(comparisons: pd.DataFrame, top_n: int = 10) -> dict[str, Any]:
+    if comparisons is None or comparisons.empty:
+        return {"count": 0}
+    frame = comparisons.head(int(top_n)).copy()
+    frame["weight"] = (pd.to_numeric(frame["Ähnlichkeit"], errors="coerce") / 100.0).clip(lower=0) ** 2
+    valid = frame.dropna(subset=["Rendite 12M", "weight"])
+    weight_sum = safe_float(valid["weight"].sum()) if not valid.empty else None
+    weighted_return = None
+    if weight_sum not in (None, 0):
+        weighted_return = safe_float((valid["Rendite 12M"] * valid["weight"]).sum() / weight_sum)
+    success = frame["Einordnung"].astype(str).str.startswith("Erfolg")
+    weak = frame["Einordnung"].astype(str).isin(["Value Trap", "Schwach (automatisch)"])
+    return {
+        "count": len(frame),
+        "weighted_return": weighted_return,
+        "success_rate": float(success.mean() * 100) if len(frame) else None,
+        "weak_rate": float(weak.mean() * 100) if len(frame) else None,
+        "average_similarity": safe_float(pd.to_numeric(frame["Ähnlichkeit"], errors="coerce").mean()),
+    }
+
+
+def _render_learning_metric(value: Any, kind: str) -> str:
+    if kind == "percent":
+        return format_percent(value, 2, signed=True)
+    if kind == "multiple":
+        return f"{format_number(value, 2)}x"
+    return format_number(value, 2)
+
+
+def render_learning_module(df: pd.DataFrame) -> None:
+    st.subheader("Persönliches Lernmodul")
+    st.caption(
+        "Das Lernmodul wertet dein eigenes Research-Journal transparent aus. Es sucht robuste "
+        "Unterschiede zwischen guten Treffern und schwachen Fällen und vergleicht heutige Aktien "
+        "mit deinen gespeicherten Beispielen. Es ist bewusst kein Black-Box-Kaufsignal."
+    )
+
+    with st.expander("So arbeitet das Lernmodul", expanded=False):
+        st.markdown(
+            """
+            1. Speichere historische Fälle im Bereich **Backtesting** und ordne sie ein.
+            2. Das Modul bevorzugt deine manuelle Bewertung. Bei offenen Fällen kann eine spätere
+               positive Rendite und Überrendite vorsichtig als automatischer Erfolg gelten.
+            3. Merkmale werden über robuste Mediane verglichen – nicht über ein undurchsichtiges KI-Modell.
+            4. Für eine heutige Aktie werden die ähnlichsten gespeicherten Fälle gesucht.
+
+            **Wichtig:** Kleine oder selektiv gespeicherte Stichproben können stark verzerren.
+            Das Journal sollte auch schlechte, verpasste und unsichere Fälle enthalten.
+            """
+        )
+
+    raw_cases = load_research_cases()
+    cases = prepare_learning_cases(raw_cases)
+    if cases.empty:
+        st.info(
+            "Noch keine Lernfälle vorhanden. Öffne den Bereich Backtesting, analysiere einen "
+            "historischen Stichtag und speichere den Fall im Lernjournal."
+        )
+        return
+
+    evaluable = cases.dropna(subset=["binary_outcome"])
+    evidence, evidence_text = learning_evidence_label(len(evaluable))
+    metrics = st.columns(6)
+    metrics[0].metric("Gespeicherte Fälle", len(cases))
+    metrics[1].metric("Auswertbar", len(evaluable))
+    metrics[2].metric("Gute Treffer", int((cases["learning_outcome"].astype(str).str.startswith("Erfolg")).sum()))
+    metrics[3].metric("Schwache/Trap-Fälle", int(cases["learning_outcome"].isin(["Value Trap", "Schwach (automatisch)"]).sum()))
+    metrics[4].metric("Ø 12M-Rendite", format_percent(cases["return_12m"].mean(), 2, signed=True))
+    metrics[5].metric("Aussagekraft", evidence)
+    if len(evaluable) < 6:
+        st.warning(f"Noch geringe Lernbasis: {evidence_text}")
+    else:
+        st.info(evidence_text)
+
+    st.markdown("### Journal pflegen")
+    st.caption("Du kannst Einordnung und Notiz direkt ändern. Die Rohdaten des historischen Falls bleiben unverändert.")
+    editable_columns = [
+        "case_id", "ticker_yahoo", "company_name", "sector", "as_of", "return_12m",
+        "excess_return_12m", "label", "notes",
+    ]
+    editor_frame = cases[[column for column in editable_columns if column in cases.columns]].copy()
+    if "as_of" in editor_frame.columns:
+        editor_frame["as_of"] = pd.to_datetime(editor_frame["as_of"], errors="coerce").dt.date
+    edited = st.data_editor(
+        editor_frame,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[column for column in editor_frame.columns if column not in {"label", "notes"}],
+        key="learning_case_editor",
+    )
+    action_cols = st.columns([1, 1, 2])
+    if action_cols[0].button("Änderungen speichern", key="save_learning_edits"):
+        updated = raw_cases.copy()
+        if "case_id" in edited.columns:
+            edit_map = edited.set_index("case_id")
+            for idx, row in updated.iterrows():
+                case_id = row.get("case_id")
+                if case_id in edit_map.index:
+                    updated.at[idx, "label"] = edit_map.at[case_id, "label"]
+                    updated.at[idx, "notes"] = edit_map.at[case_id, "notes"]
+        success, message = safe_write_csv(updated[RESEARCH_CASE_COLUMNS], RESEARCH_CASES_PATH)
+        if success:
+            st.success("Lernjournal aktualisiert.")
+            st.rerun()
+        else:
+            st.warning(message)
+    action_cols[1].download_button(
+        "Journal exportieren",
+        data=raw_cases.to_csv(index=False).encode("utf-8-sig"),
+        file_name="research_cases.csv",
+        mime="text/csv",
+        key="download_learning_journal",
+    )
+
+    st.markdown("### Was hat das Journal bisher gelernt?")
+    summary = learning_feature_summary(cases)
+    if summary.empty:
+        st.info(
+            "Für einen Merkmalsvergleich braucht das Journal mindestens einen auswertbaren guten "
+            "und einen schwachen Fall mit gemeinsamen Kennzahlen."
+        )
+    else:
+        top_summary = summary.head(8).copy()
+        display_summary = top_summary[[
+            "Merkmal", "Median gute Treffer", "Median schwache Fälle", "Beobachtung",
+            "Trennschärfe", "Erfolg-Fälle", "Schwache Fälle", "Aussagekraft",
+        ]]
+        st.dataframe(
+            display_summary.style.format({
+                "Median gute Treffer": "{:.2f}",
+                "Median schwache Fälle": "{:.2f}",
+                "Trennschärfe": "{:.0f} %",
+            }, na_rep="–"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        best = top_summary.iloc[0]
+        st.info(
+            f"Stärkste bisher beobachtete Trennung: **{best['Merkmal']}** – "
+            f"{best['Beobachtung']} (Trennschärfe {safe_float(best['Trennschärfe']) or 0:.0f} %). "
+            "Das ist eine Beobachtung deines Journals, keine allgemein gültige Börsenregel."
+        )
+        chart_data = top_summary[["Merkmal", "Trennschärfe", "Beobachtung"]].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X("Trennschärfe:Q", title="Robuste Trennschärfe (%)", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("Merkmal:N", sort="-x", title=None),
+            tooltip=["Merkmal:N", alt.Tooltip("Trennschärfe:Q", format=".0f"), "Beobachtung:N"],
+        ).properties(height=max(240, len(chart_data) * 34))
+        st.altair_chart(chart, use_container_width=True)
+
+    st.markdown("### Heutige Aktie mit dem eigenen Journal vergleichen")
+    if df is None or df.empty:
+        st.info("Lade zuerst einen Index, um eine heutige Aktie mit dem Lernjournal zu vergleichen.")
+        return
+    ticker = company_selectbox("Aktie auswählen", df, key="learning_current_ticker")
+    selected = df[df["ticker_yahoo"].astype(str) == ticker]
+    if selected.empty:
+        return
+    current = _current_learning_snapshot(selected.iloc[0])
+    min_coverage = st.slider(
+        "Minimale gemeinsame Merkmalsabdeckung",
+        10, 80, value=25, step=5, key="learning_min_similarity_coverage",
+        help="Alte Lernfälle enthalten eventuell noch weniger Merkmale. Je höher der Wert, desto strenger der Vergleich.",
+    )
+    comparisons = current_learning_comparison(current, cases, min_coverage=float(min_coverage))
+    if comparisons.empty:
+        st.info("Keine gespeicherten Fälle mit genügend gemeinsamen Merkmalen gefunden.")
+        return
+
+    expectation = weighted_learning_expectation(comparisons, top_n=min(10, len(comparisons)))
+    comparison_cols = st.columns(5)
+    comparison_cols[0].metric("Vergleichsfälle", expectation.get("count", 0))
+    comparison_cols[1].metric("Ø Ähnlichkeit", format_percent(expectation.get("average_similarity"), 1))
+    comparison_cols[2].metric("Gewichtete 12M-Rendite", format_percent(expectation.get("weighted_return"), 2, signed=True))
+    comparison_cols[3].metric("Erfolgsanteil", format_percent(expectation.get("success_rate"), 1))
+    comparison_cols[4].metric("Schwach/Trap", format_percent(expectation.get("weak_rate"), 1))
+
+    comparison_evidence, comparison_text = learning_evidence_label(int(expectation.get("count") or 0))
+    if int(expectation.get("count") or 0) < 6:
+        st.warning(f"Aussagekraft {comparison_evidence}: {comparison_text}")
+    else:
+        st.info(f"Aussagekraft {comparison_evidence}: {comparison_text}")
+
+    display_comparisons = comparisons.head(15).copy()
+    display_comparisons["Stichtag"] = pd.to_datetime(display_comparisons["Stichtag"], errors="coerce").dt.strftime("%d.%m.%Y")
+    st.dataframe(
+        display_comparisons[[
+            "Unternehmen", "Ticker", "Stichtag", "Ähnlichkeit", "Merkmalsabdeckung",
+            "Einordnung", "Rendite 12M", "Überrendite 12M", "Notiz",
+        ]].style.format({
+            "Ähnlichkeit": "{:.0f} %",
+            "Merkmalsabdeckung": "{:.0f} %",
+            "Rendite 12M": lambda value: format_percent(value, 2, signed=True),
+            "Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
+        }, na_rep="–").map(colorize_change, subset=["Rendite 12M", "Überrendite 12M"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Warum gelten diese Fälle als ähnlich?", expanded=False):
+        detail_case = st.selectbox(
+            "Vergleichsfall",
+            options=list(display_comparisons.index),
+            format_func=lambda idx: (
+                f"{display_comparisons.loc[idx, 'Unternehmen']} ({display_comparisons.loc[idx, 'Ticker']}) · "
+                f"{safe_float(display_comparisons.loc[idx, 'Ähnlichkeit']) or 0:.0f} %"
+            ),
+            key="learning_similarity_detail",
+        )
+        st.write(display_comparisons.loc[detail_case, "Ähnlichkeitsdetails"])
+
+    st.caption(
+        "Die gewichtete Rendite ist eine Zusammenfassung deiner ähnlichsten gespeicherten Fälle. "
+        "Sie ist keine Prognose und kann durch selektive Fallauswahl, kleine Stichproben und fehlende Daten verzerrt sein."
+    )
 
 
 def render_research(df: pd.DataFrame, histories: dict[str, pd.DataFrame], index_name: str) -> None:
@@ -8766,7 +9251,7 @@ def main() -> None:
     # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
     main_pages = [
         "Überblick", "Datenstatus", "Fundamentaldaten", "Aktienprofile", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Research",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Lernmodul", "Research",
     ]
     if st.session_state.get("main_navigation") not in main_pages:
         st.session_state["main_navigation"] = main_pages[0]
@@ -8819,6 +9304,8 @@ def main() -> None:
         render_bat_backtesting(data, index_name)
     elif active_page == "Mustervergleich":
         render_universe_pattern_comparison(data, index_name)
+    elif active_page == "Lernmodul":
+        render_learning_module(data)
     elif active_page == "Research":
         render_research(data, histories, index_name)
 
