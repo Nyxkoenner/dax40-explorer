@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.0.3"
+APP_VERSION = "5.1.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -698,7 +698,14 @@ def empty_metrics_frame() -> pd.DataFrame:
         "payout_ratio", "dividend_growth_5y", "dividend_frequency",
         "dividend_yield_5y_avg", "dividend_yield_vs_5y_avg_pct",
         "operating_cashflow", "free_cashflow", "shares_outstanding",
-        "cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda", "beta", "data_updated_at",
+        "cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda", "beta",
+        "revenue_growth", "earnings_growth", "earnings_quarterly_growth",
+        "gross_margin", "ebitda_margin", "current_ratio", "quick_ratio",
+        "change_1m", "change_3m", "change_6m", "price_vs_sma50_pct", "price_vs_sma200_pct",
+        "growth_score", "growth_coverage", "growth_components",
+        "momentum_score", "momentum_coverage", "momentum_components",
+        "safety_score", "safety_coverage", "safety_components",
+        "data_updated_at",
     ]
     return pd.DataFrame(columns=columns)
 
@@ -1085,6 +1092,10 @@ def fetch_ticker_info(ticker: str) -> dict[str, Any]:
         "operatingCashflow", "freeCashflow", "sharesOutstanding",
         "currency", "financialCurrency", "beta",
 
+        # Wachstum, Liquidität und zusätzliche Qualitätskennzahlen
+        "revenueGrowth", "earningsGrowth", "earningsQuarterlyGrowth",
+        "grossMargins", "ebitdaMargins", "currentRatio", "quickRatio",
+
         # Unternehmensprofil und Management
         "shortName", "longName", "sector", "industry", "country", "city",
         "fullTimeEmployees", "website", "longBusinessSummary",
@@ -1312,6 +1323,18 @@ def metrics_from_ticker(
         "debt_to_equity": None,
         "net_debt_ebitda": None,
         "beta": safe_float(info.get("beta")),
+        "revenue_growth": to_percent(info.get("revenueGrowth")),
+        "earnings_growth": to_percent(info.get("earningsGrowth")),
+        "earnings_quarterly_growth": to_percent(info.get("earningsQuarterlyGrowth")),
+        "gross_margin": to_percent(info.get("grossMargins")),
+        "ebitda_margin": to_percent(info.get("ebitdaMargins")),
+        "current_ratio": safe_float(info.get("currentRatio")),
+        "quick_ratio": safe_float(info.get("quickRatio")),
+        "change_1m": None,
+        "change_3m": None,
+        "change_6m": None,
+        "price_vs_sma50_pct": None,
+        "price_vs_sma200_pct": None,
         "data_updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
 
@@ -1333,7 +1356,22 @@ def metrics_from_ticker(
             record["last_price"] = safe_float(close.iloc[-1])
             record["change_1d"] = series_change(close, 1)
             record["change_5d"] = series_change(close, 5)
+            record["change_1m"] = series_change(close, 21)
+            record["change_3m"] = series_change(close, 63)
+            record["change_6m"] = series_change(close, 126)
             record["change_1y"] = series_change(close, 252) if len(close) >= 253 else None
+
+            last_close = safe_float(close.iloc[-1])
+            if last_close not in (None, 0):
+                if len(close) >= 50:
+                    sma50 = safe_float(close.tail(50).mean())
+                    if sma50 not in (None, 0):
+                        record["price_vs_sma50_pct"] = (last_close / sma50 - 1) * 100
+                if len(close) >= 200:
+                    sma200 = safe_float(close.tail(200).mean())
+                    if sma200 not in (None, 0):
+                        record["price_vs_sma200_pct"] = (last_close / sma200 - 1) * 100
+
             record["high_52w"] = safe_float(one_year.max())
             record["low_52w"] = safe_float(one_year.min())
             if len(returns) >= 30:
@@ -1809,6 +1847,178 @@ def compute_value_trigger_and_score(
     })
 
 
+
+def _normalised_component_score(
+    components: list[tuple[str, Optional[float], float]],
+) -> pd.Series:
+    """Normalisiert Profilpunkte und weist die Datenabdeckung transparent aus."""
+    available = [(name, points, weight) for name, points, weight in components if points is not None]
+    total_possible = sum(weight for _, _, weight in components)
+    available_weight = sum(weight for _, _, weight in available)
+    if available_weight <= 0 or total_possible <= 0:
+        return pd.Series({"score": None, "coverage": 0.0, "components": "Keine ausreichenden Daten"})
+    raw = sum(float(points) for _, points, _ in available) / available_weight * 100.0
+    coverage = available_weight / total_possible * 100.0
+    adjusted = raw * (0.65 + 0.35 * coverage / 100.0)
+    details = " | ".join(f"{name}: {float(points):.0f}/{weight:.0f}" for name, points, weight in available)
+    return pd.Series({"score": round(adjusted, 1), "coverage": round(coverage, 1), "components": details})
+
+
+def _growth_points(value: Optional[float], max_points: float) -> Optional[float]:
+    if value is None:
+        return None
+    if value >= 25:
+        return max_points
+    if value >= 15:
+        return max_points * 0.85
+    if value >= 8:
+        return max_points * 0.65
+    if value >= 3:
+        return max_points * 0.45
+    if value >= 0:
+        return max_points * 0.25
+    if value >= -10:
+        return max_points * 0.10
+    return 0.0
+
+
+def compute_growth_score(row: pd.Series) -> pd.Series:
+    """Wachstumsprofil aus Umsatz, Ergebnis, Margen und Kapitalrendite."""
+    revenue_growth = safe_float(row.get("revenue_growth"))
+    earnings_growth = safe_float(row.get("earnings_growth"))
+    if earnings_growth is None:
+        earnings_growth = safe_float(row.get("earnings_quarterly_growth"))
+    operating_margin = safe_float(row.get("operating_margin"))
+    gross_margin = safe_float(row.get("gross_margin"))
+    roe = safe_float(row.get("roe"))
+
+    margin_points = None
+    margin_value = operating_margin if operating_margin is not None else gross_margin
+    if margin_value is not None:
+        margin_points = 20 if margin_value >= 25 else 16 if margin_value >= 15 else 12 if margin_value >= 8 else 7 if margin_value >= 3 else 2
+    roe_points = None
+    if roe is not None:
+        roe_points = 15 if roe >= 25 else 12 if roe >= 15 else 9 if roe >= 10 else 5 if roe >= 5 else 1
+
+    result = _normalised_component_score([
+        ("Umsatzwachstum", _growth_points(revenue_growth, 30), 30),
+        ("Ergebniswachstum", _growth_points(earnings_growth, 35), 35),
+        ("Marge", margin_points, 20),
+        ("ROE", roe_points, 15),
+    ])
+    return pd.Series({
+        "growth_score": result["score"],
+        "growth_coverage": result["coverage"],
+        "growth_components": result["components"],
+    })
+
+
+def _momentum_return_points(value: Optional[float], max_points: float) -> Optional[float]:
+    if value is None:
+        return None
+    if value >= 20:
+        return max_points
+    if value >= 10:
+        return max_points * 0.8
+    if value >= 3:
+        return max_points * 0.6
+    if value >= 0:
+        return max_points * 0.45
+    if value >= -5:
+        return max_points * 0.25
+    if value >= -15:
+        return max_points * 0.10
+    return 0.0
+
+
+def compute_momentum_score(row: pd.Series) -> pd.Series:
+    """Trendprofil aus mehreren Zeithorizonten und Abstand zu SMA 50/200."""
+    sma50 = safe_float(row.get("price_vs_sma50_pct"))
+    sma200 = safe_float(row.get("price_vs_sma200_pct"))
+    sma_points = None
+    if sma50 is not None or sma200 is not None:
+        sma_points = 0.0
+        if sma50 is not None:
+            sma_points += 8 if sma50 >= 5 else 6 if sma50 >= 0 else 2 if sma50 >= -5 else 0
+        if sma200 is not None:
+            sma_points += 12 if sma200 >= 10 else 9 if sma200 >= 0 else 3 if sma200 >= -10 else 0
+        if sma50 is None:
+            sma_points = min(sma_points / 12 * 20, 20)
+        elif sma200 is None:
+            sma_points = min(sma_points / 8 * 20, 20)
+
+    result = _normalised_component_score([
+        ("1M-Trend", _momentum_return_points(safe_float(row.get("change_1m")), 15), 15),
+        ("3M-Trend", _momentum_return_points(safe_float(row.get("change_3m")), 20), 20),
+        ("6M-Trend", _momentum_return_points(safe_float(row.get("change_6m")), 25), 25),
+        ("12M-Trend", _momentum_return_points(safe_float(row.get("change_1y")), 20), 20),
+        ("SMA 50/200", sma_points, 20),
+    ])
+    return pd.Series({
+        "momentum_score": result["score"],
+        "momentum_coverage": result["coverage"],
+        "momentum_components": result["components"],
+    })
+
+
+def compute_safety_score(row: pd.Series) -> pd.Series:
+    """Sicherheitsprofil aus Schwankung, Drawdown, Bilanz, Cashflow und Ausschüttung."""
+    volatility = safe_float(row.get("vol_1y"))
+    drawdown = safe_float(row.get("max_drawdown_1y"))
+    net_debt = safe_float(row.get("net_debt_ebitda"))
+    debt_to_equity = safe_float(row.get("debt_to_equity"))
+    payout = safe_float(row.get("payout_ratio"))
+    free_cashflow = safe_float(row.get("free_cashflow"))
+    operating_cashflow = safe_float(row.get("operating_cashflow"))
+    current_ratio = safe_float(row.get("current_ratio"))
+
+    vol_points = None if volatility is None else 25 if volatility <= 18 else 20 if volatility <= 25 else 14 if volatility <= 35 else 7 if volatility <= 50 else 0
+    dd_abs = abs(drawdown) if drawdown is not None else None
+    drawdown_points = None if dd_abs is None else 20 if dd_abs <= 15 else 16 if dd_abs <= 25 else 10 if dd_abs <= 35 else 4 if dd_abs <= 50 else 0
+
+    debt_points = None
+    if is_financial_sector(row.get("sector")):
+        if current_ratio is not None:
+            debt_points = 20 if current_ratio >= 1.5 else 15 if current_ratio >= 1.1 else 8 if current_ratio >= 0.8 else 2
+    elif net_debt is not None:
+        debt_points = 20 if net_debt <= 1 else 16 if net_debt <= 2 else 10 if net_debt <= 3 else 4 if net_debt <= 4 else 0
+    elif debt_to_equity is not None:
+        debt_points = 20 if debt_to_equity <= 0.5 else 16 if debt_to_equity <= 1 else 10 if debt_to_equity <= 2 else 4 if debt_to_equity <= 3 else 0
+
+    payout_points = None
+    if payout is not None:
+        payout_points = 15 if 0 <= payout <= 60 else 12 if payout <= 80 else 7 if payout <= 100 else 1
+
+    cashflow = free_cashflow if free_cashflow is not None else operating_cashflow
+    cashflow_points = None if cashflow is None else 15 if cashflow > 0 else 0
+    beta = safe_float(row.get("beta"))
+    beta_points = None if beta is None else 5 if beta <= 0.8 else 4 if beta <= 1.0 else 2 if beta <= 1.3 else 0
+
+    result = _normalised_component_score([
+        ("Volatilität", vol_points, 25),
+        ("Drawdown", drawdown_points, 20),
+        ("Verschuldung/Liquidität", debt_points, 20),
+        ("Ausschüttung", payout_points, 15),
+        ("Cashflow", cashflow_points, 15),
+        ("Beta", beta_points, 5),
+    ])
+    return pd.Series({
+        "safety_score": result["score"],
+        "safety_coverage": result["coverage"],
+        "safety_components": result["components"],
+    })
+
+
+def enrich_with_profile_scores(metrics: pd.DataFrame) -> pd.DataFrame:
+    if metrics is None or metrics.empty:
+        return metrics
+    result = metrics.copy()
+    for calculator in (compute_growth_score, compute_momentum_score, compute_safety_score):
+        profile = result.apply(calculator, axis=1)
+        result = pd.concat([result, profile], axis=1)
+    return result
+
+
 def enrich_with_scores(
     metrics: pd.DataFrame,
     drawdown_trigger: float,
@@ -1831,7 +2041,8 @@ def enrich_with_scores(
         ),
         axis=1,
     )
-    return pd.concat([result, value], axis=1)
+    result = pd.concat([result, value], axis=1)
+    return enrich_with_profile_scores(result)
 
 
 def load_recent_sentiment_map(days_back: int = 120) -> dict[str, dict[str, Any]]:
@@ -5045,6 +5256,12 @@ def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
         current_cols[3].metric("Historische Fälle", int(expectation.get("count") or 0))
         current_cols[4].metric("Aussagekraft", evidence_label)
 
+        if int(expectation.get("count") or 0) < 5:
+            st.error(
+                f"Historische Warnung: Nur {int(expectation.get('count') or 0)} unabhängige Vergleichsfälle. "
+                "Prozentwerte und Szenarien sind statistisch nicht belastbar und dürfen nicht als Prognose gelesen werden."
+            )
+
         if current_trigger:
             st.warning(
                 "Das heutige quantitative Setup erfüllt den strengen Deep-Value-Trigger. "
@@ -5736,6 +5953,117 @@ def render_data_status(summary: dict[str, Any], detail: pd.DataFrame, metrics: p
             "Der Datenstatus trennt deshalb klar zwischen Indexbestandteil, Kursdaten, Fundamentaldaten, Dividenden, "
             "Cashflow und Deep-Value-Kennzahlen. Wenn ein Wert nicht im Scanner auftaucht, findest du hier meistens den Grund."
         )
+
+
+
+def _score_label(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "keine Daten"
+    if number >= 75:
+        return "stark"
+    if number >= 55:
+        return "solide"
+    if number >= 35:
+        return "schwach"
+    return "sehr schwach"
+
+
+def render_profile_scores(df: pd.DataFrame) -> None:
+    st.subheader("Aktienprofile: Value, Growth, Momentum & Safety")
+    st.caption(
+        "Die vier Profile trennen unterschiedliche Eigenschaften einer Aktie. Ein hoher Value-Score bedeutet nicht automatisch "
+        "hohe Sicherheit; ein starkes Momentum bedeutet nicht automatisch eine günstige Bewertung."
+    )
+    if df is None or df.empty:
+        st.info("Keine Daten für die aktuelle Filtereinstellung.")
+        return
+
+    with st.expander("So werden die Profile interpretiert", expanded=False):
+        explanation = pd.DataFrame([
+            {"Profil": "Value", "Frage": "Wie günstig oder ertragsstark wirkt die Aktie?", "Wichtige Daten": "Bewertung, Dividende, Drawdown, Payout, Verschuldung"},
+            {"Profil": "Growth", "Frage": "Wie stark wachsen Umsatz und Ergebnis?", "Wichtige Daten": "Umsatz-/Gewinnwachstum, Marge, ROE"},
+            {"Profil": "Momentum", "Frage": "Wie stabil ist der aktuelle Kurstrend?", "Wichtige Daten": "1M/3M/6M/12M-Performance, SMA 50/200"},
+            {"Profil": "Safety", "Frage": "Wie widerstandsfähig wirkt die Aktie?", "Wichtige Daten": "Volatilität, Drawdown, Bilanz, Cashflow, Payout"},
+        ])
+        st.dataframe(explanation, hide_index=True, use_container_width=True)
+        st.warning("Die Scores sind heuristische Recherchehilfen. Fehlende Daten senken die Abdeckung und dämpfen den jeweiligen Score.")
+
+    ticker = company_selectbox("Aktie auswählen", df, key="profile_scores_ticker")
+    row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
+    company_name = str(row.get("name") or ticker)
+    st.markdown(f"### {company_name} ({ticker})")
+
+    score_rows = [
+        ("Value", row.get("value_score"), row.get("value_coverage"), row.get("value_reason")),
+        ("Growth", row.get("growth_score"), row.get("growth_coverage"), row.get("growth_components")),
+        ("Momentum", row.get("momentum_score"), row.get("momentum_coverage"), row.get("momentum_components")),
+        ("Safety", row.get("safety_score"), row.get("safety_coverage"), row.get("safety_components")),
+        ("Deep Value", row.get("special_situation_score"), row.get("special_situation_coverage"), row.get("special_situation_reason")),
+    ]
+
+    metric_cols = st.columns(5)
+    for column, (label, value, coverage, _) in zip(metric_cols, score_rows):
+        column.metric(label, format_number(value, 1), help=f"Einordnung: {_score_label(value)} · Datenabdeckung: {format_percent(coverage, 0)}")
+
+    score_frame = pd.DataFrame([
+        {"Profil": label, "Score": safe_float(value), "Datenabdeckung": safe_float(coverage), "Einordnung": _score_label(value)}
+        for label, value, coverage, _ in score_rows
+    ])
+    chart_data = score_frame.dropna(subset=["Score"])
+    if not chart_data.empty:
+        bars = alt.Chart(chart_data).mark_bar(cornerRadiusEnd=4).encode(
+            x=alt.X("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score (0–100)"),
+            y=alt.Y("Profil:N", sort=["Value", "Growth", "Momentum", "Safety", "Deep Value"], title=None),
+            tooltip=["Profil:N", alt.Tooltip("Score:Q", format=".1f"), alt.Tooltip("Datenabdeckung:Q", format=".0f"), "Einordnung:N"],
+        ).properties(height=260)
+        labels = alt.Chart(chart_data).mark_text(align="left", dx=5).encode(
+            x="Score:Q", y=alt.Y("Profil:N", sort=["Value", "Growth", "Momentum", "Safety", "Deep Value"]),
+            text=alt.Text("Score:Q", format=".1f"),
+        )
+        st.altair_chart(bars + labels, use_container_width=True)
+
+    detail = pd.DataFrame([
+        {
+            "Profil": label,
+            "Score": safe_float(value),
+            "Datenabdeckung": safe_float(coverage),
+            "Einordnung": _score_label(value),
+            "Bausteine / Erklärung": str(details or "–"),
+        }
+        for label, value, coverage, details in score_rows
+    ])
+    st.dataframe(
+        detail.style.format({
+            "Score": lambda value: format_number(value, 1),
+            "Datenabdeckung": lambda value: format_percent(value, 0),
+        }, na_rep="–").map(colorize_score, subset=["Score"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.markdown("### Vergleich aller geladenen Aktien")
+    comparison_columns = [
+        "name", "ticker_yahoo", "sector", "value_score", "growth_score", "momentum_score", "safety_score",
+        "special_situation_score", "total_score", "score_coverage",
+    ]
+    available = [column for column in comparison_columns if column in df.columns]
+    comparison = df[available].copy().rename(columns={
+        "name": "Unternehmen", "ticker_yahoo": "Ticker", "sector": "Sektor",
+        "value_score": "Value", "growth_score": "Growth", "momentum_score": "Momentum",
+        "safety_score": "Safety", "special_situation_score": "Deep Value",
+        "total_score": "Qualität", "score_coverage": "Datenabdeckung",
+    })
+    sort_profile = st.selectbox("Sortieren nach", ["Value", "Growth", "Momentum", "Safety", "Deep Value", "Qualität"], key="profile_sort")
+    if sort_profile in comparison.columns:
+        comparison = comparison.sort_values(sort_profile, ascending=False, na_position="last")
+    score_cols = [column for column in ["Value", "Growth", "Momentum", "Safety", "Deep Value", "Qualität"] if column in comparison.columns]
+    styled = comparison.style.format(
+        {column: lambda value: format_number(value, 1) for column in score_cols} |
+        ({"Datenabdeckung": lambda value: format_percent(value, 0)} if "Datenabdeckung" in comparison.columns else {}),
+        na_rep="–",
+    ).map(colorize_score, subset=score_cols)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
 
 
 def render_overview(df: pd.DataFrame) -> None:
@@ -7403,7 +7731,7 @@ def main() -> None:
     # Persistente Hauptnavigation: Anders als st.tabs bleibt diese Auswahl bei jedem
     # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
     main_pages = [
-        "Überblick", "Datenstatus", "Fundamentaldaten", "Einzelanalyse", "Sektoren",
+        "Überblick", "Datenstatus", "Fundamentaldaten", "Aktienprofile", "Einzelanalyse", "Sektoren",
         "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Research",
     ]
     if st.session_state.get("main_navigation") not in main_pages:
@@ -7424,6 +7752,8 @@ def main() -> None:
         render_data_status(status_summary, status_detail, data)
     elif active_page == "Fundamentaldaten":
         render_fundamentals(data)
+    elif active_page == "Aktienprofile":
+        render_profile_scores(data)
     elif active_page == "Einzelanalyse":
         render_risk_and_chart(data, histories)
     elif active_page == "Sektoren":
