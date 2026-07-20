@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.5.0"
+APP_VERSION = "5.6.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -2673,7 +2673,7 @@ SEC_TICKER_CACHE_PATH = CACHE_DIR / "sec_company_tickers.json"
 
 SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "contact@example.com")
 SEC_HEADERS = {
-    "User-Agent": f"AktienExplorer/5.5 {SEC_CONTACT_EMAIL}",
+    "User-Agent": f"AktienExplorer/5.6 {SEC_CONTACT_EMAIL}",
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json,text/plain,*/*",
 }
@@ -7673,84 +7673,761 @@ def render_overview(df: pd.DataFrame) -> None:
     st.caption("*Gesamtrendite = Yahoo Adj Close als Näherung; sie kann Dividenden und Splits abbilden, ist aber keine garantierte steuer- oder brokeridentische Rendite.")
 
 
-def render_fundamentals(df: pd.DataFrame) -> None:
-    st.subheader("Fundamentaldaten")
+# -----------------------------------------------------------------------------
+# Fundamentaldaten-Ampeln (Version 5.6)
+# -----------------------------------------------------------------------------
+
+FUNDAMENTAL_STATUS_META: dict[str, dict[str, str]] = {
+    "good": {"icon": "🟢", "label": "unauffällig / stark"},
+    "watch": {"icon": "🟡", "label": "prüfen"},
+    "critical": {"icon": "🔴", "label": "kritisch"},
+    "info": {"icon": "⚪", "label": "nur informativ"},
+    "missing": {"icon": "⚪", "label": "keine Daten"},
+}
+
+FUNDAMENTAL_METRIC_LABELS: dict[str, str] = {
+    "pe_ratio": "KGV",
+    "forward_pe": "Forward KGV",
+    "pb_ratio": "KBV",
+    "ps_ratio": "KUV",
+    "ev_ebitda": "EV/EBITDA",
+    "revenue_growth": "Umsatzwachstum",
+    "earnings_growth": "Ergebniswachstum",
+    "operating_margin": "Operative Marge",
+    "net_margin": "Nettomarge",
+    "roe": "Eigenkapitalrendite",
+    "roa": "Gesamtkapitalrendite",
+    "dividend_yield": "Dividendenrendite",
+    "payout_ratio": "Ausschüttungsquote",
+    "dividend_growth_5y": "Dividendenwachstum 5J",
+    "cashflow_dividend_coverage": "FCF/Dividende",
+    "free_cashflow": "Free Cashflow",
+    "debt_to_equity": "Debt/Equity",
+    "net_debt_ebitda": "Netto-Schulden/EBITDA",
+    "current_ratio": "Current Ratio",
+}
+
+FUNDAMENTAL_METRIC_GROUPS: dict[str, list[str]] = {
+    "Bewertung": ["pe_ratio", "forward_pe", "pb_ratio", "ps_ratio", "ev_ebitda"],
+    "Wachstum & Profitabilität": [
+        "revenue_growth", "earnings_growth", "operating_margin", "net_margin", "roe", "roa"
+    ],
+    "Dividende & Cashflow": [
+        "dividend_yield", "payout_ratio", "dividend_growth_5y",
+        "cashflow_dividend_coverage", "free_cashflow",
+    ],
+    "Bilanz": ["debt_to_equity", "net_debt_ebitda", "current_ratio"],
+}
+
+FUNDAMENTAL_OVERVIEW_METRICS: list[str] = [
+    "pe_ratio", "ev_ebitda", "operating_margin", "roe", "revenue_growth",
+    "payout_ratio", "cashflow_dividend_coverage", "net_debt_ebitda",
+]
+
+
+def fundamental_sector_group(sector: Any) -> str:
+    """Ordnet uneinheitliche Yahoo-/Index-Sektorbezeichnungen grob ein."""
+    text = str(sector or "").strip().lower()
+    if is_financial_sector(text):
+        return "financial"
+    if any(term in text for term in ("real estate", "immobil", "reit")):
+        return "real_estate"
+    if any(term in text for term in ("utility", "utilities", "versorgung")):
+        return "utilities"
+    if any(term in text for term in ("energy", "oil", "gas", "energie")):
+        return "energy"
+    if any(term in text for term in ("technology", "software", "semiconductor", "information tech")):
+        return "technology"
+    if any(term in text for term in ("communication", "telecom", "media")):
+        return "communication"
+    if any(term in text for term in ("health", "pharma", "biotech")):
+        return "healthcare"
+    if any(term in text for term in ("consumer staples", "basic consumer", "nahr", "tobacco")):
+        return "staples"
+    if any(term in text for term in ("consumer discretionary", "cyclical", "retail", "automotive", "auto")):
+        return "discretionary"
+    if any(term in text for term in ("industrial", "maschinen", "aerospace", "transport")):
+        return "industrials"
+    if any(term in text for term in ("material", "chemical", "mining", "rohstoff")):
+        return "materials"
+    return "general"
+
+
+def _fundamental_result(
+    status: str,
+    explanation: str,
+    criterion: str,
+    *,
+    applicable: bool = True,
+) -> dict[str, Any]:
+    meta = FUNDAMENTAL_STATUS_META[status]
+    return {
+        "status": status,
+        "icon": meta["icon"],
+        "label": meta["label"],
+        "explanation": explanation,
+        "criterion": criterion,
+        "applicable": bool(applicable),
+    }
+
+
+def _threshold_assessment(
+    value: Optional[float],
+    *,
+    good_if: callable,
+    watch_if: callable,
+    good_text: str,
+    watch_text: str,
+    critical_text: str,
+    explanation_good: str,
+    explanation_watch: str,
+    explanation_critical: str,
+) -> dict[str, Any]:
+    if value is None:
+        return _fundamental_result("missing", "Keine verwertbaren Daten vorhanden.", f"{good_text}; {watch_text}; {critical_text}")
+    if good_if(value):
+        return _fundamental_result("good", explanation_good, good_text)
+    if watch_if(value):
+        return _fundamental_result("watch", explanation_watch, watch_text)
+    return _fundamental_result("critical", explanation_critical, critical_text)
+
+
+def assess_fundamental_metric(metric: str, row: pd.Series) -> dict[str, Any]:
+    """Bewertet eine Kennzahl sektorabhängig mit Ampel und transparenter Regel.
+
+    Die Ampel ist eine Recherchehilfe. Sie bewertet eine Kennzahl isoliert und
+    darf nicht als Kauf-/Verkaufsempfehlung interpretiert werden.
+    """
+    value = safe_float(row.get(metric))
+    if metric == "earnings_growth" and value is None:
+        value = safe_float(row.get("earnings_quarterly_growth"))
+    sector_group = fundamental_sector_group(row.get("sector"))
+    dividend_yield = safe_float(row.get("dividend_yield"))
+
+    if metric in {"pe_ratio", "forward_pe"}:
+        label = "KGV" if metric == "pe_ratio" else "Forward KGV"
+        if sector_group == "real_estate":
+            return _fundamental_result(
+                "info", f"{label} ist bei Immobilien-/REIT-Unternehmen oft durch Abschreibungen verzerrt; FFO/AFFO wäre geeigneter.",
+                "Bei REITs nur eingeschränkt vergleichbar.", applicable=False,
+            )
+        if value is None:
+            return _fundamental_result("missing", "Kein positives, verwertbares KGV verfügbar.", "Positives KGV erforderlich.")
+        if value <= 0:
+            return _fundamental_result(
+                "critical", "Ein negatives oder nullnahes KGV bedeutet meist Verlust beziehungsweise einen nicht sinnvollen Quotienten.",
+                "KGV muss positiv sein.",
+            )
+        if sector_group in {"technology", "communication"}:
+            good, watch = 25.0, 40.0
+        elif sector_group == "financial":
+            good, watch = 14.0, 22.0
+        else:
+            good, watch = 18.0, 28.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x <= good,
+            watch_if=lambda x: x <= watch,
+            good_text=f"0 < {label} ≤ {good:g}",
+            watch_text=f"{good:g} < {label} ≤ {watch:g}",
+            critical_text=f"{label} > {watch:g} oder ≤ 0",
+            explanation_good="Bewertung liegt innerhalb des für den Sektor konservativ angesetzten Bereichs.",
+            explanation_watch="Bewertung ist erhöht und sollte gegen Wachstum, Qualität und Historie geprüft werden.",
+            explanation_critical="Bewertung ist sehr hoch oder wegen Verlusten nicht sinnvoll interpretierbar.",
+        )
+
+    if metric == "pb_ratio":
+        if sector_group in {"technology", "communication"}:
+            return _fundamental_result(
+                "info", "Bei asset-light Geschäftsmodellen ist das KBV häufig wenig aussagekräftig.",
+                "Nur zusammen mit Profitabilität und Geschäftsmodell verwenden.", applicable=False,
+            )
+        if sector_group == "financial":
+            good, watch = 1.5, 2.5
+        elif sector_group == "real_estate":
+            good, watch = 1.2, 2.0
+        else:
+            good, watch = 3.0, 6.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: 0 <= x <= good,
+            watch_if=lambda x: 0 <= x <= watch,
+            good_text=f"0 ≤ KBV ≤ {good:g}",
+            watch_text=f"{good:g} < KBV ≤ {watch:g}",
+            critical_text=f"KBV > {watch:g} oder < 0",
+            explanation_good="Buchwertbewertung wirkt für den Sektor nicht überzogen.",
+            explanation_watch="Buchwertbewertung ist erhöht; Kapitalrendite und immaterielle Werte mitprüfen.",
+            explanation_critical="Sehr hohe oder negative Buchwertbewertung erfordert eine genauere Bilanzprüfung.",
+        )
+
+    if metric == "ps_ratio":
+        if sector_group in {"financial", "real_estate"}:
+            return _fundamental_result(
+                "info", "Das KUV ist für Finanz- und Immobilienunternehmen nur eingeschränkt vergleichbar.",
+                "Für diesen Sektor keine harte Ampel.", applicable=False,
+            )
+        good, watch = (5.0, 10.0) if sector_group == "technology" else (2.5, 5.0)
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: 0 <= x <= good,
+            watch_if=lambda x: 0 <= x <= watch,
+            good_text=f"0 ≤ KUV ≤ {good:g}",
+            watch_text=f"{good:g} < KUV ≤ {watch:g}",
+            critical_text=f"KUV > {watch:g} oder < 0",
+            explanation_good="Umsatzbewertung liegt im sektorüblich konservativen Bereich.",
+            explanation_watch="Umsatzbewertung ist erhöht und setzt gute Margen beziehungsweise Wachstum voraus.",
+            explanation_critical="Sehr hohe Umsatzbewertung birgt ein erhöhtes Enttäuschungsrisiko.",
+        )
+
+    if metric == "ev_ebitda":
+        if sector_group in {"financial", "real_estate"}:
+            return _fundamental_result(
+                "info", "EV/EBITDA ist bei Finanzwerten und vielen REITs nicht die bevorzugte Kennzahl.",
+                "Für diesen Sektor keine harte Ampel.", applicable=False,
+            )
+        if sector_group in {"technology", "communication"}:
+            good, watch = 18.0, 28.0
+        elif sector_group in {"utilities", "energy"}:
+            good, watch = 10.0, 16.0
+        else:
+            good, watch = 12.0, 18.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: 0 <= x <= good,
+            watch_if=lambda x: 0 <= x <= watch,
+            good_text=f"0 ≤ EV/EBITDA ≤ {good:g}",
+            watch_text=f"{good:g} < EV/EBITDA ≤ {watch:g}",
+            critical_text=f"EV/EBITDA > {watch:g} oder < 0",
+            explanation_good="Unternehmenswert im Verhältnis zum EBITDA wirkt nicht überzogen.",
+            explanation_watch="Bewertung ist erhöht; Wachstum und Kapitalintensität sollten sie rechtfertigen.",
+            explanation_critical="Sehr hohe oder negative Kennzahl weist auf teure Bewertung beziehungsweise negatives EBITDA hin.",
+        )
+
+    if metric in {"revenue_growth", "earnings_growth"}:
+        name = "Umsatzwachstum" if metric == "revenue_growth" else "Ergebniswachstum"
+        good_threshold = 3.0 if sector_group in {"utilities", "staples", "financial"} else 5.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= good_threshold,
+            watch_if=lambda x: x >= 0,
+            good_text=f"{name} ≥ {good_threshold:g} %",
+            watch_text=f"0 % ≤ {name} < {good_threshold:g} %",
+            critical_text=f"{name} < 0 %",
+            explanation_good=f"{name} ist positiv und liegt oberhalb der konservativen Sektorschwelle.",
+            explanation_watch=f"{name} ist positiv, aber schwach; Nachhaltigkeit und Basiseffekte prüfen.",
+            explanation_critical=f"{name} ist negativ und kann auf zyklischen oder strukturellen Druck hinweisen.",
+        )
+
+    if metric in {"operating_margin", "net_margin"}:
+        if metric == "operating_margin" and sector_group == "financial":
+            return _fundamental_result(
+                "info", "Die operative Marge ist bei Banken und Versicherern nicht direkt mit Industrieunternehmen vergleichbar.",
+                "Für Finanzwerte nur eingeschränkt verwenden.", applicable=False,
+            )
+        thresholds = {
+            "technology": (20.0, 10.0),
+            "communication": (15.0, 7.0),
+            "healthcare": (15.0, 7.0),
+            "staples": (12.0, 6.0),
+            "discretionary": (10.0, 4.0),
+            "industrials": (12.0, 6.0),
+            "materials": (12.0, 5.0),
+            "utilities": (15.0, 8.0),
+            "energy": (15.0, 5.0),
+            "financial": (12.0, 6.0),
+            "general": (12.0, 5.0),
+        }
+        good, watch = thresholds.get(sector_group, thresholds["general"])
+        if metric == "net_margin":
+            good *= 0.8
+            watch *= 0.8
+        name = "Operative Marge" if metric == "operating_margin" else "Nettomarge"
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= good,
+            watch_if=lambda x: x >= watch,
+            good_text=f"{name} ≥ {good:.1f} %",
+            watch_text=f"{watch:.1f} % ≤ {name} < {good:.1f} %",
+            critical_text=f"{name} < {watch:.1f} %",
+            explanation_good=f"{name} ist im groben Sektorvergleich stark.",
+            explanation_watch=f"{name} ist positiv, besitzt aber begrenzten Puffer.",
+            explanation_critical=f"{name} ist niedrig oder negativ und sollte über mehrere Jahre geprüft werden.",
+        )
+
+    if metric == "roe":
+        good, watch = (12.0, 8.0) if sector_group == "financial" else (15.0, 8.0)
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= good,
+            watch_if=lambda x: x >= watch,
+            good_text=f"ROE ≥ {good:g} %",
+            watch_text=f"{watch:g} % ≤ ROE < {good:g} %",
+            critical_text=f"ROE < {watch:g} %",
+            explanation_good="Die Eigenkapitalrendite ist im groben Sektorvergleich stark.",
+            explanation_watch="Die Eigenkapitalrendite ist positiv, aber nur mittelmäßig.",
+            explanation_critical="Niedrige oder negative Eigenkapitalrendite weist auf schwache Kapitalproduktivität hin.",
+        )
+
+    if metric == "roa":
+        good, watch = (1.0, 0.5) if sector_group == "financial" else (6.0, 3.0)
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= good,
+            watch_if=lambda x: x >= watch,
+            good_text=f"ROA ≥ {good:g} %",
+            watch_text=f"{watch:g} % ≤ ROA < {good:g} %",
+            critical_text=f"ROA < {watch:g} %",
+            explanation_good="Die Gesamtkapitalrendite ist für den Sektor solide.",
+            explanation_watch="Die Gesamtkapitalrendite ist positiv, aber mit begrenztem Puffer.",
+            explanation_critical="Die Vermögensbasis wird nur schwach oder negativ verzinst.",
+        )
+
+    if metric == "dividend_yield":
+        if value is None:
+            return _fundamental_result("missing", "Keine Dividendenrendite verfügbar.", "Rendite allein ist kein Qualitätsmerkmal.")
+        if value <= 0:
+            return _fundamental_result(
+                "info", "Keine oder keine verlässlich erfasste Dividende. Das ist bei Wachstumsunternehmen nicht automatisch negativ.",
+                "Keine harte Ampel ohne Dividendenstrategie.", applicable=False,
+            )
+        if value > 10:
+            return _fundamental_result(
+                "critical", "Eine zweistellige Rendite ist häufig ein Warnsignal für Kursverfall oder Kürzungsrisiko.",
+                "> 10 %: sehr hohe Rendite, Nachhaltigkeit zwingend prüfen.",
+            )
+        if value > 6.5:
+            return _fundamental_result(
+                "watch", "Die Rendite ist hoch. Payout, Cashflow-Deckung und Sondereffekte sollten geprüft werden.",
+                "6,5–10 %: hoch, mögliche Chance oder Dividendenfalle.",
+            )
+        if value < 1:
+            return _fundamental_result(
+                "watch", "Die Rendite ist niedrig; bei Wachstumswerten kann das normal sein.",
+                "0–1 %: niedrig, strategisch einordnen.",
+            )
+        return _fundamental_result(
+            "good", "Die Rendite liegt in einem üblichen Bereich, ihre Nachhaltigkeit hängt aber von Payout und Cashflow ab.",
+            "1–6,5 %: normaler Bereich; Qualität separat prüfen.",
+        )
+
+    if metric == "payout_ratio":
+        if dividend_yield is None or dividend_yield <= 0:
+            return _fundamental_result(
+                "info", "Ohne relevante Dividende ist die Ausschüttungsquote für die Ampel nicht entscheidend.",
+                "Nur bei Dividendenzahlern bewerten.", applicable=False,
+            )
+        if sector_group == "real_estate":
+            good, watch = 100.0, 130.0
+        else:
+            good, watch = 70.0, 90.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: 0 <= x <= good,
+            watch_if=lambda x: 0 <= x <= watch,
+            good_text=f"0–{good:g} %",
+            watch_text=f"> {good:g} bis {watch:g} %",
+            critical_text=f"> {watch:g} % oder < 0 %",
+            explanation_good="Die Ausschüttung besitzt nach dieser einfachen Regel einen angemessenen Puffer.",
+            explanation_watch="Die Ausschüttung ist hoch; Cashflow-Deckung und Gewinnqualität prüfen.",
+            explanation_critical="Die Ausschüttung wirkt nicht nachhaltig oder die Ergebnisbasis ist verzerrt.",
+        )
+
+    if metric == "dividend_growth_5y":
+        if dividend_yield is None or dividend_yield <= 0:
+            return _fundamental_result(
+                "info", "Ohne relevante Dividende wird das Dividendenwachstum nicht gewertet.",
+                "Nur bei Dividendenzahlern bewerten.", applicable=False,
+            )
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= 5,
+            watch_if=lambda x: x >= 0,
+            good_text="Wachstum ≥ 5 % p. a.",
+            watch_text="0–5 % p. a.",
+            critical_text="Wachstum < 0 % p. a.",
+            explanation_good="Die Dividende ist über abgeschlossene Jahre deutlich gewachsen.",
+            explanation_watch="Die Dividende war stabil bis moderat wachsend.",
+            explanation_critical="Die Dividende ist im Vergleichszeitraum gesunken.",
+        )
+
+    if metric == "cashflow_dividend_coverage":
+        if dividend_yield is None or dividend_yield <= 0:
+            return _fundamental_result(
+                "info", "Ohne relevante Dividende ist die Cashflow-Deckung nicht anwendbar.",
+                "Nur bei Dividendenzahlern bewerten.", applicable=False,
+            )
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= 1.5,
+            watch_if=lambda x: x >= 1.0,
+            good_text="FCF/Dividende ≥ 1,5x",
+            watch_text="1,0x bis < 1,5x",
+            critical_text="< 1,0x",
+            explanation_good="Der Free Cashflow deckt die geschätzte Dividendenzahlung mit gutem Puffer.",
+            explanation_watch="Die Dividende ist gedeckt, der Puffer ist jedoch begrenzt.",
+            explanation_critical="Der Free Cashflow deckt die Dividende nicht vollständig; Kürzungsrisiko prüfen.",
+        )
+
+    if metric == "free_cashflow":
+        if value is None:
+            return _fundamental_result("missing", "Kein Free Cashflow verfügbar.", "Positiver Free Cashflow ist grundsätzlich günstiger.")
+        if value > 0:
+            return _fundamental_result("good", "Free Cashflow ist positiv.", "Free Cashflow > 0")
+        if value == 0:
+            return _fundamental_result("watch", "Free Cashflow liegt ungefähr bei null.", "Free Cashflow ≈ 0")
+        return _fundamental_result("critical", "Free Cashflow ist negativ.", "Free Cashflow < 0")
+
+    if metric == "net_debt_ebitda":
+        if sector_group == "financial":
+            return _fundamental_result(
+                "info", "Net Debt/EBITDA ist bei Banken und Versicherern nicht sinnvoll mit Industrieunternehmen vergleichbar.",
+                "Für Finanzwerte regulatorische Kapital- und Liquiditätsquoten nutzen.", applicable=False,
+            )
+        if sector_group in {"utilities", "real_estate"}:
+            good, watch = 3.0, 5.0
+        elif sector_group == "energy":
+            good, watch = 2.5, 4.0
+        else:
+            good, watch = 2.0, 3.5
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x <= good,
+            watch_if=lambda x: x <= watch,
+            good_text=f"Net Debt/EBITDA ≤ {good:g}x",
+            watch_text=f"> {good:g}x bis {watch:g}x",
+            critical_text=f"> {watch:g}x",
+            explanation_good="Verschuldung wirkt gemessen am EBITDA beherrschbar.",
+            explanation_watch="Verschuldung ist erhöht; Zinslast und Entschuldungspfad prüfen.",
+            explanation_critical="Hohe Verschuldung kann bei Ergebnisrückgang oder steigenden Zinsen problematisch werden.",
+        )
+
+    if metric == "debt_to_equity":
+        if sector_group == "financial":
+            return _fundamental_result(
+                "info", "Debt/Equity ist bei Finanzunternehmen strukturell hoch und deshalb nicht direkt vergleichbar.",
+                "Für Finanzwerte regulatorische Kapitalquoten bevorzugen.", applicable=False,
+            )
+        if sector_group in {"utilities", "real_estate"}:
+            good, watch = 1.5, 3.0
+        else:
+            good, watch = 1.0, 2.0
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: 0 <= x <= good,
+            watch_if=lambda x: 0 <= x <= watch,
+            good_text=f"0–{good:g}x",
+            watch_text=f"> {good:g}x bis {watch:g}x",
+            critical_text=f"> {watch:g}x oder < 0",
+            explanation_good="Fremdkapitalquote wirkt im groben Sektorvergleich moderat.",
+            explanation_watch="Fremdkapitalquote ist erhöht; absolute Schulden und Cashflow mitprüfen.",
+            explanation_critical="Sehr hohe oder wegen negativem Eigenkapital verzerrte Quote ist kritisch.",
+        )
+
+    if metric == "current_ratio":
+        if sector_group == "financial":
+            return _fundamental_result(
+                "info", "Die Current Ratio ist bei Banken und Versicherern nicht die passende Liquiditätskennzahl.",
+                "Für Finanzwerte nicht anwenden.", applicable=False,
+            )
+        good, watch = (0.8, 0.6) if sector_group == "utilities" else (1.5, 1.0)
+        return _threshold_assessment(
+            value,
+            good_if=lambda x: x >= good,
+            watch_if=lambda x: x >= watch,
+            good_text=f"Current Ratio ≥ {good:g}",
+            watch_text=f"{watch:g} bis < {good:g}",
+            critical_text=f"< {watch:g}",
+            explanation_good="Kurzfristige Vermögenswerte decken kurzfristige Verpflichtungen mit Puffer.",
+            explanation_watch="Liquidität ist ausreichend bis knapp und sollte im Verlauf geprüft werden.",
+            explanation_critical="Kurzfristige Liquiditätsdeckung wirkt angespannt.",
+        )
+
+    return _fundamental_result("info", "Für diese Kennzahl ist keine Ampellogik definiert.", "Nur informativ.", applicable=False)
+
+
+def format_fundamental_metric_value(metric: str, value: Any) -> str:
+    if metric in {
+        "revenue_growth", "earnings_growth", "operating_margin", "net_margin", "roe", "roa",
+        "dividend_yield", "payout_ratio", "dividend_growth_5y",
+    }:
+        return format_percent(value, 1)
+    if metric == "free_cashflow":
+        return human_market_cap(value)
+    if metric in {"cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda"}:
+        number = safe_float(value)
+        return "–" if number is None else f"{format_number(number, 2)}x"
+    return format_number(value, 2)
+
+
+def build_fundamental_assessment(row: pd.Series) -> dict[str, Any]:
+    assessments: dict[str, dict[str, Any]] = {}
+    for metric in FUNDAMENTAL_METRIC_LABELS:
+        assessments[metric] = assess_fundamental_metric(metric, row)
+
+    applicable = [item for item in assessments.values() if item.get("applicable", True)]
+    available = [item for item in applicable if item["status"] in {"good", "watch", "critical"}]
+    counts = {
+        status: sum(item["status"] == status for item in available)
+        for status in ("good", "watch", "critical")
+    }
+    applicable_count = len(applicable)
+    coverage = len(available) / applicable_count * 100.0 if applicable_count else 0.0
+    red_ratio = counts["critical"] / len(available) if available else 0.0
+    green_ratio = counts["good"] / len(available) if available else 0.0
+
+    if len(available) < 5:
+        overall = "missing"
+        overall_text = "Zu wenig Daten"
+    elif counts["critical"] >= 3 or red_ratio >= 0.35:
+        overall = "critical"
+        overall_text = "Mehrere kritische Punkte"
+    elif counts["critical"] == 0 and green_ratio >= 0.65:
+        overall = "good"
+        overall_text = "Überwiegend unauffällig"
+    else:
+        overall = "watch"
+        overall_text = "Gemischtes Bild – prüfen"
+
+    meta = FUNDAMENTAL_STATUS_META[overall]
+    return {
+        "assessments": assessments,
+        "overall_status": overall,
+        "overall_label": f"{meta['icon']} {overall_text}",
+        "green_count": counts["good"],
+        "watch_count": counts["watch"],
+        "critical_count": counts["critical"],
+        "assessment_coverage": round(coverage, 1),
+        "assessed_count": len(available),
+    }
+
+
+def enrich_with_fundamental_assessments(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    result = deduplicate_dataframe_columns(df)
+    summaries = result.apply(lambda row: pd.Series({
+        key: value for key, value in build_fundamental_assessment(row).items() if key != "assessments"
+    }), axis=1)
+    for column in summaries.columns:
+        result[column] = summaries[column]
+    return result
+
+
+def _render_raw_fundamentals_table(df: pd.DataFrame) -> None:
     columns = [
         "name", "ticker_yahoo", "currency", "market_cap", "pe_ratio", "forward_pe", "pb_ratio",
-        "ps_ratio", "ev_ebitda", "net_margin", "operating_margin", "roe", "roa", "dividend_yield",
-        "dividend_per_share", "payout_ratio", "dividend_growth_5y", "dividend_frequency",
-        "debt_to_equity", "net_debt_ebitda", "beta", "score_raw", "score_coverage", "score_confidence",
-        "total_score",
+        "ps_ratio", "ev_ebitda", "revenue_growth", "earnings_growth", "gross_margin", "net_margin",
+        "operating_margin", "roe", "roa", "dividend_yield", "dividend_per_share", "payout_ratio",
+        "dividend_growth_5y", "dividend_frequency", "dividend_yield_5y_avg",
+        "dividend_yield_vs_5y_avg_pct", "free_cashflow", "operating_cashflow",
+        "cashflow_dividend_coverage", "debt_to_equity", "net_debt_ebitda", "current_ratio", "beta",
+        "score_raw", "score_coverage", "score_confidence", "total_score",
     ]
     visible_columns = [column for column in columns if column in df.columns]
     display_names = {
-        "name": "Unternehmen",
-        "ticker_yahoo": "Ticker",
-        "currency": "Währung",
-        "market_cap": "Marktkapitalisierung",
-        "pe_ratio": "KGV",
-        "forward_pe": "Forward KGV",
-        "pb_ratio": "KBV",
-        "ps_ratio": "KUV",
-        "ev_ebitda": "EV/EBITDA",
-        "net_margin": "Nettomarge",
-        "operating_margin": "Operative Marge",
-        "roe": "Eigenkapitalrendite",
-        "roa": "Gesamtkapitalrendite",
-        "dividend_yield": "Dividendenrendite",
-        "dividend_per_share": "Dividende je Aktie",
-        "payout_ratio": "Ausschüttungsquote",
-        "dividend_growth_5y": "Dividendenwachstum 5J",
-        "dividend_frequency": "Ausschüttungsrhythmus",
-        "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
-        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt",
-        "free_cashflow": "Free Cashflow",
-        "operating_cashflow": "Operativer Cashflow",
-        "cashflow_dividend_coverage": "FCF/Dividende",
-        "debt_to_equity": "Debt/Equity",
-        "net_debt_ebitda": "Netto-Schulden/EBITDA",
-        "beta": "Beta",
-        "score_raw": "Rohscore",
-        "score_coverage": "Datenabdeckung",
-        "score_confidence": "Datenvertrauen",
+        "name": "Unternehmen", "ticker_yahoo": "Ticker", "currency": "Währung",
+        "market_cap": "Marktkapitalisierung", "pe_ratio": "KGV", "forward_pe": "Forward KGV",
+        "pb_ratio": "KBV", "ps_ratio": "KUV", "ev_ebitda": "EV/EBITDA",
+        "revenue_growth": "Umsatzwachstum", "earnings_growth": "Ergebniswachstum",
+        "gross_margin": "Bruttomarge", "net_margin": "Nettomarge", "operating_margin": "Operative Marge",
+        "roe": "Eigenkapitalrendite", "roa": "Gesamtkapitalrendite",
+        "dividend_yield": "Dividendenrendite", "dividend_per_share": "Dividende je Aktie",
+        "payout_ratio": "Ausschüttungsquote", "dividend_growth_5y": "Dividendenwachstum 5J",
+        "dividend_frequency": "Ausschüttungsrhythmus", "dividend_yield_5y_avg": "Ø Div.-Rendite 5J",
+        "dividend_yield_vs_5y_avg_pct": "Rendite vs. 5J-Schnitt", "free_cashflow": "Free Cashflow",
+        "operating_cashflow": "Operativer Cashflow", "cashflow_dividend_coverage": "FCF/Dividende",
+        "debt_to_equity": "Debt/Equity", "net_debt_ebitda": "Netto-Schulden/EBITDA",
+        "current_ratio": "Current Ratio", "beta": "Beta", "score_raw": "Rohscore",
+        "score_coverage": "Datenabdeckung", "score_confidence": "Datenvertrauen",
         "total_score": "Qualitäts-Score",
     }
     display_df = df[visible_columns].rename(columns=display_names)
     formats = {
         "Marktkapitalisierung": human_market_cap,
-        "KGV": lambda value: format_number(value, 2),
-        "Forward KGV": lambda value: format_number(value, 2),
-        "KBV": lambda value: format_number(value, 2),
-        "KUV": lambda value: format_number(value, 2),
+        "KGV": lambda value: format_number(value, 2), "Forward KGV": lambda value: format_number(value, 2),
+        "KBV": lambda value: format_number(value, 2), "KUV": lambda value: format_number(value, 2),
         "EV/EBITDA": lambda value: format_number(value, 2),
-        "Nettomarge": lambda value: format_percent(value, 2),
+        "Umsatzwachstum": lambda value: format_percent(value, 2), "Ergebniswachstum": lambda value: format_percent(value, 2),
+        "Bruttomarge": lambda value: format_percent(value, 2), "Nettomarge": lambda value: format_percent(value, 2),
         "Operative Marge": lambda value: format_percent(value, 2),
-        "Eigenkapitalrendite": lambda value: format_percent(value, 2),
-        "Gesamtkapitalrendite": lambda value: format_percent(value, 2),
-        "Dividendenrendite": lambda value: format_percent(value, 2),
-        "Dividende je Aktie": lambda value: format_number(value, 2),
-        "Ausschüttungsquote": lambda value: format_percent(value, 2),
-        "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
+        "Eigenkapitalrendite": lambda value: format_percent(value, 2), "Gesamtkapitalrendite": lambda value: format_percent(value, 2),
+        "Dividendenrendite": lambda value: format_percent(value, 2), "Dividende je Aktie": lambda value: format_number(value, 2),
+        "Ausschüttungsquote": lambda value: format_percent(value, 2), "Dividendenwachstum 5J": lambda value: format_percent(value, 2),
         "Ø Div.-Rendite 5J": lambda value: format_percent(value, 2),
         "Rendite vs. 5J-Schnitt": lambda value: format_percent(value, 0, signed=True),
-        "Free Cashflow": human_market_cap,
-        "Operativer Cashflow": human_market_cap,
-        "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
-        "Debt/Equity": lambda value: f"{format_number(value, 2)}x",
-        "Netto-Schulden/EBITDA": lambda value: f"{format_number(value, 2)}x",
-        "Beta": lambda value: format_number(value, 2),
-        "Rohscore": lambda value: format_number(value, 1),
-        "Datenabdeckung": lambda value: format_percent(value, 0),
+        "Free Cashflow": human_market_cap, "Operativer Cashflow": human_market_cap,
+        "FCF/Dividende": lambda value: "–" if safe_float(value) is None else f"{format_number(value, 2)}x",
+        "Debt/Equity": lambda value: "–" if safe_float(value) is None else f"{format_number(value, 2)}x",
+        "Netto-Schulden/EBITDA": lambda value: "–" if safe_float(value) is None else f"{format_number(value, 2)}x",
+        "Current Ratio": lambda value: format_number(value, 2), "Beta": lambda value: format_number(value, 2),
+        "Rohscore": lambda value: format_number(value, 1), "Datenabdeckung": lambda value: format_percent(value, 0),
         "Qualitäts-Score": lambda value: format_number(value, 1),
     }
     styled = display_df.style.format(formats, na_rep="–").map(colorize_score, subset=["Qualitäts-Score"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption(
-        "Die Marktkapitalisierung bezieht sich auf die Originalwährung. "
-        "Negative KGVs werden im Score nicht als günstig bewertet. Datenabdeckung und Datenvertrauen zeigen, "
-        "wie belastbar eine heuristische Einstufung ist."
+
+
+def render_fundamentals(df: pd.DataFrame) -> None:
+    st.subheader("Fundamentaldaten & Ampeln")
+    if df is None or df.empty:
+        st.info("Keine Fundamentaldaten geladen.")
+        return
+
+    clean_df = deduplicate_dataframe_columns(df)
+    assessed_df = enrich_with_fundamental_assessments(clean_df)
+
+    with st.expander("So funktionieren die Fundamentaldaten-Ampeln", expanded=False):
+        st.markdown(
+            "Die Ampeln bewerten **einzelne Kennzahlen isoliert** und verwenden grobe, teilweise sektorspezifische "
+            "Schwellen. 🟢 bedeutet nicht automatisch günstig oder kaufenswert, 🔴 nicht automatisch verkaufen. "
+            "Bei Banken, Versicherern und Immobilienwerten werden ungeeignete Kennzahlen bewusst grau statt rot dargestellt."
+        )
+        st.markdown(
+            "**Legende:** 🟢 unauffällig/stark · 🟡 genauer prüfen · 🔴 kritisch · ⚪ nicht anwendbar oder keine Daten. "
+            "Die Gesamtampel fasst nur anwendbare, verfügbare Kennzahlen zusammen und ersetzt weder die Aktienprofile "
+            "noch eine Prüfung von Geschäftsmodell, Sondereffekten und mehrjährigen Trends."
+        )
+
+    view_mode = st.radio(
+        "Darstellung",
+        ["Ampelübersicht", "Einzelwert erklären", "Alle Rohdaten"],
+        horizontal=True,
+        key="fundamentals_view_mode",
     )
 
+    if view_mode == "Ampelübersicht":
+        col_filter, col_sort = st.columns([2, 1])
+        with col_filter:
+            status_options = ["🟢 Überwiegend unauffällig", "🟡 Gemischtes Bild", "🔴 Kritische Punkte", "⚪ Zu wenig Daten"]
+            selected_statuses = st.multiselect(
+                "Gesamtampel filtern",
+                status_options,
+                default=status_options,
+                key="fundamental_overall_filter",
+            )
+        with col_sort:
+            sort_choice = st.selectbox(
+                "Sortieren nach",
+                ["Unternehmen", "Kritische Punkte", "Grüne Punkte", "Datenabdeckung", "Qualitäts-Score"],
+                key="fundamental_sort_choice",
+            )
+
+        status_bucket = {
+            "good": "🟢 Überwiegend unauffällig",
+            "watch": "🟡 Gemischtes Bild",
+            "critical": "🔴 Kritische Punkte",
+            "missing": "⚪ Zu wenig Daten",
+        }
+        rows: list[dict[str, Any]] = []
+        for _, row in assessed_df.iterrows():
+            summary = build_fundamental_assessment(row)
+            bucket = status_bucket.get(summary["overall_status"], "⚪ Zu wenig Daten")
+            if selected_statuses and bucket not in selected_statuses:
+                continue
+            output: dict[str, Any] = {
+                "Unternehmen": row.get("name", row.get("ticker_yahoo", "–")),
+                "Ticker": row.get("ticker_yahoo", "–"),
+                "Sektor": row.get("sector", "–"),
+                "Gesamtampel": summary["overall_label"],
+                "🟢": summary["green_count"],
+                "🟡": summary["watch_count"],
+                "🔴": summary["critical_count"],
+                "Ampel-Abdeckung": summary["assessment_coverage"],
+                "Qualitäts-Score": safe_float(row.get("total_score")),
+            }
+            for metric in FUNDAMENTAL_OVERVIEW_METRICS:
+                assessment = summary["assessments"][metric]
+                output[FUNDAMENTAL_METRIC_LABELS[metric]] = (
+                    f"{assessment['icon']} {format_fundamental_metric_value(metric, row.get(metric))}"
+                )
+            rows.append(output)
+
+        overview = pd.DataFrame(rows)
+        if overview.empty:
+            st.info("Für den gewählten Filter gibt es keine Unternehmen.")
+        else:
+            sort_map = {
+                "Unternehmen": ("Unternehmen", True),
+                "Kritische Punkte": ("🔴", False),
+                "Grüne Punkte": ("🟢", False),
+                "Datenabdeckung": ("Ampel-Abdeckung", False),
+                "Qualitäts-Score": ("Qualitäts-Score", False),
+            }
+            sort_col, ascending = sort_map[sort_choice]
+            overview = overview.sort_values(sort_col, ascending=ascending, na_position="last", kind="stable")
+            styled = overview.style.format({
+                "Ampel-Abdeckung": lambda value: format_percent(value, 0),
+                "Qualitäts-Score": lambda value: format_number(value, 1),
+            }, na_rep="–").map(colorize_score, subset=["Qualitäts-Score"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.caption(
+                "Die kompakte Ansicht zeigt nur zentrale Kennzahlen. Öffne „Einzelwert erklären“, um Schwelle, "
+                "Begründung und nicht anwendbare Kennzahlen vollständig zu sehen."
+            )
+        return
+
+    if view_mode == "Einzelwert erklären":
+        ticker = company_selectbox("Aktie auswählen", assessed_df, key="fundamental_detail_ticker")
+        row = assessed_df[assessed_df["ticker_yahoo"].astype(str) == str(ticker)].iloc[0]
+        summary = build_fundamental_assessment(row)
+
+        st.caption(f"{row.get('name', ticker)} · {ticker} · {row.get('sector', '–')}")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Gesamtampel", summary["overall_label"])
+        col2.metric("🟢 Unauffällig", summary["green_count"])
+        col3.metric("🟡 Prüfen", summary["watch_count"])
+        col4.metric("🔴 Kritisch", summary["critical_count"])
+        col5.metric("Ampel-Abdeckung", format_percent(summary["assessment_coverage"], 0))
+
+        selected_detail_statuses = st.multiselect(
+            "Kennzahlen anzeigen",
+            ["good", "watch", "critical", "info", "missing"],
+            default=["good", "watch", "critical", "info", "missing"],
+            format_func=lambda status: f"{FUNDAMENTAL_STATUS_META[status]['icon']} {FUNDAMENTAL_STATUS_META[status]['label']}",
+            key="fundamental_detail_status_filter",
+        )
+
+        detail_rows: list[dict[str, Any]] = []
+        for group, metrics in FUNDAMENTAL_METRIC_GROUPS.items():
+            for metric in metrics:
+                assessment = summary["assessments"][metric]
+                if selected_detail_statuses and assessment["status"] not in selected_detail_statuses:
+                    continue
+                detail_rows.append({
+                    "Bereich": group,
+                    "Kennzahl": FUNDAMENTAL_METRIC_LABELS[metric],
+                    "Wert": format_fundamental_metric_value(metric, row.get(metric)),
+                    "Ampel": f"{assessment['icon']} {assessment['label']}",
+                    "Einordnung": assessment["explanation"],
+                    "Verwendete Regel": assessment["criterion"],
+                })
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+        red_items = [
+            FUNDAMENTAL_METRIC_LABELS[metric]
+            for metric, item in summary["assessments"].items() if item["status"] == "critical"
+        ]
+        yellow_items = [
+            FUNDAMENTAL_METRIC_LABELS[metric]
+            for metric, item in summary["assessments"].items() if item["status"] == "watch"
+        ]
+        if red_items:
+            st.error("Kritisch zu prüfen: " + ", ".join(red_items))
+        elif yellow_items:
+            st.warning("Vertiefen: " + ", ".join(yellow_items))
+        else:
+            st.success("In den verfügbaren, anwendbaren Kennzahlen wurden keine roten Punkte erkannt.")
+        st.caption(
+            "Die Ampel verwendet aktuelle Yahoo-Daten und Momentaufnahmen. Ein einzelnes Jahr, zyklische Hochphasen, "
+            "Sondereffekte oder abweichende Rechnungslegung können die Einordnung verzerren."
+        )
+        return
+
+    _render_raw_fundamentals_table(clean_df)
+    st.caption(
+        "Die Rohdaten zeigen die unveränderten Kennzahlen. Negative KGVs werden nicht als günstig bewertet. "
+        "Marktkapitalisierung und Cashflows beziehen sich auf die jeweilige Originalwährung."
+    )
 
 def render_value_trigger_explanation(
     df: pd.DataFrame,
@@ -8576,7 +9253,7 @@ def render_news_summary(
 
 
 # -----------------------------------------------------------------------------
-# Version 5.5 – Event-Kalender 2.0 mit Quellenstatus und offiziellen Filings
+# Version 5.6 – Fundamentaldaten-Ampeln mit sektorabhängiger Einordnung
 # -----------------------------------------------------------------------------
 
 EVENT_COLUMNS_V55 = [
