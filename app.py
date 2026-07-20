@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -5404,6 +5404,538 @@ def _save_research_case(record: dict[str, Any]) -> tuple[bool, str]:
 
 
 
+# -----------------------------------------------------------------------------
+# Universumsweiter historischer Mustervergleich
+# -----------------------------------------------------------------------------
+
+
+def _similarity_component(current_value: Any, historical_value: Any, scale: float) -> Optional[float]:
+    """Gibt eine Ähnlichkeit von 0 bis 1 für zwei numerische Merkmale zurück."""
+    current = safe_float(current_value)
+    historical = safe_float(historical_value)
+    if current is None or historical is None or scale <= 0:
+        return None
+    return max(0.0, min(1.0, 1.0 - abs(current - historical) / float(scale)))
+
+
+def deep_value_pattern_similarity(
+    current_snapshot: dict[str, Any],
+    historical_row: pd.Series,
+    current_sector: Optional[str] = None,
+    historical_sector: Optional[str] = None,
+) -> dict[str, Any]:
+    """Vergleicht ein heutiges Deep-Value-Setup mit einem historischen Fall.
+
+    Die Ähnlichkeit ist bewusst transparent und regelbasiert. Sie ersetzt kein
+    statistisches Modell, sondern gewichtet Score, Rendite, Drawdown,
+    Cashflow-Deckung und Verschuldung. Ein gleicher Sektor liefert einen kleinen
+    Bonus, weil Kennzahlen innerhalb eines Geschäftsmodells besser vergleichbar
+    sind.
+    """
+    definitions = [
+        ("Deep-Value-Score", current_snapshot.get("bat_pattern_score"), historical_row.get("Deep-Value-Score"), 25.0, 0.30),
+        ("Dividendenrendite", current_snapshot.get("dividend_yield"), historical_row.get("Dividendenrendite"), 5.0, 0.20),
+        ("Drawdown", current_snapshot.get("deepest_drawdown_3_5y_pct"), historical_row.get("Drawdown"), 30.0, 0.20),
+        ("FCF/Dividende", current_snapshot.get("cashflow_dividend_coverage"), historical_row.get("FCF/Dividende"), 1.5, 0.15),
+        ("Net Debt/EBITDA", current_snapshot.get("net_debt_ebitda"), historical_row.get("Net Debt/EBITDA"), 2.5, 0.10),
+    ]
+    weighted_sum = 0.0
+    available_weight = 0.0
+    details: list[str] = []
+    for label, current_value, historical_value, scale, weight in definitions:
+        similarity = _similarity_component(current_value, historical_value, scale)
+        if similarity is None:
+            details.append(f"{label}: keine vollständigen Vergleichsdaten")
+            continue
+        weighted_sum += similarity * weight
+        available_weight += weight
+        details.append(f"{label}: {similarity * 100:.0f} % ähnlich")
+
+    if available_weight <= 0:
+        return {"similarity": None, "coverage": 0.0, "explanation": "Keine vergleichbaren Merkmale verfügbar."}
+
+    score = weighted_sum / available_weight * 100.0
+    same_sector = bool(
+        current_sector and historical_sector
+        and str(current_sector).strip().lower() == str(historical_sector).strip().lower()
+    )
+    if same_sector:
+        score = min(100.0, score + 5.0)
+        details.append("Sektorbonus: +5 Punkte")
+
+    return {
+        "similarity": round(score, 1),
+        "coverage": round(available_weight / 0.95 * 100.0, 1),
+        "same_sector": same_sector,
+        "explanation": " | ".join(details),
+    }
+
+
+def _sample_dates(start_date: Any, end_date: Any, sampling_months: int) -> pd.DatetimeIndex:
+    start = pd.Timestamp(start_date).tz_localize(None).normalize()
+    end = pd.Timestamp(end_date).tz_localize(None).normalize()
+    if end < start:
+        return pd.DatetimeIndex([])
+    monthly = pd.date_range(start, end, freq="ME")
+    step = max(1, int(sampling_months))
+    return monthly[::step]
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def historical_pattern_candidates_cached(
+    ticker: str,
+    company_name: str,
+    sector: str,
+    benchmark_ticker: str,
+    start_date_iso: str,
+    end_date_iso: str,
+    info_lag_days: int,
+    sampling_months: int,
+) -> pd.DataFrame:
+    """Erstellt zeitlich gesampelte historische Deep-Value-Fälle je Unternehmen."""
+    symbol = clean_ticker(ticker)
+    if not symbol:
+        return pd.DataFrame()
+
+    history = fetch_long_history(symbol)
+    if history.empty or "Close" not in history.columns:
+        return pd.DataFrame()
+    dividends = fetch_dividends(symbol)
+    financials = fetch_historical_financials(symbol)
+    benchmark = fetch_benchmark_history(benchmark_ticker, period="max")
+
+    rows: list[dict[str, Any]] = []
+    for date_value in _sample_dates(start_date_iso, end_date_iso, sampling_months):
+        snapshot = historical_bat_snapshot(
+            ticker=symbol,
+            as_of=date_value,
+            history=history,
+            dividends=dividends,
+            financials=financials,
+            info_lag_days=int(info_lag_days),
+            negative_news_shock=False,
+            special_effect_suspected=False,
+        )
+        if snapshot.get("error"):
+            continue
+
+        signal_date = pd.Timestamp(snapshot["price_date"])
+        forward = forward_performance_table(history, benchmark, signal_date, use_adjusted=True)
+        horizon = forward[forward["Horizont"] == "12 Monate"] if not forward.empty else pd.DataFrame()
+        stock_return = safe_float(horizon["Aktienrendite"].iloc[0]) if not horizon.empty else None
+        benchmark_return = safe_float(horizon["Benchmark"].iloc[0]) if not horizon.empty else None
+        excess_return = safe_float(horizon["Überrendite"].iloc[0]) if not horizon.empty else None
+
+        trap = _future_value_trap_metrics(
+            history=history,
+            dividends=dividends,
+            financials=financials,
+            entry_date=signal_date,
+            info_lag_days=int(info_lag_days),
+            use_adjusted=True,
+        )
+        rows.append({
+            "Ticker": symbol,
+            "Unternehmen": company_name or symbol,
+            "Sektor": sector or "Unbekannt",
+            "Signal-Datum": signal_date,
+            "Deep-Value-Score": safe_float(snapshot.get("bat_pattern_score")) or 0.0,
+            "Kurs": snapshot.get("price"),
+            "Dividendenrendite": snapshot.get("dividend_yield"),
+            "Drawdown": snapshot.get("deepest_drawdown_3_5y_pct"),
+            "FCF/Dividende": snapshot.get("cashflow_dividend_coverage"),
+            "Net Debt/EBITDA": snapshot.get("net_debt_ebitda"),
+            "Rendite 12M": stock_return,
+            "Benchmark 12M": benchmark_return,
+            "Überrendite 12M": excess_return,
+            "Benchmark geschlagen 12M": excess_return is not None and excess_return > 0,
+            "Max. Rückgang 12M": trap.get("max_decline_12m"),
+            "Dividendenänderung 12M": trap.get("dividend_change_12m"),
+            "Value Trap": bool(trap.get("value_trap")),
+            "Value-Trap-Grund": trap.get("value_trap_reason", ""),
+            "Score-Erklärung": _component_summary(snapshot),
+        })
+    return pd.DataFrame(rows)
+
+
+def _independent_pattern_cases(frame: pd.DataFrame, cooldown_months: int) -> pd.DataFrame:
+    """Wählt je Ticker die ähnlichsten zeitlich unabhängigen Fälle aus."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    selected_rows: list[pd.Series] = []
+    for _, group in frame.groupby("Ticker", dropna=False):
+        group = group.copy()
+        group["Signal-Datum"] = pd.to_datetime(group["Signal-Datum"], errors="coerce")
+        group = group.dropna(subset=["Signal-Datum", "Ähnlichkeit"]).sort_values("Ähnlichkeit", ascending=False)
+        chosen_dates: list[pd.Timestamp] = []
+        for _, row in group.iterrows():
+            current_date = pd.Timestamp(row["Signal-Datum"])
+            if any(abs((current_date - previous).days) < int(cooldown_months * 30.44) for previous in chosen_dates):
+                continue
+            selected_rows.append(row)
+            chosen_dates.append(current_date)
+    if not selected_rows:
+        return pd.DataFrame(columns=frame.columns)
+    return pd.DataFrame(selected_rows).sort_values(["Ähnlichkeit", "Signal-Datum"], ascending=[False, False]).reset_index(drop=True)
+
+
+def summarise_universe_pattern_cases(frame: pd.DataFrame) -> dict[str, Any]:
+    result: dict[str, Any] = {"count": 0}
+    if frame is None or frame.empty:
+        return result
+    valid = frame.dropna(subset=["Rendite 12M"]).copy()
+    if valid.empty:
+        return result
+    returns = pd.to_numeric(valid["Rendite 12M"], errors="coerce").dropna()
+    excess = pd.to_numeric(valid.get("Überrendite 12M"), errors="coerce").dropna()
+    drawdowns = pd.to_numeric(valid.get("Max. Rückgang 12M"), errors="coerce").dropna()
+    trap = valid.get("Value Trap", pd.Series(False, index=valid.index)).fillna(False).astype(bool)
+    benchmark_hits = valid.get("Benchmark geschlagen 12M", pd.Series(False, index=valid.index)).fillna(False).astype(bool)
+    result.update({
+        "count": len(valid),
+        "positive_rate": float((returns > 0).mean() * 100) if not returns.empty else None,
+        "benchmark_rate": float(benchmark_hits.mean() * 100) if len(benchmark_hits) else None,
+        "trap_rate": float(trap.mean() * 100) if len(trap) else None,
+        "average_return": safe_float(returns.mean()) if not returns.empty else None,
+        "median_return": safe_float(returns.median()) if not returns.empty else None,
+        "average_excess": safe_float(excess.mean()) if not excess.empty else None,
+        "weak_scenario": safe_float(returns.quantile(0.20)) if not returns.empty else None,
+        "middle_scenario": safe_float(returns.quantile(0.50)) if not returns.empty else None,
+        "strong_scenario": safe_float(returns.quantile(0.80)) if not returns.empty else None,
+        "typical_drawdown": safe_float(drawdowns.median()) if not drawdowns.empty else None,
+        "worst_return": safe_float(returns.min()) if not returns.empty else None,
+        "best_return": safe_float(returns.max()) if not returns.empty else None,
+        "valid": valid,
+    })
+    return result
+
+
+def render_universe_pattern_comparison(df: pd.DataFrame, index_name: str) -> None:
+    st.subheader("Universumsweiter historischer Mustervergleich")
+    st.caption(
+        "Vergleicht das heutige Deep-Value-Setup einer Aktie mit historischen Situationen "
+        "mehrerer Unternehmen des aktuell geladenen Index. Dadurch entsteht eine breitere "
+        "Stichprobe als bei der reinen Einzelaktien-Historie."
+    )
+
+    with st.expander("Methodik und wichtige Grenzen", expanded=False):
+        st.markdown(
+            """
+            **Verglichen werden:** Deep-Value-Score, Dividendenrendite, langfristiger Drawdown,
+            Free-Cashflow-Deckung der Dividende und Net Debt/EBITDA. Ein gleicher Sektor erhält
+            einen kleinen Bonus.
+
+            **Ergebnis:** historische 12-Monatsrendite, Überrendite zur Benchmark,
+            zwischenzeitlicher Rückgang und Value-Trap-Kennzeichnung.
+
+            **Wichtige Grenze:** Die Auswahl nutzt die *heutigen* Indexbestandteile. Frühere
+            ausgeschiedene oder insolvente Unternehmen fehlen. Dadurch besteht Survivorship Bias.
+            Yahoo-Jahresabschlüsse sind zudem keine garantierte Point-in-Time-Datenbank. Das Modul
+            ist ein Research-Werkzeug und keine Renditeprognose.
+            """
+        )
+
+    if df is None or df.empty:
+        st.info("Bitte zuerst links Marktdaten für einen Index laden.")
+        return
+
+    target_ticker = company_selectbox("Heutiges Zielunternehmen", df, key="universe_pattern_target")
+    target_row = df[df["ticker_yahoo"].astype(str) == str(target_ticker)].iloc[0]
+    target_name = str(target_row.get("name") or target_ticker)
+    target_sector = str(target_row.get("sector") or "Unbekannt")
+    benchmark_ticker = benchmark_for_index(index_name)
+
+    with st.spinner(f"Berechne heutiges Deep-Value-Setup für {target_name} ({target_ticker}) …"):
+        target_history = fetch_long_history(target_ticker)
+        target_dividends = fetch_dividends(target_ticker)
+        target_financials = fetch_historical_financials(target_ticker)
+    if target_history.empty:
+        st.error("Für das Zielunternehmen konnten keine langen Kursdaten geladen werden.")
+        return
+    latest_date = target_history.index.max()
+    current_snapshot = historical_bat_snapshot(
+        ticker=target_ticker,
+        as_of=latest_date,
+        history=target_history,
+        dividends=target_dividends,
+        financials=target_financials,
+        info_lag_days=120,
+        negative_news_shock=False,
+        special_effect_suspected=False,
+    )
+    if current_snapshot.get("error"):
+        st.warning(str(current_snapshot.get("error")))
+        return
+
+    target_cols = st.columns(6)
+    target_cols[0].metric("Zielaktie", target_name)
+    target_cols[1].metric("Deep-Value-Score heute", format_number(current_snapshot.get("bat_pattern_score"), 1))
+    target_cols[2].metric("Dividendenrendite", format_percent(current_snapshot.get("dividend_yield"), 2))
+    target_cols[3].metric("Drawdown 3J/5J", format_percent(current_snapshot.get("deepest_drawdown_3_5y_pct"), 1, signed=True))
+    target_cols[4].metric("FCF/Dividende", f"{format_number(current_snapshot.get('cashflow_dividend_coverage'), 2)}x")
+    target_cols[5].metric("Net Debt/EBITDA", f"{format_number(current_snapshot.get('net_debt_ebitda'), 2)}x")
+    st.caption(f"Sektor: {target_sector} · Benchmark: {benchmark_ticker} · Stichtag: {pd.Timestamp(latest_date).strftime('%d.%m.%Y')}")
+
+    st.markdown("#### Vergleichsuniversum einstellen")
+    settings_a, settings_b, settings_c = st.columns(3)
+    sector_mode = settings_a.selectbox(
+        "Sektorvergleich",
+        ["Alle Sektoren · gleicher Sektor bevorzugt", "Nur gleicher Sektor", "Alle Sektoren ohne Bonus"],
+        key="universe_pattern_sector_mode",
+    )
+    sampling_label = settings_b.selectbox(
+        "Historische Abtastung",
+        ["Quartalsweise", "Halbjährlich"],
+        key="universe_pattern_sampling",
+        help="Quartalsweise liefert mehr Fälle, braucht aber länger.",
+    )
+    sampling_months = 3 if sampling_label == "Quartalsweise" else 6
+    max_available = max(1, len(df.drop_duplicates("ticker_yahoo")))
+    max_companies = settings_c.slider(
+        "Max. Unternehmen",
+        min_value=1,
+        max_value=min(100, max_available),
+        value=min(20, max_available),
+        step=1,
+        key="universe_pattern_max_companies",
+        help="Für den ersten Test 10 bis 20 Unternehmen verwenden. DAX 40 kann anschließend vollständig geprüft werden.",
+    )
+
+    settings_d, settings_e, settings_f = st.columns(3)
+    similarity_min = settings_d.slider("Mindestähnlichkeit", 40, 95, 65, 5, key="universe_pattern_similarity_min")
+    min_coverage = settings_e.slider("Min. Merkmalsabdeckung", 20, 100, 60, 10, key="universe_pattern_min_coverage")
+    cooldown_months = settings_f.slider("Mindestabstand je Aktie (Monate)", 6, 36, 12, 1, key="universe_pattern_cooldown")
+
+    history_min = datetime(2005, 1, 1).date()
+    default_start = datetime(2014, 1, 1).date()
+    latest_complete = (pd.Timestamp.today().normalize() - pd.DateOffset(months=12)).date()
+    date_a, date_b, date_c = st.columns(3)
+    start_date = date_a.date_input("Historischer Beginn", value=default_start, min_value=history_min, max_value=latest_complete, key="universe_pattern_start")
+    end_date = date_b.date_input("Historisches Ende", value=latest_complete, min_value=history_min, max_value=latest_complete, key="universe_pattern_end")
+    max_cases = date_c.slider("Max. Vergleichsfälle", 10, 200, 60, 10, key="universe_pattern_max_cases")
+
+    universe = df[["ticker_yahoo", "name", "sector", "deep_value_score"]].copy() if "deep_value_score" in df.columns else df[["ticker_yahoo", "name", "sector"]].copy()
+    universe = universe.dropna(subset=["ticker_yahoo"]).drop_duplicates("ticker_yahoo")
+    if sector_mode == "Nur gleicher Sektor":
+        universe = universe[universe["sector"].astype(str).str.lower() == target_sector.lower()]
+    if "deep_value_score" in universe.columns:
+        universe["deep_value_score"] = pd.to_numeric(universe["deep_value_score"], errors="coerce")
+        universe = universe.sort_values(["deep_value_score", "name"], ascending=[False, True], na_position="last")
+    else:
+        universe = universe.sort_values("name")
+    universe = universe.head(int(max_companies)).reset_index(drop=True)
+
+    st.caption(
+        f"Geplant: {len(universe)} Unternehmen · {sampling_label.lower()} · "
+        f"{pd.Timestamp(start_date).strftime('%d.%m.%Y')} bis {pd.Timestamp(end_date).strftime('%d.%m.%Y')}. "
+        "Bereits gecachte Unternehmen werden deutlich schneller verarbeitet."
+    )
+
+    if st.button("Universumsvergleich starten", type="primary", key="run_universe_pattern_comparison"):
+        if pd.Timestamp(end_date) <= pd.Timestamp(start_date):
+            st.error("Das Enddatum muss nach dem Startdatum liegen.")
+        else:
+            progress = st.progress(0.0, text="Bereite Vergleich vor …")
+            frames: list[pd.DataFrame] = []
+            errors: list[str] = []
+            total = max(1, len(universe))
+            for position, row in universe.iterrows():
+                symbol = clean_ticker(row.get("ticker_yahoo"))
+                name = str(row.get("name") or symbol)
+                sector = str(row.get("sector") or "Unbekannt")
+                progress.progress(position / total, text=f"{name} ({symbol}) · historische Fälle …")
+                try:
+                    candidates = historical_pattern_candidates_cached(
+                        ticker=symbol,
+                        company_name=name,
+                        sector=sector,
+                        benchmark_ticker=benchmark_ticker,
+                        start_date_iso=pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+                        end_date_iso=pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+                        info_lag_days=120,
+                        sampling_months=sampling_months,
+                    )
+                    if candidates is not None and not candidates.empty:
+                        frames.append(candidates)
+                    else:
+                        errors.append(f"{symbol}: keine ausreichenden historischen Fälle")
+                except Exception as exc:
+                    errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+            progress.progress(1.0, text="Berechne Ähnlichkeiten …")
+
+            combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if not combined.empty:
+                similarity_rows: list[dict[str, Any]] = []
+                for _, candidate in combined.iterrows():
+                    candidate_sector = str(candidate.get("Sektor") or "Unbekannt")
+                    comparison_sector = None if sector_mode == "Alle Sektoren ohne Bonus" else target_sector
+                    similarity = deep_value_pattern_similarity(
+                        current_snapshot,
+                        candidate,
+                        current_sector=comparison_sector,
+                        historical_sector=candidate_sector,
+                    )
+                    item = candidate.to_dict()
+                    item["Ähnlichkeit"] = similarity.get("similarity")
+                    item["Merkmalsabdeckung"] = similarity.get("coverage")
+                    item["Gleicher Sektor"] = bool(similarity.get("same_sector"))
+                    item["Ähnlichkeits-Erklärung"] = similarity.get("explanation")
+                    similarity_rows.append(item)
+                combined = pd.DataFrame(similarity_rows)
+                combined = combined[
+                    (pd.to_numeric(combined["Ähnlichkeit"], errors="coerce") >= float(similarity_min))
+                    & (pd.to_numeric(combined["Merkmalsabdeckung"], errors="coerce") >= float(min_coverage))
+                ].copy()
+                combined = _independent_pattern_cases(combined, int(cooldown_months))
+                combined = combined.sort_values("Ähnlichkeit", ascending=False).head(int(max_cases)).reset_index(drop=True)
+
+            st.session_state["universe_pattern_result"] = combined
+            st.session_state["universe_pattern_errors"] = errors
+            st.session_state["universe_pattern_meta"] = {
+                "target_ticker": target_ticker,
+                "target_name": target_name,
+                "target_sector": target_sector,
+                "benchmark": benchmark_ticker,
+                "companies": len(universe),
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "sampling": sampling_label,
+                "similarity_min": similarity_min,
+                "coverage_min": min_coverage,
+                "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            }
+            progress.empty()
+            st.rerun()
+
+    result = st.session_state.get("universe_pattern_result")
+    meta = st.session_state.get("universe_pattern_meta", {})
+    if not isinstance(result, pd.DataFrame):
+        st.info("Starte den Vergleich, um historische Muster aus mehreren Unternehmen auszuwerten.")
+        return
+
+    if meta.get("target_ticker") != target_ticker:
+        st.warning("Das angezeigte Ergebnis gehört zu einer zuvor gewählten Zielaktie. Starte den Vergleich erneut.")
+
+    errors = st.session_state.get("universe_pattern_errors", [])
+    if errors:
+        with st.expander(f"Nicht vollständig verarbeitete Unternehmen ({len(errors)})", expanded=False):
+            for message in errors[:100]:
+                st.write(f"- {message}")
+
+    if result.empty:
+        st.warning(
+            "Keine historischen Fälle erfüllen die gewählte Ähnlichkeit und Datenabdeckung. "
+            "Reduziere die Mindestähnlichkeit, erweitere den Zeitraum oder erhöhe die Zahl der Unternehmen."
+        )
+        return
+
+    summary = summarise_universe_pattern_cases(result)
+    count = int(summary.get("count") or 0)
+    evidence_label, evidence_text = expectation_evidence_label(count)
+    st.markdown("#### Historische Erwartung aus dem Vergleichsuniversum")
+    summary_cols = st.columns(7)
+    summary_cols[0].metric("Vergleichsfälle", count)
+    summary_cols[1].metric("Aussagekraft", evidence_label)
+    summary_cols[2].metric("Positiv nach 12M", format_percent(summary.get("positive_rate"), 1))
+    summary_cols[3].metric("Benchmark geschlagen", format_percent(summary.get("benchmark_rate"), 1))
+    summary_cols[4].metric("Medianrendite", format_percent(summary.get("median_return"), 2, signed=True))
+    summary_cols[5].metric("Value-Trap-Anteil", format_percent(summary.get("trap_rate"), 1))
+    summary_cols[6].metric("Typischer Rückgang", format_percent(summary.get("typical_drawdown"), 1, signed=True))
+
+    if count < 5:
+        st.error(f"Nur {count} unabhängige Fälle. Die Statistik ist nicht belastbar. {evidence_text}")
+    else:
+        st.caption(evidence_text)
+
+    scenario_cols = st.columns(3)
+    scenario_cols[0].metric("Schwaches Szenario · 20 %", format_percent(summary.get("weak_scenario"), 2, signed=True))
+    scenario_cols[1].metric("Mittleres Szenario · Median", format_percent(summary.get("middle_scenario"), 2, signed=True))
+    scenario_cols[2].metric("Starkes Szenario · 80 %", format_percent(summary.get("strong_scenario"), 2, signed=True))
+
+    valid = summary.get("valid", pd.DataFrame())
+    if isinstance(valid, pd.DataFrame) and not valid.empty:
+        plot_frame = valid.dropna(subset=["Ähnlichkeit", "Rendite 12M"]).copy()
+        if not plot_frame.empty:
+            plot_frame["Fall"] = plot_frame["Unternehmen"].astype(str) + " · " + pd.to_datetime(plot_frame["Signal-Datum"]).dt.strftime("%m/%Y")
+            scatter = alt.Chart(plot_frame).mark_circle(size=90).encode(
+                x=alt.X("Ähnlichkeit:Q", scale=alt.Scale(domain=[40, 100]), title="Ähnlichkeit zum heutigen Setup (%)"),
+                y=alt.Y("Rendite 12M:Q", title="Rendite nach 12 Monaten (%)"),
+                shape=alt.Shape("Value Trap:N", title="Value Trap"),
+                tooltip=[
+                    "Fall:N", "Ticker:N", "Sektor:N",
+                    alt.Tooltip("Ähnlichkeit:Q", format=".1f"),
+                    alt.Tooltip("Rendite 12M:Q", format="+.2f"),
+                    alt.Tooltip("Überrendite 12M:Q", format="+.2f"),
+                    "Value Trap:N",
+                ],
+            ).properties(height=360)
+            zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4]).encode(y="y:Q")
+            st.altair_chart(scatter + zero, use_container_width=True)
+            st.caption("Jeder Punkt ist ein historischer, zeitlich unabhängiger Fall. Weiter rechts bedeutet ähnlicher zum heutigen Setup.")
+
+    st.markdown("#### Ähnlichste historische Fälle")
+    display_columns = [
+        "Unternehmen", "Ticker", "Sektor", "Signal-Datum", "Ähnlichkeit", "Merkmalsabdeckung",
+        "Deep-Value-Score", "Dividendenrendite", "Drawdown", "FCF/Dividende",
+        "Net Debt/EBITDA", "Rendite 12M", "Überrendite 12M", "Max. Rückgang 12M",
+        "Value Trap", "Value-Trap-Grund",
+    ]
+    display = result[[column for column in display_columns if column in result.columns]].copy()
+    if "Signal-Datum" in display.columns:
+        display["Signal-Datum"] = pd.to_datetime(display["Signal-Datum"], errors="coerce").dt.strftime("%d.%m.%Y")
+    st.dataframe(
+        display.style.format(
+            {
+                "Ähnlichkeit": "{:.1f} %",
+                "Merkmalsabdeckung": "{:.1f} %",
+                "Deep-Value-Score": "{:.1f}",
+                "Dividendenrendite": lambda value: format_percent(value, 2),
+                "Drawdown": lambda value: format_percent(value, 1, signed=True),
+                "FCF/Dividende": lambda value: f"{format_number(value, 2)}x",
+                "Net Debt/EBITDA": lambda value: f"{format_number(value, 2)}x",
+                "Rendite 12M": lambda value: format_percent(value, 2, signed=True),
+                "Überrendite 12M": lambda value: format_percent(value, 2, signed=True),
+                "Max. Rückgang 12M": lambda value: format_percent(value, 1, signed=True),
+            },
+            na_rep="–",
+        ).map(
+            colorize_change,
+            subset=[column for column in ["Rendite 12M", "Überrendite 12M"] if column in display.columns],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_options = result.index.tolist()
+    selected_case = st.selectbox(
+        "Historischen Fall genauer ansehen",
+        options=selected_options,
+        format_func=lambda idx: (
+            f"{result.loc[idx, 'Unternehmen']} ({result.loc[idx, 'Ticker']}) · "
+            f"{pd.Timestamp(result.loc[idx, 'Signal-Datum']).strftime('%m/%Y')} · "
+            f"{safe_float(result.loc[idx, 'Ähnlichkeit']) or 0:.1f} % ähnlich"
+        ),
+        key="universe_pattern_case_detail",
+    )
+    case = result.loc[selected_case]
+    detail_left, detail_right = st.columns(2)
+    detail_left.info(f"**Ähnlichkeitslogik**\n\n{case.get('Ähnlichkeits-Erklärung', '–')}")
+    detail_right.info(f"**Historischer Score**\n\n{case.get('Score-Erklärung', '–')}")
+
+    csv_data = result.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Vergleichsfälle als CSV herunterladen",
+        data=csv_data,
+        file_name=f"mustervergleich_{clean_ticker(target_ticker).replace('.', '_')}.csv",
+        mime="text/csv",
+        key="download_universe_pattern_cases",
+    )
+    st.caption(
+        f"Ergebnis erstellt: {meta.get('created_at', '–')} · {meta.get('companies', '–')} Unternehmen geprüft · "
+        f"Mindestähnlichkeit {meta.get('similarity_min', '–')} % · Mindestabdeckung {meta.get('coverage_min', '–')} %."
+    )
+
+
 def render_bat_backtesting(df: pd.DataFrame, index_name: str) -> None:
     st.subheader("Historisches Deep-Value-Backtesting")
     st.caption(
@@ -8234,7 +8766,7 @@ def main() -> None:
     # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
     main_pages = [
         "Überblick", "Datenstatus", "Fundamentaldaten", "Aktienprofile", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Research",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Research",
     ]
     if st.session_state.get("main_navigation") not in main_pages:
         st.session_state["main_navigation"] = main_pages[0]
@@ -8285,6 +8817,8 @@ def main() -> None:
         render_special_situation_scanner(data)
     elif active_page == "Backtesting":
         render_bat_backtesting(data, index_name)
+    elif active_page == "Mustervergleich":
+        render_universe_pattern_comparison(data, index_name)
     elif active_page == "Research":
         render_research(data, histories, index_name)
 
