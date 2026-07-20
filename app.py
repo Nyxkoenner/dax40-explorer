@@ -19,8 +19,10 @@ import os
 import logging
 import re
 import tempfile
+import xml.etree.ElementTree as ET
 import time
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -41,7 +43,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.7.1"
+APP_VERSION = "5.8"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -57,6 +59,8 @@ BACKTEST_RUNS_PATH = BACKTEST_DIR / "backtest_runs.csv"
 COMPANY_PROFILE_PATH = DATA_DIR / "company_profiles.csv"
 COMPANY_SEGMENTS_PATH = DATA_DIR / "company_segments.csv"
 COMPANY_REGIONS_PATH = DATA_DIR / "company_regions.csv"
+SUPERINVESTOR_REGISTRY_PATH = DATA_DIR / "superinvestors.csv"
+SUPERINVESTOR_TICKER_MAP_PATH = DATA_DIR / "superinvestor_ticker_map.csv"
 
 for directory in (DATA_DIR, INDEX_DIR, CACHE_DIR, BACKTEST_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -2684,7 +2688,7 @@ SEC_TICKER_CACHE_PATH = CACHE_DIR / "sec_company_tickers.json"
 
 SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "contact@example.com")
 SEC_HEADERS = {
-    "User-Agent": f"AktienExplorer/5.6 {SEC_CONTACT_EMAIL}",
+    "User-Agent": f"AktienExplorer/5.8 {SEC_CONTACT_EMAIL}",
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json,text/plain,*/*",
 }
@@ -11671,6 +11675,768 @@ def render_deep_company_profiles(data: pd.DataFrame) -> None:
         )
 
 
+
+# -----------------------------------------------------------------------------
+# Version 5.8 – Superinvestoren und Fondsbeobachtung via SEC Form 13F
+# -----------------------------------------------------------------------------
+
+SUPERINVESTOR_COLUMNS = [
+    "manager_name", "cik", "strategy", "website", "active", "notes",
+]
+SUPERINVESTOR_TICKER_MAP_COLUMNS = [
+    "cusip", "ticker_yahoo", "company_name", "notes",
+]
+DEFAULT_SUPERINVESTORS: list[dict[str, Any]] = [
+    {
+        "manager_name": "Berkshire Hathaway",
+        "cik": "1067983",
+        "strategy": "Konzentriertes Qualitäts-/Value-Portfolio",
+        "website": "https://www.berkshirehathaway.com/",
+        "active": True,
+        "notes": "Form-13F-Manager; Positionen können Tochtergesellschaften einschließen.",
+    },
+    {
+        "manager_name": "Pershing Square Capital Management",
+        "cik": "1336528",
+        "strategy": "Konzentriertes aktivistisches Aktienportfolio",
+        "website": "https://pershingsquareholdings.com/",
+        "active": True,
+        "notes": "Form 13F zeigt nur meldepflichtige US-Wertpapiere.",
+    },
+    {
+        "manager_name": "Scion Asset Management",
+        "cik": "1649339",
+        "strategy": "Konzentrierte, opportunistische Sondersituationen",
+        "website": "",
+        "active": True,
+        "notes": "Optionspositionen werden als Put/Call gesondert ausgewiesen.",
+    },
+    {
+        "manager_name": "Bridgewater Associates",
+        "cik": "1350694",
+        "strategy": "Global-Macro; 13F bildet nur einen Teil des Gesamtportfolios ab",
+        "website": "https://www.bridgewater.com/",
+        "active": True,
+        "notes": "Viele ETF-/US-Aktienpositionen; 13F ist kein vollständiges Macro-Portfolio.",
+    },
+    {
+        "manager_name": "Duquesne Family Office",
+        "cik": "1536411",
+        "strategy": "Konzentriertes, taktisches Aktienportfolio",
+        "website": "",
+        "active": True,
+        "notes": "Quartalsweise Form-13F-Meldungen.",
+    },
+]
+
+
+def _normalize_cik(value: Any) -> str:
+    raw = re.sub(r"\D+", "", str(value or ""))
+    return raw.lstrip("0") or ""
+
+
+def ensure_superinvestor_registry() -> pd.DataFrame:
+    if not SUPERINVESTOR_REGISTRY_PATH.exists():
+        frame = pd.DataFrame(DEFAULT_SUPERINVESTORS, columns=SUPERINVESTOR_COLUMNS)
+        safe_write_csv(frame, SUPERINVESTOR_REGISTRY_PATH)
+        return frame
+    try:
+        frame = pd.read_csv(SUPERINVESTOR_REGISTRY_PATH)
+    except Exception:
+        frame = pd.DataFrame(DEFAULT_SUPERINVESTORS, columns=SUPERINVESTOR_COLUMNS)
+    for column in SUPERINVESTOR_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = "" if column != "active" else True
+    frame = frame[SUPERINVESTOR_COLUMNS].copy()
+    frame["cik"] = frame["cik"].map(_normalize_cik)
+    frame["active"] = frame["active"].map(
+        lambda value: str(value).strip().lower() not in {"false", "0", "nein", "no", ""}
+    )
+    return frame
+
+
+def read_superinvestor_ticker_map() -> pd.DataFrame:
+    if not SUPERINVESTOR_TICKER_MAP_PATH.exists():
+        frame = pd.DataFrame(columns=SUPERINVESTOR_TICKER_MAP_COLUMNS)
+        safe_write_csv(frame, SUPERINVESTOR_TICKER_MAP_PATH)
+        return frame
+    try:
+        frame = pd.read_csv(SUPERINVESTOR_TICKER_MAP_PATH, dtype=str).fillna("")
+    except Exception:
+        frame = pd.DataFrame(columns=SUPERINVESTOR_TICKER_MAP_COLUMNS)
+    for column in SUPERINVESTOR_TICKER_MAP_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame = frame[SUPERINVESTOR_TICKER_MAP_COLUMNS].copy()
+    frame["cusip"] = frame["cusip"].astype(str).str.strip().str.upper()
+    frame["ticker_yahoo"] = frame["ticker_yahoo"].map(clean_ticker)
+    return frame
+
+
+def _sec_request_json(url: str, timeout: int = 30) -> dict[str, Any]:
+    response = requests.get(url, headers=SEC_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("SEC-Antwort enthält kein JSON-Objekt.")
+    return payload
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_13f_filing_list(cik_value: Any, max_filings: int = 16) -> pd.DataFrame:
+    cik = _normalize_cik(cik_value)
+    columns = [
+        "report_date", "filing_date", "accession", "form", "primary_document",
+        "filing_url", "cik",
+    ]
+    if not cik:
+        return pd.DataFrame(columns=columns)
+    url = f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
+    payload = _sec_request_json(url)
+    recent = payload.get("filings", {}).get("recent", {})
+    forms = list(recent.get("form", []))
+    rows: list[dict[str, Any]] = []
+    for index, form in enumerate(forms):
+        normalized_form = str(form or "").upper().strip()
+        if normalized_form not in {"13F-HR", "13F-HR/A"}:
+            continue
+        def item(name: str, default: str = "") -> str:
+            values = recent.get(name, [])
+            return str(values[index]) if index < len(values) else default
+        accession = item("accessionNumber")
+        accession_compact = accession.replace("-", "")
+        report_date = pd.to_datetime(item("reportDate"), errors="coerce")
+        filing_date = pd.to_datetime(item("filingDate"), errors="coerce")
+        if pd.isna(report_date):
+            continue
+        rows.append({
+            "report_date": pd.Timestamp(report_date).normalize(),
+            "filing_date": pd.Timestamp(filing_date).normalize() if pd.notna(filing_date) else pd.NaT,
+            "accession": accession,
+            "form": normalized_form,
+            "primary_document": item("primaryDocument"),
+            "filing_url": (
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_compact}/"
+                f"{accession}-index.html"
+            ),
+            "cik": cik,
+        })
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(rows).sort_values(["report_date", "filing_date"], ascending=[False, False])
+    # Bei Amendments gilt für denselben Berichtszeitraum die zuletzt eingereichte Fassung.
+    result = result.drop_duplicates(subset=["report_date"], keep="first").head(max_filings)
+    return result[columns].reset_index(drop=True)
+
+
+def _xml_local_name(tag: Any) -> str:
+    return str(tag or "").split("}")[-1]
+
+
+def _xml_descendant_text(element: ET.Element, local_name: str) -> str:
+    target = str(local_name).casefold()
+    for child in element.iter():
+        if _xml_local_name(child.tag).casefold() == target:
+            return str(child.text or "").strip()
+    return ""
+
+
+def parse_13f_information_table(xml_payload: bytes | str) -> pd.DataFrame:
+    columns = [
+        "holding_key", "issuer", "title_of_class", "cusip", "figi", "market_value_usd",
+        "shares", "share_type", "put_call", "investment_discretion", "voting_sole",
+        "voting_shared", "voting_none",
+    ]
+    if isinstance(xml_payload, str):
+        payload = xml_payload.encode("utf-8")
+    else:
+        payload = xml_payload
+    root = ET.fromstring(payload)
+    rows: list[dict[str, Any]] = []
+    for element in root.iter():
+        if _xml_local_name(element.tag).casefold() != "infotable":
+            continue
+        issuer = _xml_descendant_text(element, "nameOfIssuer")
+        title = _xml_descendant_text(element, "titleOfClass")
+        cusip = _xml_descendant_text(element, "cusip").upper()
+        figi = _xml_descendant_text(element, "figi")
+        put_call = _xml_descendant_text(element, "putCall").upper()
+        value_thousands = safe_float(_xml_descendant_text(element, "value")) or 0.0
+        shares = safe_float(_xml_descendant_text(element, "sshPrnamt")) or 0.0
+        row = {
+            "issuer": issuer,
+            "title_of_class": title,
+            "cusip": cusip,
+            "figi": figi,
+            "market_value_usd": value_thousands * 1000.0,
+            "shares": shares,
+            "share_type": _xml_descendant_text(element, "sshPrnamtType"),
+            "put_call": put_call,
+            "investment_discretion": _xml_descendant_text(element, "investmentDiscretion"),
+            "voting_sole": safe_float(_xml_descendant_text(element, "Sole")) or 0.0,
+            "voting_shared": safe_float(_xml_descendant_text(element, "Shared")) or 0.0,
+            "voting_none": safe_float(_xml_descendant_text(element, "None")) or 0.0,
+        }
+        row["holding_key"] = "|".join([cusip, title.casefold(), put_call])
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=columns + ["weight_pct"])
+    result = pd.DataFrame(rows)
+    # Mehrere Zeilen für denselben Titel werden konsolidiert, sofern Klasse/Put-Call gleich sind.
+    group_columns = ["holding_key", "issuer", "title_of_class", "cusip", "figi", "share_type", "put_call", "investment_discretion"]
+    result = result.groupby(group_columns, dropna=False, as_index=False).agg({
+        "market_value_usd": "sum",
+        "shares": "sum",
+        "voting_sole": "sum",
+        "voting_shared": "sum",
+        "voting_none": "sum",
+    })
+    total_value = float(result["market_value_usd"].sum())
+    result["weight_pct"] = result["market_value_usd"] / total_value * 100.0 if total_value > 0 else 0.0
+    return result.sort_values("market_value_usd", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def fetch_13f_holdings(cik_value: Any, accession: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    cik = _normalize_cik(cik_value)
+    accession_clean = str(accession or "").strip()
+    if not cik or not accession_clean:
+        return pd.DataFrame(), {"error": "CIK oder Accession fehlt."}
+    accession_compact = accession_clean.replace("-", "")
+    directory_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_compact}/"
+    index_url = directory_url + "index.json"
+    try:
+        index_payload = _sec_request_json(index_url)
+        items = index_payload.get("directory", {}).get("item", [])
+        candidates: list[dict[str, Any]] = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", ""))
+            name_lower = name.lower()
+            if not name_lower.endswith(".xml") or name_lower in {"primary_doc.xml"}:
+                continue
+            score = 0
+            if any(term in name_lower for term in ["info", "table", "13f"]):
+                score += 100
+            score += int(safe_float(item.get("size")) or 0) // 1000
+            candidates.append({"name": name, "score": score, "size": int(safe_float(item.get("size")) or 0)})
+        if not candidates:
+            raise RuntimeError("Keine XML-Informationstabelle im 13F-Ordner gefunden.")
+        candidate = sorted(candidates, key=lambda row: (row["score"], row["size"]), reverse=True)[0]
+        xml_url = directory_url + candidate["name"]
+        response = requests.get(xml_url, headers=SEC_HEADERS, timeout=35)
+        response.raise_for_status()
+        holdings = parse_13f_information_table(response.content)
+        metadata = {
+            "cik": cik,
+            "accession": accession_clean,
+            "directory_url": directory_url,
+            "index_url": index_url,
+            "xml_url": xml_url,
+            "source_file": candidate["name"],
+            "holdings_count": len(holdings),
+            "total_value_usd": float(holdings["market_value_usd"].sum()) if not holdings.empty else 0.0,
+            "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "error": "",
+        }
+        return holdings, metadata
+    except Exception as error:
+        return pd.DataFrame(), {
+            "cik": cik,
+            "accession": accession_clean,
+            "directory_url": directory_url,
+            "index_url": index_url,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def compare_13f_holdings(current: pd.DataFrame, previous: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "holding_key", "issuer", "title_of_class", "cusip", "put_call", "status",
+        "current_value_usd", "previous_value_usd", "value_change_usd", "value_change_pct",
+        "current_shares", "previous_shares", "share_change", "share_change_pct",
+        "current_weight_pct", "previous_weight_pct", "weight_change_pp",
+    ]
+    current_frame = current.copy() if isinstance(current, pd.DataFrame) else pd.DataFrame()
+    previous_frame = previous.copy() if isinstance(previous, pd.DataFrame) else pd.DataFrame()
+    if current_frame.empty and previous_frame.empty:
+        return pd.DataFrame(columns=columns)
+    selected = ["holding_key", "issuer", "title_of_class", "cusip", "put_call", "market_value_usd", "shares", "weight_pct"]
+    for frame in (current_frame, previous_frame):
+        for column in selected:
+            if column not in frame.columns:
+                frame[column] = None
+    merged = current_frame[selected].merge(
+        previous_frame[selected], on="holding_key", how="outer", suffixes=("_current", "_previous")
+    )
+    for base in ["issuer", "title_of_class", "cusip", "put_call"]:
+        merged[base] = merged[f"{base}_current"].combine_first(merged[f"{base}_previous"])
+    merged["current_value_usd"] = pd.to_numeric(merged["market_value_usd_current"], errors="coerce").fillna(0.0)
+    merged["previous_value_usd"] = pd.to_numeric(merged["market_value_usd_previous"], errors="coerce").fillna(0.0)
+    merged["current_shares"] = pd.to_numeric(merged["shares_current"], errors="coerce").fillna(0.0)
+    merged["previous_shares"] = pd.to_numeric(merged["shares_previous"], errors="coerce").fillna(0.0)
+    merged["current_weight_pct"] = pd.to_numeric(merged["weight_pct_current"], errors="coerce").fillna(0.0)
+    merged["previous_weight_pct"] = pd.to_numeric(merged["weight_pct_previous"], errors="coerce").fillna(0.0)
+    merged["value_change_usd"] = merged["current_value_usd"] - merged["previous_value_usd"]
+    merged["share_change"] = merged["current_shares"] - merged["previous_shares"]
+    merged["weight_change_pp"] = merged["current_weight_pct"] - merged["previous_weight_pct"]
+    merged["value_change_pct"] = merged.apply(
+        lambda row: (row["value_change_usd"] / row["previous_value_usd"] * 100.0) if row["previous_value_usd"] > 0 else None,
+        axis=1,
+    )
+    merged["share_change_pct"] = merged.apply(
+        lambda row: (row["share_change"] / row["previous_shares"] * 100.0) if row["previous_shares"] > 0 else None,
+        axis=1,
+    )
+    def classify(row: pd.Series) -> str:
+        if row["previous_shares"] <= 0 and row["current_shares"] > 0:
+            return "Neu"
+        if row["current_shares"] <= 0 and row["previous_shares"] > 0:
+            return "Verkauft"
+        tolerance = max(1.0, abs(row["previous_shares"]) * 0.0001)
+        if row["share_change"] > tolerance:
+            return "Aufgestockt"
+        if row["share_change"] < -tolerance:
+            return "Reduziert"
+        return "Unverändert"
+    merged["status"] = merged.apply(classify, axis=1)
+    return merged[columns].sort_values(["status", "current_value_usd"], ascending=[True, False]).reset_index(drop=True)
+
+
+def _normalize_issuer_name(value: Any) -> str:
+    normalized = normalize_for_search(value)
+    stop_words = {
+        "inc", "incorporated", "corp", "corporation", "company", "co", "ltd", "limited",
+        "plc", "sa", "nv", "ag", "se", "holdings", "holding", "group", "the", "class",
+        "com", "common", "stock", "shares",
+    }
+    tokens = [token for token in normalized.split() if token not in stop_words and len(token) > 1]
+    return " ".join(tokens)
+
+
+def _issuer_similarity(left: Any, right: Any) -> float:
+    a = _normalize_issuer_name(left)
+    b = _normalize_issuer_name(right)
+    if not a or not b:
+        return 0.0
+    sequence = SequenceMatcher(None, a, b).ratio()
+    set_a, set_b = set(a.split()), set(b.split())
+    jaccard = len(set_a & set_b) / len(set_a | set_b) if set_a | set_b else 0.0
+    containment = 1.0 if a in b or b in a else 0.0
+    return max(sequence, 0.65 * sequence + 0.35 * jaccard, containment * 0.92)
+
+
+def map_13f_holdings_to_tickers(holdings: pd.DataFrame, market_data: pd.DataFrame) -> pd.DataFrame:
+    if holdings is None or holdings.empty:
+        return pd.DataFrame()
+    result = holdings.copy()
+    mapping = read_superinvestor_ticker_map()
+    cusip_map = {
+        str(row.get("cusip", "")).upper(): {
+            "ticker": clean_ticker(row.get("ticker_yahoo")),
+            "company_name": str(row.get("company_name", "")),
+        }
+        for _, row in mapping.iterrows() if str(row.get("cusip", "")).strip()
+    }
+    candidates: list[tuple[str, str]] = []
+    if isinstance(market_data, pd.DataFrame) and not market_data.empty:
+        for _, row in market_data[["ticker_yahoo", "name"]].dropna(subset=["ticker_yahoo"]).drop_duplicates().iterrows():
+            candidates.append((clean_ticker(row["ticker_yahoo"]), str(row.get("name") or row["ticker_yahoo"])))
+    tickers, sources, scores = [], [], []
+    for _, row in result.iterrows():
+        cusip = str(row.get("cusip", "")).upper().strip()
+        manual = cusip_map.get(cusip)
+        if manual and manual["ticker"]:
+            tickers.append(manual["ticker"])
+            sources.append("Manuelle CUSIP-Zuordnung")
+            scores.append(100.0)
+            continue
+        issuer = row.get("issuer", "")
+        best_ticker, best_score = "", 0.0
+        for ticker, name in candidates:
+            score = _issuer_similarity(issuer, name)
+            if score > best_score:
+                best_ticker, best_score = ticker, score
+        if best_score >= 0.78:
+            tickers.append(best_ticker)
+            sources.append("Namensabgleich im geladenen Index")
+            scores.append(round(best_score * 100.0, 1))
+        else:
+            tickers.append("")
+            sources.append("Nicht zugeordnet")
+            scores.append(round(best_score * 100.0, 1) if best_score else 0.0)
+    result["ticker_yahoo"] = tickers
+    result["ticker_mapping_source"] = sources
+    result["ticker_match_score"] = scores
+    return result
+
+
+def _human_usd(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "–"
+    absolute = abs(number)
+    if absolute >= 1_000_000_000:
+        return f"{format_number(number / 1_000_000_000, 1)} Mrd. USD"
+    if absolute >= 1_000_000:
+        return f"{format_number(number / 1_000_000, 1)} Mio. USD"
+    return f"{format_number(number, 0)} USD"
+
+
+def _13f_filing_label(row: pd.Series) -> str:
+    report = pd.to_datetime(row.get("report_date"), errors="coerce")
+    filing = pd.to_datetime(row.get("filing_date"), errors="coerce")
+    report_label = report.strftime("%d.%m.%Y") if pd.notna(report) else "–"
+    filing_label = filing.strftime("%d.%m.%Y") if pd.notna(filing) else "–"
+    return f"Berichtsstand {report_label} · eingereicht {filing_label}"
+
+
+def _render_13f_top_holdings(holdings: pd.DataFrame, manager_name: str, report_date: Any) -> None:
+    if holdings.empty:
+        st.info("Für diese Meldung wurden keine Positionen gelesen.")
+        return
+    total_value = float(holdings["market_value_usd"].sum())
+    top10 = float(holdings.head(10)["weight_pct"].sum())
+    option_share = float(holdings["put_call"].astype(str).str.len().gt(0).mul(holdings["weight_pct"]).sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("13F-Meldewert", _human_usd(total_value))
+    c2.metric("Positionen", format_number(len(holdings), 0))
+    c3.metric("Top-10-Konzentration", format_percent(top10, 1))
+    c4.metric("Put/Call-Anteil", format_percent(option_share, 1))
+    st.caption(
+        f"{manager_name} · Berichtsstand {pd.to_datetime(report_date).strftime('%d.%m.%Y') if pd.notna(pd.to_datetime(report_date, errors='coerce')) else '–'}"
+    )
+
+    top_count = st.slider("Anzahl Top-Positionen", 5, min(40, len(holdings)), min(15, len(holdings)), key="superinvestor_top_count")
+    top = holdings.head(top_count).copy().sort_values("weight_pct")
+    chart = alt.Chart(top).mark_bar().encode(
+        x=alt.X("weight_pct:Q", title="Portfoliogewicht (%)"),
+        y=alt.Y("issuer:N", sort=None, title=""),
+        tooltip=[
+            alt.Tooltip("issuer:N", title="Emittent"),
+            alt.Tooltip("weight_pct:Q", title="Gewicht", format=".2f"),
+            alt.Tooltip("market_value_usd:Q", title="Meldewert USD", format=",.0f"),
+            alt.Tooltip("shares:Q", title="Stück/Nennbetrag", format=",.0f"),
+            alt.Tooltip("put_call:N", title="Put/Call"),
+        ],
+    ).properties(height=max(260, 25 * len(top)))
+    st.altair_chart(chart, use_container_width=True)
+
+    table = holdings.copy()
+    table["Meldewert"] = table["market_value_usd"].map(_human_usd)
+    table["Gewicht"] = table["weight_pct"].map(lambda value: format_percent(value, 2))
+    table["Stück/Nennbetrag"] = table["shares"].map(lambda value: format_number(value, 0))
+    display = table.rename(columns={
+        "issuer": "Emittent", "title_of_class": "Klasse", "cusip": "CUSIP",
+        "put_call": "Put/Call", "share_type": "Einheit",
+    })[["Emittent", "Klasse", "CUSIP", "Put/Call", "Meldewert", "Gewicht", "Stück/Nennbetrag", "Einheit"]]
+    st.dataframe(display, hide_index=True, use_container_width=True)
+
+
+def _render_13f_changes(changes: pd.DataFrame, current_label: str, previous_label: str) -> None:
+    st.caption(f"Vergleich: {current_label} gegenüber {previous_label}")
+    if changes.empty:
+        st.info("Für den Quartalsvergleich liegen keine Daten vor.")
+        return
+    statuses = ["Alle"] + sorted(changes["status"].dropna().astype(str).unique().tolist())
+    selected = st.multiselect("Veränderungen filtern", statuses[1:], default=statuses[1:], key="superinvestor_change_filter")
+    view = changes[changes["status"].isin(selected)].copy() if selected else changes.iloc[0:0].copy()
+    summary = changes["status"].value_counts()
+    cols = st.columns(5)
+    for column, label in zip(cols, ["Neu", "Aufgestockt", "Reduziert", "Verkauft", "Unverändert"]):
+        column.metric(label, int(summary.get(label, 0)))
+    if view.empty:
+        st.info("Für den gewählten Filter gibt es keine Positionen.")
+        return
+    view["Aktuell"] = view["current_value_usd"].map(_human_usd)
+    view["Vorher"] = view["previous_value_usd"].map(_human_usd)
+    view["Wertänderung"] = view["value_change_usd"].map(_human_usd)
+    view["Stückänderung"] = view["share_change_pct"].map(lambda value: format_percent(value, 1, signed=True))
+    view["Gewichtsänderung"] = view["weight_change_pp"].map(lambda value: format_percent(value, 2, signed=True))
+    display = view.rename(columns={"issuer": "Emittent", "title_of_class": "Klasse", "status": "Status", "put_call": "Put/Call"})
+    st.dataframe(
+        display[["Status", "Emittent", "Klasse", "Put/Call", "Aktuell", "Vorher", "Wertänderung", "Stückänderung", "Gewichtsänderung"]],
+        hide_index=True, use_container_width=True,
+    )
+
+
+def _render_13f_overlaps(mapped: pd.DataFrame, data: pd.DataFrame) -> None:
+    if mapped.empty:
+        st.info("Keine Positionen für Überschneidungen verfügbar.")
+        return
+    watchlist = read_watchlist()
+    try:
+        portfolio = read_portfolio()
+    except Exception:
+        portfolio = pd.DataFrame(columns=["ticker_yahoo"])
+    watch_tickers = set(watchlist.get("ticker_yahoo", pd.Series(dtype=str)).map(clean_ticker))
+    portfolio_tickers = set(portfolio.get("ticker_yahoo", pd.Series(dtype=str)).map(clean_ticker))
+    index_tickers = set(data.get("ticker_yahoo", pd.Series(dtype=str)).map(clean_ticker))
+    mapped = mapped.copy()
+    mapped["Im geladenen Index"] = mapped["ticker_yahoo"].isin(index_tickers)
+    mapped["In Watchlist"] = mapped["ticker_yahoo"].isin(watch_tickers)
+    mapped["Im Portfolio"] = mapped["ticker_yahoo"].isin(portfolio_tickers)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ticker zugeordnet", int(mapped["ticker_yahoo"].astype(str).str.len().gt(0).sum()))
+    c2.metric("Im aktuellen Index", int(mapped["Im geladenen Index"].sum()))
+    c3.metric("In deiner Watchlist", int(mapped["In Watchlist"].sum()))
+    c4.metric("In deinem Portfolio", int(mapped["Im Portfolio"].sum()))
+    overlaps = mapped[mapped[["Im geladenen Index", "In Watchlist", "Im Portfolio"]].any(axis=1)].copy()
+    if overlaps.empty:
+        st.info(
+            "Keine zuverlässig zugeordneten Überschneidungen gefunden. Im Bereich „Manager & Zuordnung“ kannst du "
+            "CUSIP-Werte manuell einem Yahoo-Ticker zuweisen."
+        )
+    else:
+        overlaps["Gewicht"] = overlaps["weight_pct"].map(lambda value: format_percent(value, 2))
+        st.dataframe(
+            overlaps.rename(columns={"issuer": "Emittent", "ticker_yahoo": "Ticker", "ticker_mapping_source": "Zuordnung"})[
+                ["Emittent", "Ticker", "Gewicht", "Im geladenen Index", "In Watchlist", "Im Portfolio", "Zuordnung"]
+            ], hide_index=True, use_container_width=True,
+        )
+
+    eligible = mapped[mapped["ticker_yahoo"].astype(str).str.len().gt(0)].copy()
+    if not eligible.empty:
+        option_map = {
+            f"{row['issuer']} ({row['ticker_yahoo']})": row["ticker_yahoo"] for _, row in eligible.iterrows()
+        }
+        choice = st.selectbox("Zugeordnete Position zur Watchlist hinzufügen", list(option_map), key="superinvestor_watchlist_choice")
+        selected_ticker = option_map[choice]
+        selected_row = eligible[eligible["ticker_yahoo"].eq(selected_ticker)].iloc[0]
+        market_match = data[data["ticker_yahoo"].map(clean_ticker).eq(selected_ticker)]
+        name = str(market_match.iloc[0].get("name")) if not market_match.empty else str(selected_row.get("issuer") or selected_ticker)
+        sector = str(market_match.iloc[0].get("sector")) if not market_match.empty else ""
+        if st.button("Zur Watchlist hinzufügen", key="superinvestor_add_watchlist"):
+            if add_to_watchlist(selected_ticker, name, sector):
+                st.success(f"{name} ({selected_ticker}) wurde zur Watchlist hinzugefügt.")
+            else:
+                st.info("Der Titel ist bereits in der Watchlist.")
+
+
+def _render_13f_consensus() -> None:
+    loaded = st.session_state.get("superinvestor_loaded", {})
+    valid = [entry for entry in loaded.values() if isinstance(entry, dict) and isinstance(entry.get("holdings"), pd.DataFrame) and not entry["holdings"].empty]
+    if len(valid) < 2:
+        st.info("Lade mindestens zwei Manager, um gemeinsame Positionen zu vergleichen.")
+        return
+    rows: list[pd.DataFrame] = []
+    for entry in valid:
+        frame = entry["holdings"].copy()
+        frame["manager_name"] = entry.get("manager_name", entry.get("cik", ""))
+        rows.append(frame[["holding_key", "issuer", "cusip", "weight_pct", "manager_name"]])
+    combined = pd.concat(rows, ignore_index=True)
+    consensus = combined.groupby(["holding_key", "issuer", "cusip"], as_index=False).agg(
+        manager_count=("manager_name", "nunique"),
+        managers=("manager_name", lambda values: " · ".join(sorted(set(map(str, values))))),
+        average_weight_pct=("weight_pct", "mean"),
+        total_weight_pct=("weight_pct", "sum"),
+    )
+    consensus = consensus[consensus["manager_count"] >= 2].sort_values(["manager_count", "total_weight_pct"], ascending=[False, False])
+    if consensus.empty:
+        st.info("Unter den geladenen Managern gibt es keine identischen CUSIP-Positionen.")
+        return
+    consensus["Ø Gewicht"] = consensus["average_weight_pct"].map(lambda value: format_percent(value, 2))
+    consensus["Summe Gewichte"] = consensus["total_weight_pct"].map(lambda value: format_percent(value, 2))
+    display = consensus.rename(columns={"issuer": "Emittent", "manager_count": "Anzahl Manager", "managers": "Manager"})
+    st.dataframe(display[["Emittent", "CUSIP" if "CUSIP" in display.columns else "cusip", "Anzahl Manager", "Manager", "Ø Gewicht", "Summe Gewichte"]], hide_index=True, use_container_width=True)
+
+
+def _render_superinvestor_admin() -> None:
+    st.markdown("#### Manager verwalten")
+    registry = ensure_superinvestor_registry()
+    edited = st.data_editor(
+        registry,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "manager_name": st.column_config.TextColumn("Manager", required=True),
+            "cik": st.column_config.TextColumn("SEC-CIK", required=True, help="Nur Ziffern; führende Nullen sind optional."),
+            "strategy": st.column_config.TextColumn("Strategie"),
+            "website": st.column_config.LinkColumn("Website"),
+            "active": st.column_config.CheckboxColumn("Aktiv"),
+            "notes": st.column_config.TextColumn("Hinweise"),
+        },
+        key="superinvestor_registry_editor",
+    )
+    if st.button("Managerliste speichern", key="save_superinvestor_registry"):
+        edited = edited.copy()
+        edited["cik"] = edited["cik"].map(_normalize_cik)
+        edited = edited[edited["manager_name"].astype(str).str.strip().ne("") & edited["cik"].astype(str).str.strip().ne("")]
+        ok, message = safe_write_csv(edited[SUPERINVESTOR_COLUMNS], SUPERINVESTOR_REGISTRY_PATH)
+        if ok:
+            st.success("Managerliste gespeichert.")
+        else:
+            st.warning(message)
+
+    st.markdown("#### CUSIP → Yahoo-Ticker zuordnen")
+    st.caption(
+        "Form 13F enthält CUSIP und Emittentenname, aber keinen verlässlichen Yahoo-Ticker. "
+        "Manuelle Zuordnungen verbessern Watchlist-/Portfolio-Überschneidungen."
+    )
+    ticker_map = read_superinvestor_ticker_map()
+    edited_map = st.data_editor(
+        ticker_map,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "cusip": st.column_config.TextColumn("CUSIP", required=True),
+            "ticker_yahoo": st.column_config.TextColumn("Yahoo-Ticker", required=True),
+            "company_name": st.column_config.TextColumn("Unternehmen"),
+            "notes": st.column_config.TextColumn("Hinweise"),
+        },
+        key="superinvestor_ticker_map_editor",
+    )
+    if st.button("Ticker-Zuordnungen speichern", key="save_superinvestor_ticker_map"):
+        edited_map = edited_map.fillna("").copy()
+        edited_map["cusip"] = edited_map["cusip"].astype(str).str.strip().str.upper()
+        edited_map["ticker_yahoo"] = edited_map["ticker_yahoo"].map(clean_ticker)
+        edited_map = edited_map[edited_map["cusip"].ne("") & edited_map["ticker_yahoo"].ne("")]
+        ok, message = safe_write_csv(edited_map[SUPERINVESTOR_TICKER_MAP_COLUMNS], SUPERINVESTOR_TICKER_MAP_PATH)
+        if ok:
+            st.success("Ticker-Zuordnungen gespeichert.")
+        else:
+            st.warning(message)
+
+
+def render_superinvestors(data: pd.DataFrame) -> None:
+    st.subheader("Superinvestoren & Fonds – SEC Form 13F")
+    st.caption(
+        "Quartalsweise US-Aktienmeldungen großer institutioneller Manager. Du siehst Top-Positionen, "
+        "Käufe/Verkäufe, Überschneidungen und Gemeinsamkeiten geladener Manager."
+    )
+    registry = ensure_superinvestor_registry()
+    active_registry = registry[registry["active"].fillna(True)].copy()
+    if active_registry.empty:
+        st.warning("In data/superinvestors.csv ist kein aktiver Manager hinterlegt.")
+        _render_superinvestor_admin()
+        return
+    labels = {
+        f"{row['manager_name']} · CIK {int(row['cik']):010d}": str(row["cik"])
+        for _, row in active_registry.iterrows() if _normalize_cik(row.get("cik"))
+    }
+    label = st.selectbox("Manager auswählen", list(labels), key="superinvestor_manager")
+    cik = labels[label]
+    manager_row = active_registry[active_registry["cik"].astype(str).eq(cik)].iloc[0]
+    manager_name = str(manager_row["manager_name"])
+    if str(manager_row.get("strategy", "")).strip():
+        st.caption(f"Strategie: {manager_row['strategy']}")
+
+    try:
+        filings = fetch_13f_filing_list(cik)
+    except Exception as error:
+        st.error(f"SEC-Filings konnten nicht geladen werden: {error}")
+        filings = pd.DataFrame()
+    if filings.empty:
+        st.warning("Für diesen CIK wurden keine aktuellen 13F-HR-Meldungen gefunden.")
+        section = st.radio("Bereich", ["Manager & Zuordnung", "Datenhinweise"], horizontal=True, key="superinvestor_empty_section")
+        if section == "Manager & Zuordnung":
+            _render_superinvestor_admin()
+        else:
+            st.info("Prüfe CIK, SEC-Kontaktkennung und Internetverbindung.")
+        return
+
+    filing_labels = {_13f_filing_label(row): index for index, row in filings.iterrows()}
+    selected_label = st.selectbox("Berichtsquartal", list(filing_labels), key="superinvestor_filing")
+    selected_index = filing_labels[selected_label]
+    selected_filing = filings.loc[selected_index]
+    selected_position = filings.index.get_loc(selected_index)
+    previous_filing = filings.iloc[selected_position + 1] if selected_position + 1 < len(filings) else None
+
+    if st.button("13F-Positionen laden / aktualisieren", type="primary", key="load_superinvestor_holdings"):
+        with st.spinner(f"Lade 13F-Positionen von {manager_name} …"):
+            current, current_meta = fetch_13f_holdings(cik, selected_filing["accession"])
+            previous, previous_meta = (pd.DataFrame(), {})
+            if previous_filing is not None:
+                previous, previous_meta = fetch_13f_holdings(cik, previous_filing["accession"])
+        if current.empty:
+            st.error(current_meta.get("error") or "Die 13F-Informationstabelle konnte nicht gelesen werden.")
+        else:
+            loaded = st.session_state.setdefault("superinvestor_loaded", {})
+            loaded[cik] = {
+                "cik": cik,
+                "manager_name": manager_name,
+                "filing": selected_filing.to_dict(),
+                "previous_filing": previous_filing.to_dict() if previous_filing is not None else {},
+                "holdings": current,
+                "previous_holdings": previous,
+                "changes": compare_13f_holdings(current, previous),
+                "metadata": current_meta,
+                "previous_metadata": previous_meta,
+            }
+            st.success(f"{len(current)} Positionen wurden geladen.")
+            st.rerun()
+
+    loaded_entry = st.session_state.get("superinvestor_loaded", {}).get(cik)
+    if not loaded_entry or str(loaded_entry.get("filing", {}).get("accession", "")) != str(selected_filing["accession"]):
+        st.info("Klicke auf „13F-Positionen laden / aktualisieren“, um das gewählte Quartal auszuwerten.")
+        with st.expander("Was Form 13F zeigt – und was nicht"):
+            st.markdown(
+                "- Positionen werden quartalsweise und zeitverzögert gemeldet.\n"
+                "- Erfasst werden vor allem bestimmte US-notierte Wertpapiere; Bargeld, viele Anleihen, ausländische Direktlistings und Short-Positionen fehlen.\n"
+                "- Put-/Call-Positionen zeigen den Nominalbestand, aber nicht Strategie, Laufzeit oder Ausübungspreis.\n"
+                "- Ein Manager kann zwischen Berichtsende und Veröffentlichung bereits gehandelt haben."
+            )
+        return
+
+    holdings = loaded_entry["holdings"]
+    previous_holdings = loaded_entry.get("previous_holdings", pd.DataFrame())
+    changes = loaded_entry.get("changes", pd.DataFrame())
+    filing = loaded_entry["filing"]
+    previous_meta = loaded_entry.get("previous_filing", {})
+    mapped = map_13f_holdings_to_tickers(holdings, data)
+
+    metadata = loaded_entry.get("metadata", {})
+    st.caption(
+        f"Quelle: SEC EDGAR · abgerufen {metadata.get('retrieved_at', '–')} · "
+        f"Datei: {metadata.get('source_file', '–')}"
+    )
+    if metadata.get("directory_url"):
+        st.link_button("Offizielle SEC-Meldung öffnen", metadata["directory_url"])
+
+    sections = ["Top-Positionen", "Veränderungen", "Überschneidungen", "Konsens", "Manager & Zuordnung", "Datenhinweise"]
+    if st.session_state.get("superinvestor_section") not in sections:
+        st.session_state["superinvestor_section"] = sections[0]
+    section = st.radio("Bereich", sections, horizontal=True, key="superinvestor_section", label_visibility="collapsed")
+    st.divider()
+
+    if section == "Top-Positionen":
+        _render_13f_top_holdings(holdings, manager_name, filing.get("report_date"))
+    elif section == "Veränderungen":
+        current_label = _13f_filing_label(pd.Series(filing))
+        previous_label = _13f_filing_label(pd.Series(previous_meta)) if previous_meta else "kein Vorquartal"
+        _render_13f_changes(changes, current_label, previous_label)
+    elif section == "Überschneidungen":
+        _render_13f_overlaps(mapped, data)
+    elif section == "Konsens":
+        _render_13f_consensus()
+    elif section == "Manager & Zuordnung":
+        _render_superinvestor_admin()
+    else:
+        st.markdown("#### Datenhinweise")
+        st.warning(
+            "Form 13F ist eine verzögerte regulatorische Momentaufnahme, kein Live-Portfolio und kein Kaufargument. "
+            "Die Meldung deckt nicht das gesamte Vermögen oder alle Strategien eines Managers ab."
+        )
+        st.markdown(
+            "**So verwendest du den Bereich sinnvoll:**\n"
+            "1. Neue oder stark aufgestockte Positionen als Recherchehinweis markieren.\n"
+            "2. Positionen mit deinen Value-/Growth-/Safety-Scores prüfen.\n"
+            "3. Überschneidungen mehrerer Manager nicht automatisch als Qualitätsbeweis ansehen.\n"
+            "4. Berichtsdatum und Veröffentlichungsverzug immer beachten."
+        )
+        quality = pd.DataFrame([
+            {"Feld": "Manager", "Wert": manager_name},
+            {"Feld": "SEC-CIK", "Wert": f"{int(cik):010d}"},
+            {"Feld": "Berichtsstand", "Wert": pd.to_datetime(filing.get("report_date")).strftime("%d.%m.%Y")},
+            {"Feld": "Einreichung", "Wert": pd.to_datetime(filing.get("filing_date")).strftime("%d.%m.%Y")},
+            {"Feld": "Positionen", "Wert": len(holdings)},
+            {"Feld": "Ticker automatisch/manuell zugeordnet", "Wert": int(mapped["ticker_yahoo"].astype(str).str.len().gt(0).sum())},
+        ])
+        st.dataframe(quality, hide_index=True, use_container_width=True)
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
     show_header()
@@ -11784,6 +12550,8 @@ def main() -> None:
             fetch_benchmark_history.clear()
             fetch_long_history.clear()
             fetch_historical_financials.clear()
+            fetch_13f_filing_list.clear()
+            fetch_13f_holdings.clear()
             fx_to_eur.clear()
             for state_key in [
                 "metrics_raw", "histories", "loaded_tickers", "portfolio_extra_metrics",
@@ -11847,7 +12615,7 @@ def main() -> None:
     # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
     main_pages = [
         "Überblick", "Datenstatus", "Fundamentaldaten", "Aktienprofile", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Lernmodul", "Unternehmensprofile", "Research",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Lernmodul", "Unternehmensprofile", "Superinvestoren", "Research",
     ]
     if st.session_state.get("main_navigation") not in main_pages:
         st.session_state["main_navigation"] = main_pages[0]
@@ -11904,6 +12672,8 @@ def main() -> None:
         render_learning_module(data)
     elif active_page == "Unternehmensprofile":
         render_deep_company_profiles(data)
+    elif active_page == "Superinvestoren":
+        render_superinvestors(data)
     elif active_page == "Research":
         render_research(data, histories, index_name)
 
