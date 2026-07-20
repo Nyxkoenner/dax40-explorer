@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.7.0"
+APP_VERSION = "5.7.1"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -11503,7 +11503,7 @@ def render_deep_company_profiles(data: pd.DataFrame) -> None:
         st.info("Lade zuerst einen Index beziehungsweise Marktdaten.")
         return
 
-    ticker = company_ticker_selectbox(
+    ticker = company_selectbox(
         "Unternehmen auswählen",
         data,
         key="deep_company_profile_ticker",
