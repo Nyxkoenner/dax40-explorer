@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.6.0"
+APP_VERSION = "5.7.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -54,6 +54,9 @@ PORTFOLIO_PATH = ROOT_DIR / "portfolio.csv"
 RESEARCH_CASES_PATH = DATA_DIR / "research_cases.csv"
 BACKTEST_DIR = DATA_DIR / "backtests"
 BACKTEST_RUNS_PATH = BACKTEST_DIR / "backtest_runs.csv"
+COMPANY_PROFILE_PATH = DATA_DIR / "company_profiles.csv"
+COMPANY_SEGMENTS_PATH = DATA_DIR / "company_segments.csv"
+COMPANY_REGIONS_PATH = DATA_DIR / "company_regions.csv"
 
 for directory in (DATA_DIR, INDEX_DIR, CACHE_DIR, BACKTEST_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -1171,6 +1174,14 @@ def fetch_ticker_info(ticker: str) -> dict[str, Any]:
         "recommendationKey", "recommendationMean",
         "targetMeanPrice", "targetHighPrice", "targetLowPrice",
         "numberOfAnalystOpinions",
+
+        # Erweiterte Unternehmens- und Risikodaten für Deep Profiles
+        "address1", "zip", "phone", "fax", "quoteType",
+        "enterpriseValue", "enterpriseToRevenue", "bookValue",
+        "totalRevenue", "grossProfits", "revenuePerShare",
+        "trailingEps", "forwardEps", "52WeekChange", "SandP52WeekChange",
+        "auditRisk", "boardRisk", "compensationRisk",
+        "shareHolderRightsRisk", "overallRisk",
     ]
     try:
         raw_info = yf.Ticker(ticker).get_info() or {}
@@ -10865,6 +10876,801 @@ def render_watchlist(
         st.rerun()
 
 
+
+# -----------------------------------------------------------------------------
+# Deep Company Profiles (V5.7)
+# -----------------------------------------------------------------------------
+
+COMPANY_PROFILE_COLUMNS = [
+    "ticker_yahoo", "business_model", "moat", "brands", "competitors",
+    "key_customers", "suppliers", "opportunities", "risks", "catalysts",
+    "ir_url", "source_note", "updated_at",
+]
+
+COMPANY_SEGMENT_COLUMNS = [
+    "ticker_yahoo", "segment", "revenue", "revenue_share_pct",
+    "operating_profit", "currency", "fiscal_year", "source", "notes",
+]
+
+COMPANY_REGION_COLUMNS = [
+    "ticker_yahoo", "region", "revenue", "revenue_share_pct",
+    "currency", "fiscal_year", "source", "notes",
+]
+
+
+def _empty_csv_frame(columns: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(columns=columns)
+
+
+def _read_csv_schema(path: Path, columns: list[str]) -> pd.DataFrame:
+    """Liest eine lokale Profildatei und ergänzt fehlende Spalten robust."""
+    if not path.exists():
+        return _empty_csv_frame(columns)
+    try:
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except Exception:
+        return _empty_csv_frame(columns)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    return frame[columns].copy()
+
+
+def _save_csv_schema(frame: pd.DataFrame, path: Path, columns: list[str]) -> tuple[bool, str]:
+    clean = frame.copy() if frame is not None else _empty_csv_frame(columns)
+    for column in columns:
+        if column not in clean.columns:
+            clean[column] = ""
+    clean = clean[columns].fillna("")
+    return safe_write_csv(clean, path)
+
+
+def _profile_row_for_ticker(ticker: str) -> dict[str, str]:
+    symbol = clean_ticker(ticker)
+    frame = _read_csv_schema(COMPANY_PROFILE_PATH, COMPANY_PROFILE_COLUMNS)
+    if frame.empty:
+        return {column: "" for column in COMPANY_PROFILE_COLUMNS}
+    match = frame[frame["ticker_yahoo"].map(clean_ticker).eq(symbol)]
+    if match.empty:
+        return {column: "" for column in COMPANY_PROFILE_COLUMNS}
+    row = match.iloc[-1].to_dict()
+    return {column: str(row.get(column, "") or "") for column in COMPANY_PROFILE_COLUMNS}
+
+
+def _upsert_profile_row(ticker: str, values: dict[str, Any]) -> tuple[bool, str]:
+    symbol = clean_ticker(ticker)
+    frame = _read_csv_schema(COMPANY_PROFILE_PATH, COMPANY_PROFILE_COLUMNS)
+    if not frame.empty:
+        frame = frame[~frame["ticker_yahoo"].map(clean_ticker).eq(symbol)].copy()
+    row = {column: "" for column in COMPANY_PROFILE_COLUMNS}
+    row.update({key: str(value or "") for key, value in values.items() if key in row})
+    row["ticker_yahoo"] = symbol
+    row["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+    return _save_csv_schema(frame, COMPANY_PROFILE_PATH, COMPANY_PROFILE_COLUMNS)
+
+
+def _ticker_rows(path: Path, columns: list[str], ticker: str) -> pd.DataFrame:
+    symbol = clean_ticker(ticker)
+    frame = _read_csv_schema(path, columns)
+    if frame.empty:
+        return frame
+    return frame[frame["ticker_yahoo"].map(clean_ticker).eq(symbol)].reset_index(drop=True)
+
+
+def _replace_ticker_rows(
+    path: Path,
+    columns: list[str],
+    ticker: str,
+    edited: pd.DataFrame,
+) -> tuple[bool, str]:
+    symbol = clean_ticker(ticker)
+    full = _read_csv_schema(path, columns)
+    if not full.empty:
+        full = full[~full["ticker_yahoo"].map(clean_ticker).eq(symbol)].copy()
+    incoming = edited.copy() if edited is not None else _empty_csv_frame(columns)
+    for column in columns:
+        if column not in incoming.columns:
+            incoming[column] = ""
+    incoming = incoming[columns].fillna("")
+    incoming["ticker_yahoo"] = symbol
+    label_column = "segment" if "segment" in columns else "region"
+    incoming = incoming[incoming[label_column].astype(str).str.strip().ne("")]
+    combined = pd.concat([full, incoming], ignore_index=True)
+    return _save_csv_schema(combined, path, columns)
+
+
+def _safe_yf_table(ticker_object: Any, method_name: str, attribute_name: str) -> pd.DataFrame:
+    """Lädt yfinance-Tabellen versionsübergreifend und ohne UI-Absturz."""
+    try:
+        method = getattr(ticker_object, method_name, None)
+        if callable(method):
+            candidate = method()
+            if isinstance(candidate, pd.DataFrame):
+                return candidate.copy()
+            if isinstance(candidate, dict):
+                return pd.DataFrame(candidate)
+    except Exception:
+        pass
+    try:
+        candidate = getattr(ticker_object, attribute_name, None)
+        if isinstance(candidate, pd.DataFrame):
+            return candidate.copy()
+        if isinstance(candidate, dict):
+            return pd.DataFrame(candidate)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _safe_yf_dict(ticker_object: Any, method_name: str, attribute_name: str) -> dict[str, Any]:
+    try:
+        method = getattr(ticker_object, method_name, None)
+        if callable(method):
+            candidate = method()
+            if isinstance(candidate, dict):
+                return candidate.copy()
+    except Exception:
+        pass
+    try:
+        candidate = getattr(ticker_object, attribute_name, None)
+        if isinstance(candidate, dict):
+            return candidate.copy()
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def fetch_company_profile_enrichment(ticker: str) -> dict[str, Any]:
+    """Lädt Ownership-, Analysten- und Governance-Daten, soweit Yahoo sie anbietet."""
+    symbol = clean_ticker(ticker)
+    result: dict[str, Any] = {
+        "major_holders": pd.DataFrame(),
+        "institutional_holders": pd.DataFrame(),
+        "mutualfund_holders": pd.DataFrame(),
+        "insider_roster": pd.DataFrame(),
+        "insider_transactions": pd.DataFrame(),
+        "insider_purchases": pd.DataFrame(),
+        "recommendations": pd.DataFrame(),
+        "upgrades_downgrades": pd.DataFrame(),
+        "revenue_estimate": pd.DataFrame(),
+        "earnings_estimate": pd.DataFrame(),
+        "growth_estimates": pd.DataFrame(),
+        "sustainability": pd.DataFrame(),
+        "analyst_targets": {},
+        "errors": [],
+    }
+    if not symbol:
+        return result
+    try:
+        obj = yf.Ticker(symbol)
+    except Exception as error:
+        result["errors"].append(f"Ticker konnte nicht initialisiert werden: {error}")
+        return result
+
+    table_specs = [
+        ("major_holders", "get_major_holders", "major_holders"),
+        ("institutional_holders", "get_institutional_holders", "institutional_holders"),
+        ("mutualfund_holders", "get_mutualfund_holders", "mutualfund_holders"),
+        ("insider_roster", "get_insider_roster_holders", "insider_roster_holders"),
+        ("insider_transactions", "get_insider_transactions", "insider_transactions"),
+        ("insider_purchases", "get_insider_purchases", "insider_purchases"),
+        ("recommendations", "get_recommendations_summary", "recommendations_summary"),
+        ("upgrades_downgrades", "get_upgrades_downgrades", "upgrades_downgrades"),
+        ("revenue_estimate", "get_revenue_estimate", "revenue_estimate"),
+        ("earnings_estimate", "get_earnings_estimate", "earnings_estimate"),
+        ("growth_estimates", "get_growth_estimates", "growth_estimates"),
+        ("sustainability", "get_sustainability", "sustainability"),
+    ]
+    for key, method_name, attribute_name in table_specs:
+        try:
+            result[key] = _safe_yf_table(obj, method_name, attribute_name)
+        except Exception as error:
+            result["errors"].append(f"{key}: {error}")
+
+    result["analyst_targets"] = _safe_yf_dict(obj, "get_analyst_price_targets", "analyst_price_targets")
+    return result
+
+
+def _cagr(first: Any, last: Any, years: float) -> Optional[float]:
+    start = safe_float(first)
+    end = safe_float(last)
+    if start is None or end is None or start <= 0 or end <= 0 or years <= 0:
+        return None
+    try:
+        return ((end / start) ** (1.0 / years) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _financial_profile_frame(ticker: str) -> pd.DataFrame:
+    financials = fetch_historical_financials(ticker).copy()
+    if financials.empty:
+        return financials
+    financials["fiscal_date"] = pd.to_datetime(financials["fiscal_date"], errors="coerce")
+    financials = financials.dropna(subset=["fiscal_date"]).sort_values("fiscal_date")
+    for column in ["revenue", "net_income", "ebitda", "free_cashflow", "operating_cashflow", "net_debt"]:
+        if column in financials.columns:
+            financials[column] = pd.to_numeric(financials[column], errors="coerce")
+    financials["net_margin_pct"] = (
+        financials["net_income"] / financials["revenue"] * 100.0
+        if {"net_income", "revenue"}.issubset(financials.columns)
+        else None
+    )
+    financials["ebitda_margin_pct"] = (
+        financials["ebitda"] / financials["revenue"] * 100.0
+        if {"ebitda", "revenue"}.issubset(financials.columns)
+        else None
+    )
+    financials["fcf_margin_pct"] = (
+        financials["free_cashflow"] / financials["revenue"] * 100.0
+        if {"free_cashflow", "revenue"}.issubset(financials.columns)
+        else None
+    )
+    return financials
+
+
+def _financial_profile_summary(financials: pd.DataFrame) -> dict[str, Optional[float]]:
+    summary: dict[str, Optional[float]] = {
+        "revenue_cagr": None,
+        "ebitda_cagr": None,
+        "fcf_cagr": None,
+        "avg_net_margin": None,
+        "avg_fcf_margin": None,
+        "latest_net_debt_ebitda": None,
+        "years": 0.0,
+    }
+    if financials is None or financials.empty:
+        return summary
+    dates = pd.to_datetime(financials["fiscal_date"], errors="coerce").dropna()
+    if len(dates) >= 2:
+        years = max((dates.max() - dates.min()).days / 365.25, 1.0)
+        summary["years"] = years
+        for column, target in [
+            ("revenue", "revenue_cagr"),
+            ("ebitda", "ebitda_cagr"),
+            ("free_cashflow", "fcf_cagr"),
+        ]:
+            values = pd.to_numeric(financials[column], errors="coerce").dropna() if column in financials.columns else pd.Series(dtype=float)
+            if len(values) >= 2:
+                summary[target] = _cagr(values.iloc[0], values.iloc[-1], years)
+    for column, target in [("net_margin_pct", "avg_net_margin"), ("fcf_margin_pct", "avg_fcf_margin")]:
+        if column in financials.columns:
+            values = pd.to_numeric(financials[column], errors="coerce").dropna()
+            summary[target] = float(values.mean()) if not values.empty else None
+    if "net_debt_ebitda" in financials.columns:
+        values = pd.to_numeric(financials["net_debt_ebitda"], errors="coerce").dropna()
+        summary["latest_net_debt_ebitda"] = float(values.iloc[-1]) if not values.empty else None
+    return summary
+
+
+def _compact_profile_table(frame: pd.DataFrame, max_rows: int = 15) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    result = frame.copy().head(max_rows)
+    if isinstance(result.index, pd.DatetimeIndex):
+        result = result.reset_index()
+    elif result.index.name is not None or not isinstance(result.index, pd.RangeIndex):
+        result = result.reset_index()
+    # Komplexe Objekte machen Arrow/Streamlit gelegentlich Probleme.
+    for column in result.columns:
+        result[column] = result[column].map(
+            lambda value: ", ".join(map(str, value)) if isinstance(value, (list, tuple, set))
+            else str(value) if isinstance(value, dict)
+            else value
+        )
+    return result
+
+
+def _manual_list(value: Any) -> list[str]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return []
+    return [item.strip() for item in re.split(r"[|;\n]+", text_value) if item.strip()]
+
+
+def _render_tag_list(title: str, value: Any, empty_text: str = "Noch nicht gepflegt") -> None:
+    items = _manual_list(value)
+    st.markdown(f"**{title}**")
+    if not items:
+        st.caption(empty_text)
+        return
+    st.markdown(" · ".join(f"`{item}`" for item in items))
+
+
+def _data_available(value: Any) -> bool:
+    if isinstance(value, pd.DataFrame):
+        return not value.empty
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    if value is None:
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return False
+    return str(value).strip() not in {"", "–", "None", "nan"}
+
+
+def _profile_coverage(info: dict[str, Any], financials: pd.DataFrame, enrichment: dict[str, Any], manual: dict[str, str]) -> tuple[int, int, float]:
+    checks = [
+        info.get("industry"), info.get("country"), info.get("longBusinessSummary"),
+        info.get("fullTimeEmployees"), info.get("website"), info.get("companyOfficers"),
+        financials, enrichment.get("institutional_holders"), enrichment.get("analyst_targets"),
+        manual.get("business_model"), manual.get("brands"), manual.get("competitors"),
+        manual.get("risks"), manual.get("opportunities"),
+    ]
+    available = sum(1 for value in checks if _data_available(value))
+    total = len(checks)
+    return available, total, available / total * 100.0 if total else 0.0
+
+
+def _render_financial_trend(ticker: str, currency: str) -> None:
+    financials = _financial_profile_frame(ticker)
+    if financials.empty:
+        st.info("Yahoo liefert für diesen Ticker aktuell keine verwertbaren Jahresabschlüsse.")
+        return
+
+    summary = _financial_profile_summary(financials)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Umsatz-CAGR", format_percent(summary.get("revenue_cagr"), 1))
+    c2.metric("FCF-CAGR", format_percent(summary.get("fcf_cagr"), 1))
+    c3.metric("Ø FCF-Marge", format_percent(summary.get("avg_fcf_margin"), 1))
+    c4.metric("Net Debt / EBITDA", format_number(summary.get("latest_net_debt_ebitda"), 2, "x"))
+
+    amount_columns = [column for column in ["revenue", "ebitda", "net_income", "free_cashflow"] if column in financials.columns]
+    chart_frame = financials[["fiscal_date"] + amount_columns].copy()
+    long = chart_frame.melt("fiscal_date", var_name="Kennzahl", value_name="Wert").dropna(subset=["Wert"])
+    if not long.empty:
+        divisor = 1e9 if long["Wert"].abs().median() >= 1e8 else 1e6
+        unit = "Mrd." if divisor == 1e9 else "Mio."
+        long["Wert skaliert"] = long["Wert"] / divisor
+        labels = {
+            "revenue": "Umsatz", "ebitda": "EBITDA",
+            "net_income": "Nettoergebnis", "free_cashflow": "Free Cashflow",
+        }
+        long["Kennzahl"] = long["Kennzahl"].map(labels).fillna(long["Kennzahl"])
+        chart = (
+            alt.Chart(long)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("fiscal_date:T", title="Geschäftsjahr"),
+                y=alt.Y("Wert skaliert:Q", title=f"{currency} {unit}"),
+                color=alt.Color("Kennzahl:N", title="Kennzahl"),
+                tooltip=[
+                    alt.Tooltip("fiscal_date:T", title="Geschäftsjahr", format="%Y"),
+                    alt.Tooltip("Kennzahl:N"),
+                    alt.Tooltip("Wert skaliert:Q", title=f"{currency} {unit}", format=",.2f"),
+                ],
+            )
+            .properties(height=360)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    display = financials.copy()
+    display["Geschäftsjahr"] = pd.to_datetime(display["fiscal_date"], errors="coerce").dt.year
+    table = pd.DataFrame({
+        "Geschäftsjahr": display["Geschäftsjahr"],
+        "Umsatz": display.get("revenue"),
+        "EBITDA": display.get("ebitda"),
+        "Nettoergebnis": display.get("net_income"),
+        "Free Cashflow": display.get("free_cashflow"),
+        "FCF-Marge": display.get("fcf_margin_pct"),
+        "Net Debt/EBITDA": display.get("net_debt_ebitda"),
+        "FCF/Dividende": display.get("cashflow_dividend_coverage"),
+    })
+    st.dataframe(
+        table.style.format({
+            "Umsatz": human_market_cap,
+            "EBITDA": human_market_cap,
+            "Nettoergebnis": human_market_cap,
+            "Free Cashflow": human_market_cap,
+            "FCF-Marge": lambda value: format_percent(value, 1),
+            "Net Debt/EBITDA": lambda value: format_number(value, 2, "x"),
+            "FCF/Dividende": lambda value: format_number(value, 2, "x"),
+        }, na_rep="–"),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def _render_segments_regions_editor(ticker: str) -> None:
+    st.markdown("#### Segmente")
+    segments = _ticker_rows(COMPANY_SEGMENTS_PATH, COMPANY_SEGMENT_COLUMNS, ticker)
+    if segments.empty:
+        segments = pd.DataFrame([{column: "" for column in COMPANY_SEGMENT_COLUMNS}])
+        segments["ticker_yahoo"] = clean_ticker(ticker)
+    edited_segments = st.data_editor(
+        segments,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key=f"company_segments_editor_{clean_ticker(ticker)}",
+        disabled=["ticker_yahoo"],
+        column_config={
+            "revenue": st.column_config.NumberColumn("Umsatz", format="%.2f"),
+            "revenue_share_pct": st.column_config.NumberColumn("Umsatzanteil %", min_value=0.0, max_value=100.0, format="%.1f"),
+            "operating_profit": st.column_config.NumberColumn("Operatives Ergebnis", format="%.2f"),
+            "fiscal_year": st.column_config.NumberColumn("Geschäftsjahr", min_value=1900, max_value=2200, step=1, format="%d"),
+        },
+    )
+    if st.button("Segmente speichern", key=f"save_segments_{clean_ticker(ticker)}"):
+        ok, message = _replace_ticker_rows(COMPANY_SEGMENTS_PATH, COMPANY_SEGMENT_COLUMNS, ticker, edited_segments)
+        if ok:
+            st.success("Segmentdaten gespeichert.")
+        else:
+            st.warning(message)
+
+    st.markdown("#### Regionen")
+    regions = _ticker_rows(COMPANY_REGIONS_PATH, COMPANY_REGION_COLUMNS, ticker)
+    if regions.empty:
+        regions = pd.DataFrame([{column: "" for column in COMPANY_REGION_COLUMNS}])
+        regions["ticker_yahoo"] = clean_ticker(ticker)
+    edited_regions = st.data_editor(
+        regions,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key=f"company_regions_editor_{clean_ticker(ticker)}",
+        disabled=["ticker_yahoo"],
+        column_config={
+            "revenue": st.column_config.NumberColumn("Umsatz", format="%.2f"),
+            "revenue_share_pct": st.column_config.NumberColumn("Umsatzanteil %", min_value=0.0, max_value=100.0, format="%.1f"),
+            "fiscal_year": st.column_config.NumberColumn("Geschäftsjahr", min_value=1900, max_value=2200, step=1, format="%d"),
+        },
+    )
+    if st.button("Regionen speichern", key=f"save_regions_{clean_ticker(ticker)}"):
+        ok, message = _replace_ticker_rows(COMPANY_REGIONS_PATH, COMPANY_REGION_COLUMNS, ticker, edited_regions)
+        if ok:
+            st.success("Regionsdaten gespeichert.")
+        else:
+            st.warning(message)
+
+    st.caption(
+        "Segment- und Regionsdaten müssen derzeit aus Geschäftsberichten oder Investor-Relations-Unterlagen "
+        "übernommen werden. Quelle und Geschäftsjahr sollten immer mitgespeichert werden."
+    )
+
+
+def _render_manual_company_profile(ticker: str) -> None:
+    manual = _profile_row_for_ticker(ticker)
+    symbol = clean_ticker(ticker)
+    with st.form(f"manual_company_profile_{symbol}"):
+        st.markdown("#### Eigene qualitative Analyse")
+        business_model = st.text_area(
+            "Geschäftsmodell in eigenen Worten",
+            value=manual.get("business_model", ""),
+            height=110,
+            help="Wie verdient das Unternehmen Geld? Welche Produkte, Kunden und Preismechanismen sind entscheidend?",
+        )
+        moat = st.text_area(
+            "Wettbewerbsvorteile / Burggraben",
+            value=manual.get("moat", ""),
+            height=90,
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            brands = st.text_area("Marken (mit | trennen)", value=manual.get("brands", ""), height=85)
+            competitors = st.text_area("Wettbewerber (mit | trennen)", value=manual.get("competitors", ""), height=85)
+            key_customers = st.text_area("Wichtige Kunden / Kundengruppen", value=manual.get("key_customers", ""), height=85)
+            suppliers = st.text_area("Lieferanten / Lieferketten-Abhängigkeiten", value=manual.get("suppliers", ""), height=85)
+        with col2:
+            opportunities = st.text_area("Chancen", value=manual.get("opportunities", ""), height=85)
+            risks = st.text_area("Wesentliche Risiken", value=manual.get("risks", ""), height=85)
+            catalysts = st.text_area("Mögliche Katalysatoren", value=manual.get("catalysts", ""), height=85)
+            ir_url = st.text_input("Investor-Relations-URL", value=manual.get("ir_url", ""))
+        source_note = st.text_area(
+            "Quellen / Notizen",
+            value=manual.get("source_note", ""),
+            height=80,
+            help="Zum Beispiel Geschäftsbericht 2025, Seiten 32–38.",
+        )
+        submitted = st.form_submit_button("Qualitatives Profil speichern", type="primary")
+    if submitted:
+        ok, message = _upsert_profile_row(ticker, {
+            "business_model": business_model,
+            "moat": moat,
+            "brands": brands,
+            "competitors": competitors,
+            "key_customers": key_customers,
+            "suppliers": suppliers,
+            "opportunities": opportunities,
+            "risks": risks,
+            "catalysts": catalysts,
+            "ir_url": ir_url,
+            "source_note": source_note,
+        })
+        if ok:
+            st.success("Qualitatives Unternehmensprofil gespeichert.")
+        else:
+            st.warning(message)
+
+
+def _render_ownership_management(ticker: str, info: dict[str, Any], enrichment: dict[str, Any]) -> None:
+    officers = info.get("companyOfficers") or []
+    st.markdown("#### Management")
+    if officers:
+        rows = []
+        for officer in officers[:20]:
+            if not isinstance(officer, dict):
+                continue
+            rows.append({
+                "Name": officer.get("name", ""),
+                "Funktion": officer.get("title", ""),
+                "Alter": officer.get("age", ""),
+                "Gesamtvergütung": officer.get("totalPay", ""),
+                "Ausübungsjahr": officer.get("yearBorn", ""),
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("Für diesen Ticker wurden keine Managementdaten geliefert.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Große Anteilseigner")
+        major = _compact_profile_table(enrichment.get("major_holders", pd.DataFrame()), 12)
+        if major.empty:
+            st.caption("Keine Major-Holder-Daten verfügbar.")
+        else:
+            st.dataframe(major, hide_index=True, use_container_width=True)
+    with c2:
+        st.markdown("#### Institutionelle Anleger")
+        inst = _compact_profile_table(enrichment.get("institutional_holders", pd.DataFrame()), 15)
+        if inst.empty:
+            st.caption("Keine institutionellen Holder-Daten verfügbar.")
+        else:
+            st.dataframe(inst, hide_index=True, use_container_width=True)
+
+    with st.expander("Weitere Ownership- und Insiderdaten"):
+        for title, key in [
+            ("Fonds", "mutualfund_holders"),
+            ("Insider-Rollen", "insider_roster"),
+            ("Insider-Transaktionen", "insider_transactions"),
+            ("Insider-Käufe", "insider_purchases"),
+        ]:
+            st.markdown(f"**{title}**")
+            frame = _compact_profile_table(enrichment.get(key, pd.DataFrame()), 20)
+            if frame.empty:
+                st.caption("Keine Daten verfügbar.")
+            else:
+                st.dataframe(frame, hide_index=True, use_container_width=True)
+
+
+def _render_analyst_outlook(info: dict[str, Any], enrichment: dict[str, Any], current_price: Optional[float]) -> None:
+    targets = enrichment.get("analyst_targets") or {}
+    mean_target = safe_float(targets.get("mean")) or safe_float(info.get("targetMeanPrice"))
+    low_target = safe_float(targets.get("low")) or safe_float(info.get("targetLowPrice"))
+    high_target = safe_float(targets.get("high")) or safe_float(info.get("targetHighPrice"))
+    upside = (mean_target / current_price - 1) * 100 if mean_target is not None and current_price not in (None, 0) else None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Analystenurteil", str(info.get("recommendationKey") or "–").upper())
+    c2.metric("Mittleres Kursziel", format_number(mean_target, 2))
+    c3.metric("Spanne", f"{format_number(low_target, 2)} – {format_number(high_target, 2)}")
+    c4.metric("Abstand zum Mittel", format_percent(upside, 1, signed=True))
+
+    tabs = st.tabs(["Empfehlungen", "Umsatzschätzungen", "Gewinnschätzungen", "Wachstum", "Up-/Downgrades"])
+    frames = [
+        enrichment.get("recommendations", pd.DataFrame()),
+        enrichment.get("revenue_estimate", pd.DataFrame()),
+        enrichment.get("earnings_estimate", pd.DataFrame()),
+        enrichment.get("growth_estimates", pd.DataFrame()),
+        enrichment.get("upgrades_downgrades", pd.DataFrame()),
+    ]
+    for tab, frame in zip(tabs, frames):
+        with tab:
+            compact = _compact_profile_table(frame, 30)
+            if compact.empty:
+                st.info("Für diesen Ticker sind keine entsprechenden Analystendaten verfügbar.")
+            else:
+                st.dataframe(compact, hide_index=True, use_container_width=True)
+
+
+def _render_company_profile_status(info: dict[str, Any], financials: pd.DataFrame, enrichment: dict[str, Any], manual: dict[str, str]) -> None:
+    available, total, coverage = _profile_coverage(info, financials, enrichment, manual)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Profildaten verfügbar", f"{available}/{total}")
+    c2.metric("Profil-Datenabdeckung", format_percent(coverage, 0))
+    c3.metric("Manuell ergänzt", "Ja" if any(str(manual.get(key, "")).strip() for key in COMPANY_PROFILE_COLUMNS if key not in {"ticker_yahoo", "updated_at"}) else "Nein")
+
+    status_rows = [
+        {"Datenbereich": "Basisprofil", "Quelle": "Yahoo Finance", "Status": "Verfügbar" if _data_available(info.get("longBusinessSummary")) else "Fehlt"},
+        {"Datenbereich": "Jahresabschlüsse", "Quelle": "Yahoo Finance", "Status": "Verfügbar" if not financials.empty else "Fehlt"},
+        {"Datenbereich": "Management", "Quelle": "Yahoo Finance", "Status": "Verfügbar" if _data_available(info.get("companyOfficers")) else "Fehlt"},
+        {"Datenbereich": "Ownership", "Quelle": "Yahoo Finance", "Status": "Verfügbar" if _data_available(enrichment.get("institutional_holders")) else "Fehlt"},
+        {"Datenbereich": "Segmente", "Quelle": "Lokale Profildatei", "Status": "Verfügbar" if not _ticker_rows(COMPANY_SEGMENTS_PATH, COMPANY_SEGMENT_COLUMNS, info.get("symbol", "")).empty else "Manuell pflegen"},
+        {"Datenbereich": "Regionen", "Quelle": "Lokale Profildatei", "Status": "Verfügbar" if not _ticker_rows(COMPANY_REGIONS_PATH, COMPANY_REGION_COLUMNS, info.get("symbol", "")).empty else "Manuell pflegen"},
+        {"Datenbereich": "Qualitative Analyse", "Quelle": "Eigene Eingabe", "Status": "Verfügbar" if _data_available(manual.get("business_model")) else "Manuell pflegen"},
+    ]
+    status = pd.DataFrame(status_rows)
+    st.dataframe(status, hide_index=True, use_container_width=True)
+    if enrichment.get("errors"):
+        with st.expander("Technische Abrufhinweise"):
+            for error in enrichment["errors"]:
+                st.write(f"- {error}")
+
+
+def render_deep_company_profiles(data: pd.DataFrame) -> None:
+    st.subheader("Deep Company Profiles")
+    st.caption(
+        "Finanztrend, Analystenschätzungen, Ownership und deine eigene qualitative Analyse in einer Ansicht. "
+        "Automatische Daten stammen überwiegend von Yahoo Finance; Segmente, Regionen und Lieferketten können "
+        "über lokale Profildateien aus Geschäftsberichten ergänzt werden."
+    )
+    if data is None or data.empty:
+        st.info("Lade zuerst einen Index beziehungsweise Marktdaten.")
+        return
+
+    ticker = company_ticker_selectbox(
+        "Unternehmen auswählen",
+        data,
+        key="deep_company_profile_ticker",
+    )
+    row = data[data["ticker_yahoo"].astype(str).eq(str(ticker))].iloc[0]
+    info = fetch_ticker_info(ticker)
+    # Die Profildaten benötigen das Symbol auch für die Datenstatusansicht.
+    info = dict(info)
+    info["symbol"] = clean_ticker(ticker)
+    enrichment = fetch_company_profile_enrichment(ticker)
+    financials = _financial_profile_frame(ticker)
+    manual = _profile_row_for_ticker(ticker)
+
+    company_name = str(row.get("name") or info.get("longName") or info.get("shortName") or ticker)
+    industry = str(info.get("industry") or row.get("sector") or "–")
+    country = str(info.get("country") or "–")
+    currency = str(row.get("currency") or info.get("financialCurrency") or info.get("currency") or "")
+    current_price = safe_float(row.get("last_price"))
+
+    st.markdown(f"### {company_name} · {ticker}")
+    st.caption(f"{industry} · {country} · Berichtswährung: {currency or '–'}")
+
+    available, total, coverage = _profile_coverage(info, financials, enrichment, manual)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Kurs", format_number(current_price, 2, f" {row.get('currency') or ''}"))
+    c2.metric("Marktkapitalisierung", human_market_cap(row.get("market_cap")))
+    c3.metric("Quality", format_number(row.get("quality_score"), 0))
+    c4.metric("Safety", format_number(row.get("safety_score"), 0))
+    c5.metric("Profilabdeckung", format_percent(coverage, 0))
+
+    sections = [
+        "Überblick", "Finanztrend", "Segmente & Regionen", "Ownership & Management",
+        "Analysten", "Risiken & eigene Analyse", "Datenstatus",
+    ]
+    key = "deep_company_profile_section"
+    if st.session_state.get(key) not in sections:
+        st.session_state[key] = sections[0]
+    section = st.radio(
+        "Profilbereich",
+        sections,
+        horizontal=True,
+        key=key,
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if section == "Überblick":
+        left, right = st.columns([2, 1])
+        with left:
+            st.markdown("#### Geschäft und Positionierung")
+            summary = str(info.get("longBusinessSummary") or "").strip()
+            if summary:
+                st.write(summary)
+            else:
+                st.info("Keine automatische Unternehmensbeschreibung verfügbar.")
+            if manual.get("business_model"):
+                st.markdown("**Eigene Zusammenfassung des Geschäftsmodells**")
+                st.write(manual["business_model"])
+            if manual.get("moat"):
+                st.markdown("**Wettbewerbsvorteile / Burggraben**")
+                st.write(manual["moat"])
+        with right:
+            basics = pd.DataFrame([
+                {"Kennzahl": "Sektor", "Wert": str(info.get("sector") or row.get("sector") or "–")},
+                {"Kennzahl": "Branche", "Wert": industry},
+                {"Kennzahl": "Land", "Wert": country},
+                {"Kennzahl": "Stadt", "Wert": str(info.get("city") or "–")},
+                {"Kennzahl": "Mitarbeitende", "Wert": format_number(info.get("fullTimeEmployees"), 0)},
+                {"Kennzahl": "Institutioneller Anteil", "Wert": format_percent(to_percent(info.get("heldPercentInstitutions")), 1)},
+                {"Kennzahl": "Insider-Anteil", "Wert": format_percent(to_percent(info.get("heldPercentInsiders")), 1)},
+            ])
+            st.dataframe(basics, hide_index=True, use_container_width=True)
+            if info.get("website"):
+                st.link_button("Unternehmenswebsite öffnen", str(info["website"]))
+            if manual.get("ir_url"):
+                st.link_button("Investor Relations öffnen", str(manual["ir_url"]))
+
+        st.divider()
+        cols = st.columns(3)
+        with cols[0]:
+            _render_tag_list("Marken", manual.get("brands"))
+        with cols[1]:
+            _render_tag_list("Wettbewerber", manual.get("competitors"))
+        with cols[2]:
+            _render_tag_list("Kundengruppen", manual.get("key_customers"))
+
+        st.markdown("#### Governance-Risikoindikatoren")
+        risks = pd.DataFrame([
+            {"Kennzahl": "Audit Risk", "Wert": info.get("auditRisk")},
+            {"Kennzahl": "Board Risk", "Wert": info.get("boardRisk")},
+            {"Kennzahl": "Compensation Risk", "Wert": info.get("compensationRisk")},
+            {"Kennzahl": "Shareholder Rights Risk", "Wert": info.get("shareHolderRightsRisk")},
+            {"Kennzahl": "Overall Risk", "Wert": info.get("overallRisk")},
+        ])
+        if risks["Wert"].map(_data_available).any():
+            st.dataframe(risks, hide_index=True, use_container_width=True)
+            st.caption("Yahoo-Risikoindikatoren sind Datenanbieterwerte und keine eigene rechtliche oder Governance-Prüfung.")
+        else:
+            st.caption("Keine Governance-Risikoindikatoren verfügbar.")
+
+    elif section == "Finanztrend":
+        _render_financial_trend(ticker, currency)
+
+    elif section == "Segmente & Regionen":
+        _render_segments_regions_editor(ticker)
+        segments = _ticker_rows(COMPANY_SEGMENTS_PATH, COMPANY_SEGMENT_COLUMNS, ticker)
+        regions = _ticker_rows(COMPANY_REGIONS_PATH, COMPANY_REGION_COLUMNS, ticker)
+        if not segments.empty and "revenue_share_pct" in segments.columns:
+            chart_data = segments.copy()
+            chart_data["revenue_share_pct"] = pd.to_numeric(chart_data["revenue_share_pct"], errors="coerce")
+            chart_data = chart_data.dropna(subset=["revenue_share_pct"])
+            if not chart_data.empty:
+                st.altair_chart(
+                    alt.Chart(chart_data).mark_bar().encode(
+                        x=alt.X("revenue_share_pct:Q", title="Umsatzanteil %"),
+                        y=alt.Y("segment:N", sort="-x", title="Segment"),
+                        tooltip=["segment:N", alt.Tooltip("revenue_share_pct:Q", format=".1f")],
+                    ).properties(height=max(240, len(chart_data) * 34)),
+                    use_container_width=True,
+                )
+        if not regions.empty and "revenue_share_pct" in regions.columns:
+            chart_data = regions.copy()
+            chart_data["revenue_share_pct"] = pd.to_numeric(chart_data["revenue_share_pct"], errors="coerce")
+            chart_data = chart_data.dropna(subset=["revenue_share_pct"])
+            if not chart_data.empty:
+                st.altair_chart(
+                    alt.Chart(chart_data).mark_bar().encode(
+                        x=alt.X("revenue_share_pct:Q", title="Umsatzanteil %"),
+                        y=alt.Y("region:N", sort="-x", title="Region"),
+                        tooltip=["region:N", alt.Tooltip("revenue_share_pct:Q", format=".1f")],
+                    ).properties(height=max(240, len(chart_data) * 34)),
+                    use_container_width=True,
+                )
+
+    elif section == "Ownership & Management":
+        _render_ownership_management(ticker, info, enrichment)
+
+    elif section == "Analysten":
+        _render_analyst_outlook(info, enrichment, current_price)
+
+    elif section == "Risiken & eigene Analyse":
+        if any(manual.get(key) for key in ["opportunities", "risks", "catalysts", "suppliers"]):
+            c1, c2 = st.columns(2)
+            with c1:
+                _render_tag_list("Chancen", manual.get("opportunities"))
+                _render_tag_list("Katalysatoren", manual.get("catalysts"))
+            with c2:
+                _render_tag_list("Risiken", manual.get("risks"))
+                _render_tag_list("Lieferketten / Abhängigkeiten", manual.get("suppliers"))
+            st.divider()
+        _render_manual_company_profile(ticker)
+
+    elif section == "Datenstatus":
+        _render_company_profile_status(info, financials, enrichment, manual)
+        st.markdown("#### Lokale Profildateien")
+        st.code(
+            "data/company_profiles.csv\n"
+            "data/company_segments.csv\n"
+            "data/company_regions.csv",
+            language="text",
+        )
+        st.caption(
+            "Die Dateien werden beim ersten Speichern automatisch angelegt. Für eine spätere Monetarisierung "
+            "kann dieser manuell gepflegte Research-Bereich als Pro-Funktion in eine Datenbank übertragen werden."
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
     show_header()
@@ -11041,7 +11847,7 @@ def main() -> None:
     # Streamlit-Rerun erhalten, zum Beispiel nach dem Aktualisieren der News.
     main_pages = [
         "Überblick", "Datenstatus", "Fundamentaldaten", "Aktienprofile", "Einzelanalyse", "Sektoren",
-        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Lernmodul", "Research",
+        "News & Events", "Portfolio", "Watchlist", "Value-Scanner", "Deep Value", "Backtesting", "Mustervergleich", "Lernmodul", "Unternehmensprofile", "Research",
     ]
     if st.session_state.get("main_navigation") not in main_pages:
         st.session_state["main_navigation"] = main_pages[0]
@@ -11096,6 +11902,8 @@ def main() -> None:
         render_universe_pattern_comparison(data, index_name)
     elif active_page == "Lernmodul":
         render_learning_module(data)
+    elif active_page == "Unternehmensprofile":
+        render_deep_company_profiles(data)
     elif active_page == "Research":
         render_research(data, histories, index_name)
 
