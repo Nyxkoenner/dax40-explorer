@@ -41,7 +41,7 @@ from dateutil import parser as dateparser
 # App-Konfiguration
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 APP_TITLE = "Aktien Explorer"
 BASE_CURRENCY = "EUR"
 
@@ -2402,8 +2402,11 @@ def build_portfolio_view(metrics: pd.DataFrame, portfolio: pd.DataFrame) -> pd.D
 
     metric_columns = [
         "ticker_yahoo", "name", "sector", "currency", "last_price", "dividend_yield",
-        "dividend_per_share", "total_score", "value_score", "value_trigger", "vol_1y",
-        "total_return_1y", "max_drawdown_1y",
+        "dividend_per_share", "payout_ratio", "dividend_growth_5y", "fcf_dividend_coverage",
+        "net_debt_ebitda", "total_score", "score_coverage", "value_score", "value_trigger",
+        "growth_score", "growth_coverage", "momentum_score", "momentum_coverage",
+        "safety_score", "safety_coverage", "special_situation_score", "special_situation_trigger",
+        "vol_1y", "total_return_1y", "max_drawdown_1y",
     ]
     available_columns = [column for column in metric_columns if column in metrics.columns]
     result = portfolio.merge(metrics[available_columns], on="ticker_yahoo", how="left", suffixes=("", "_asset"))
@@ -3918,6 +3921,433 @@ Die Bewertung nutzt nur RSS-Überschrift und -Beschreibung. Ironie, komplexe Zus
 
 
 
+
+
+
+def _weighted_portfolio_average(portfolio_view: pd.DataFrame, column: str) -> Optional[float]:
+    """Gewichteter Durchschnitt einer Kennzahl mit den aktuellen Portfoliogewichten."""
+    if portfolio_view is None or portfolio_view.empty or column not in portfolio_view.columns:
+        return None
+    values = pd.to_numeric(portfolio_view[column], errors="coerce")
+    weights = pd.to_numeric(portfolio_view.get("weight_pct"), errors="coerce")
+    valid = values.notna() & weights.notna() & (weights > 0)
+    if not valid.any():
+        return None
+    weight_sum = float(weights[valid].sum())
+    if weight_sum <= 0:
+        return None
+    return float((values[valid] * weights[valid]).sum() / weight_sum)
+
+
+def _concentration_points(value: Optional[float], thresholds: list[tuple[float, float]]) -> Optional[float]:
+    if value is None:
+        return None
+    for upper, points in thresholds:
+        if value <= upper:
+            return float(points)
+    return 0.0
+
+
+def compute_portfolio_health(portfolio_view: pd.DataFrame) -> dict[str, Any]:
+    """Berechnet einen nachvollziehbaren Portfolio-Health-Score von 0 bis 100.
+
+    Der Score bewertet Diversifikation, Konzentration sowie die gewichteten
+    Qualitäts-, Safety- und Risikokennzahlen. Fehlende Daten werden über eine
+    separate Abdeckung ausgewiesen und nicht stillschweigend als gut behandelt.
+    """
+    empty = {
+        "score": None,
+        "coverage": 0.0,
+        "label": "nicht berechenbar",
+        "confidence": "gering",
+        "components": pd.DataFrame(),
+        "metrics": {},
+        "strengths": [],
+        "risks": ["Keine ausreichenden Portfoliodaten vorhanden."],
+        "profiles": {},
+    }
+    if portfolio_view is None or portfolio_view.empty:
+        return empty
+
+    frame = portfolio_view.copy()
+    frame["weight_pct"] = pd.to_numeric(frame.get("weight_pct"), errors="coerce")
+    frame = frame.dropna(subset=["weight_pct"])
+    frame = frame[frame["weight_pct"] > 0]
+    if frame.empty:
+        return empty
+
+    weights = frame["weight_pct"] / frame["weight_pct"].sum() * 100.0
+    frame["_health_weight"] = weights
+    top_position = float(weights.max())
+    hhi = float(((weights / 100.0) ** 2).sum())
+    effective_positions = float(1.0 / hhi) if hhi > 0 else None
+
+    sector_weights = (
+        frame.assign(_sector=frame.get("sector", "Unbekannt").fillna("Unbekannt").astype(str))
+        .groupby("_sector", dropna=False)["_health_weight"].sum()
+        .sort_values(ascending=False)
+    )
+    currency_weights = (
+        frame.assign(_currency=frame.get("asset_currency", BASE_CURRENCY).fillna(BASE_CURRENCY).astype(str))
+        .groupby("_currency", dropna=False)["_health_weight"].sum()
+        .sort_values(ascending=False)
+    )
+    top_sector = float(sector_weights.iloc[0]) if not sector_weights.empty else None
+    top_sector_name = str(sector_weights.index[0]) if not sector_weights.empty else "–"
+    top_currency = float(currency_weights.iloc[0]) if not currency_weights.empty else None
+    top_currency_name = str(currency_weights.index[0]) if not currency_weights.empty else "–"
+
+    top_position_points = _concentration_points(
+        top_position,
+        [(10, 20), (15, 17), (20, 13), (25, 8), (35, 3)],
+    )
+    effective_points = _concentration_points(
+        effective_positions,
+        [(1.5, 0), (2.5, 4), (4, 8), (6, 13), (9, 17), (10_000, 20)],
+    )
+    # Für die effektive Anzahl gilt: höher ist besser. Die Hilfsfunktion bewertet
+    # kleine Werte, deshalb wird hier bewusst direkt klassifiziert.
+    if effective_positions is not None:
+        effective_points = (
+            20.0 if effective_positions >= 10 else
+            17.0 if effective_positions >= 7 else
+            13.0 if effective_positions >= 5 else
+            8.0 if effective_positions >= 3 else
+            4.0 if effective_positions >= 2 else 0.0
+        )
+    position_points = None
+    if top_position_points is not None and effective_points is not None:
+        position_points = (top_position_points + effective_points) / 2.0
+
+    sector_points = _concentration_points(top_sector, [(25, 15), (35, 12), (45, 8), (60, 4)])
+    currency_points = _concentration_points(top_currency, [(45, 10), (60, 8), (75, 5), (90, 2)])
+
+    weighted_safety = _weighted_portfolio_average(frame, "safety_score")
+    weighted_quality = _weighted_portfolio_average(frame, "total_score")
+    weighted_value = _weighted_portfolio_average(frame, "value_score")
+    weighted_growth = _weighted_portfolio_average(frame, "growth_score")
+    weighted_momentum = _weighted_portfolio_average(frame, "momentum_score")
+    weighted_deep_value = _weighted_portfolio_average(frame, "special_situation_score")
+    weighted_volatility = _weighted_portfolio_average(frame, "vol_1y")
+    weighted_drawdown = _weighted_portfolio_average(frame, "max_drawdown_1y")
+
+    safety_points = None if weighted_safety is None else max(0.0, min(20.0, weighted_safety / 100.0 * 20.0))
+    quality_points = None if weighted_quality is None else max(0.0, min(15.0, weighted_quality / 100.0 * 15.0))
+    volatility_points = _concentration_points(weighted_volatility, [(18, 10), (25, 8), (35, 5), (45, 2)])
+    drawdown_abs = abs(weighted_drawdown) if weighted_drawdown is not None else None
+    drawdown_points = _concentration_points(drawdown_abs, [(15, 10), (25, 8), (35, 5), (50, 2)])
+
+    component_rows = [
+        ("Positions-Diversifikation", position_points, 20.0, f"Größte Position {top_position:.1f} %, effektive Positionen {effective_positions:.1f}" if effective_positions is not None else f"Größte Position {top_position:.1f} %"),
+        ("Sektor-Diversifikation", sector_points, 15.0, f"Größter Sektor: {top_sector_name} ({top_sector:.1f} %)" if top_sector is not None else "Keine Sektordaten"),
+        ("Währungs-Diversifikation", currency_points, 10.0, f"Größte Währung: {top_currency_name} ({top_currency:.1f} %)" if top_currency is not None else "Keine Währungsdaten"),
+        ("Safety-Profil", safety_points, 20.0, f"Gewichteter Safety-Score {weighted_safety:.1f}" if weighted_safety is not None else "Safety-Daten fehlen"),
+        ("Qualitätsprofil", quality_points, 15.0, f"Gewichteter Qualitäts-Score {weighted_quality:.1f}" if weighted_quality is not None else "Qualitätsdaten fehlen"),
+        ("Volatilität", volatility_points, 10.0, f"Gewichtet {weighted_volatility:.1f} %" if weighted_volatility is not None else "Volatilitätsdaten fehlen"),
+        ("Drawdown", drawdown_points, 10.0, f"Gewichtet {weighted_drawdown:.1f} %" if weighted_drawdown is not None else "Drawdown-Daten fehlen"),
+    ]
+
+    available = [(name, points, maximum, detail) for name, points, maximum, detail in component_rows if points is not None]
+    available_max = sum(maximum for _, _, maximum, _ in available)
+    total_max = sum(maximum for _, _, maximum, _ in component_rows)
+    coverage = available_max / total_max * 100.0 if total_max else 0.0
+    raw_score = sum(points for _, points, _, _ in available) / available_max * 100.0 if available_max else None
+    score = None if raw_score is None else round(raw_score * (0.70 + 0.30 * coverage / 100.0), 1)
+
+    if score is None:
+        label = "nicht berechenbar"
+    elif score >= 80:
+        label = "sehr robust"
+    elif score >= 65:
+        label = "solide"
+    elif score >= 50:
+        label = "gemischt"
+    else:
+        label = "erhöhte Risiken"
+
+    if coverage >= 85 and len(frame) >= 7:
+        confidence = "hoch"
+    elif coverage >= 65 and len(frame) >= 4:
+        confidence = "mittel"
+    else:
+        confidence = "gering"
+
+    components = pd.DataFrame([
+        {
+            "Baustein": name,
+            "Punkte": round(points, 1) if points is not None else None,
+            "Maximum": maximum,
+            "Erfüllung": round(points / maximum * 100.0, 1) if points is not None and maximum else None,
+            "Einordnung": detail,
+        }
+        for name, points, maximum, detail in component_rows
+    ])
+
+    strengths: list[str] = []
+    risks: list[str] = []
+    if top_position <= 15:
+        strengths.append(f"Keine einzelne Position überschreitet 15 % (Maximum {top_position:.1f} %).")
+    else:
+        risks.append(f"Die größte Position wiegt {top_position:.1f} % und erhöht das Einzelwertrisiko.")
+    if top_sector is not None and top_sector <= 30:
+        strengths.append(f"Die größte Sektorquote liegt mit {top_sector:.1f} % im moderaten Bereich.")
+    elif top_sector is not None:
+        risks.append(f"Der Sektor {top_sector_name} bündelt {top_sector:.1f} % des Portfolios.")
+    if weighted_safety is not None and weighted_safety >= 65:
+        strengths.append(f"Der gewichtete Safety-Score ist mit {weighted_safety:.1f} solide.")
+    elif weighted_safety is not None and weighted_safety < 45:
+        risks.append(f"Der gewichtete Safety-Score ist mit {weighted_safety:.1f} niedrig.")
+    if weighted_volatility is not None and weighted_volatility > 35:
+        risks.append(f"Die gewichtete Einzeltitel-Volatilität ist mit {weighted_volatility:.1f} % hoch.")
+    if effective_positions is not None and effective_positions < 4:
+        risks.append(f"Die effektive Diversifikation entspricht nur etwa {effective_positions:.1f} gleichgewichteten Positionen.")
+    if coverage < 70:
+        risks.append(f"Nur {coverage:.0f} % der Health-Komponenten sind mit Daten belegt.")
+
+    profiles = {
+        "Value": weighted_value,
+        "Growth": weighted_growth,
+        "Momentum": weighted_momentum,
+        "Safety": weighted_safety,
+        "Deep Value": weighted_deep_value,
+        "Qualität": weighted_quality,
+    }
+    metrics = {
+        "positions": int(len(frame)),
+        "top_position_pct": top_position,
+        "effective_positions": effective_positions,
+        "top_sector_pct": top_sector,
+        "top_sector_name": top_sector_name,
+        "top_currency_pct": top_currency,
+        "top_currency_name": top_currency_name,
+        "weighted_safety": weighted_safety,
+        "weighted_quality": weighted_quality,
+        "weighted_volatility": weighted_volatility,
+        "weighted_drawdown": weighted_drawdown,
+    }
+    return {
+        "score": score,
+        "coverage": round(coverage, 1),
+        "label": label,
+        "confidence": confidence,
+        "components": components,
+        "metrics": metrics,
+        "strengths": strengths,
+        "risks": risks,
+        "profiles": profiles,
+    }
+
+
+def build_rebalancing_suggestions(
+    portfolio_view: pd.DataFrame,
+    max_position_pct: float = 15.0,
+    max_sector_pct: float = 30.0,
+    max_currency_pct: float = 70.0,
+    min_safety_score: float = 40.0,
+) -> pd.DataFrame:
+    """Erzeugt regelbasierte Prüfhinweise, keine automatischen Handelsaufträge."""
+    columns = ["Priorität", "Kategorie", "Betroffen", "Aktuell", "Grenze", "Prüfhinweis", "Richtwert EUR"]
+    if portfolio_view is None or portfolio_view.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = portfolio_view.copy()
+    frame["weight_pct"] = pd.to_numeric(frame.get("weight_pct"), errors="coerce")
+    frame["market_value_eur"] = pd.to_numeric(frame.get("market_value_eur"), errors="coerce")
+    total_value = float(frame["market_value_eur"].sum(skipna=True))
+    rows: list[dict[str, Any]] = []
+
+    for _, row in frame.dropna(subset=["weight_pct"]).iterrows():
+        weight = float(row["weight_pct"])
+        if weight > max_position_pct:
+            excess = max(0.0, total_value * (weight - max_position_pct) / 100.0)
+            rows.append({
+                "Priorität": "hoch" if weight >= max_position_pct + 10 else "mittel",
+                "Kategorie": "Einzelposition",
+                "Betroffen": f"{row.get('name', row.get('ticker_yahoo', '–'))} ({row.get('ticker_yahoo', '–')})",
+                "Aktuell": f"{weight:.1f} %",
+                "Grenze": f"{max_position_pct:.1f} %",
+                "Prüfhinweis": "Positionsgröße und Investmentthese prüfen; eine Reduktion wäre eine mögliche, aber nicht zwingende Maßnahme.",
+                "Richtwert EUR": round(excess, 2),
+            })
+
+    sector_group = (
+        frame.assign(_sector=frame.get("sector", "Unbekannt").fillna("Unbekannt").astype(str))
+        .groupby("_sector", dropna=False)["weight_pct"].sum()
+        .sort_values(ascending=False)
+    )
+    for sector, weight in sector_group.items():
+        weight = float(weight)
+        if weight > max_sector_pct:
+            excess = max(0.0, total_value * (weight - max_sector_pct) / 100.0)
+            rows.append({
+                "Priorität": "hoch" if weight >= max_sector_pct + 15 else "mittel",
+                "Kategorie": "Sektor",
+                "Betroffen": str(sector),
+                "Aktuell": f"{weight:.1f} %",
+                "Grenze": f"{max_sector_pct:.1f} %",
+                "Prüfhinweis": "Sektorkonzentration prüfen; neue Käufe könnten bevorzugt andere Sektoren ergänzen.",
+                "Richtwert EUR": round(excess, 2),
+            })
+
+    currency_group = (
+        frame.assign(_currency=frame.get("asset_currency", BASE_CURRENCY).fillna(BASE_CURRENCY).astype(str))
+        .groupby("_currency", dropna=False)["weight_pct"].sum()
+        .sort_values(ascending=False)
+    )
+    for currency, weight in currency_group.items():
+        weight = float(weight)
+        if weight > max_currency_pct:
+            excess = max(0.0, total_value * (weight - max_currency_pct) / 100.0)
+            rows.append({
+                "Priorität": "mittel",
+                "Kategorie": "Währung",
+                "Betroffen": str(currency),
+                "Aktuell": f"{weight:.1f} %",
+                "Grenze": f"{max_currency_pct:.1f} %",
+                "Prüfhinweis": "Währungskonzentration und persönliche Ausgabenwährung prüfen; dies ist nicht automatisch ein Nachteil.",
+                "Richtwert EUR": round(excess, 2),
+            })
+
+    if "safety_score" in frame.columns:
+        safety_values = pd.to_numeric(frame["safety_score"], errors="coerce")
+        for index, row in frame[safety_values.notna() & (safety_values < min_safety_score) & (frame["weight_pct"] >= 3)].iterrows():
+            safety = float(safety_values.loc[index])
+            rows.append({
+                "Priorität": "hoch" if safety < 25 else "mittel",
+                "Kategorie": "Safety",
+                "Betroffen": f"{row.get('name', row.get('ticker_yahoo', '–'))} ({row.get('ticker_yahoo', '–')})",
+                "Aktuell": f"Safety {safety:.1f} / Gewicht {float(row.get('weight_pct')):.1f} %",
+                "Grenze": f"Safety ≥ {min_safety_score:.0f}",
+                "Prüfhinweis": "Bilanz, Cashflow, Ausschüttung und Drawdown dieser Position vertieft prüfen.",
+                "Richtwert EUR": None,
+            })
+
+    if len(frame) < 5:
+        rows.append({
+            "Priorität": "hoch" if len(frame) <= 2 else "mittel",
+            "Kategorie": "Diversifikation",
+            "Betroffen": "Gesamtportfolio",
+            "Aktuell": f"{len(frame)} Positionen",
+            "Grenze": "mindestens 5 als grober Orientierungswert",
+            "Prüfhinweis": "Die geringe Zahl an Positionen erhöht das unternehmensspezifische Risiko.",
+            "Richtwert EUR": None,
+        })
+
+    suggestions = pd.DataFrame(rows, columns=columns)
+    if suggestions.empty:
+        return suggestions
+    priority_order = {"hoch": 0, "mittel": 1, "niedrig": 2}
+    suggestions["_order"] = suggestions["Priorität"].map(priority_order).fillna(9)
+    return suggestions.sort_values(["_order", "Kategorie", "Betroffen"]).drop(columns="_order").reset_index(drop=True)
+
+
+def render_portfolio_health(portfolio_view: pd.DataFrame) -> None:
+    st.markdown("#### Portfolio Health Score & Rebalancing")
+    st.caption(
+        "Der Health Score bündelt Diversifikation, Konzentration, Safety, Qualität, Volatilität und Drawdown. "
+        "Die Hinweise sind regelbasierte Research-Hilfen und keine automatischen Kauf- oder Verkaufsaufträge."
+    )
+
+    health = compute_portfolio_health(portfolio_view)
+    score = health.get("score")
+    metrics = health.get("metrics", {})
+    score_columns = st.columns(6)
+    score_columns[0].metric("Health Score", format_number(score, 1) if score is not None else "–")
+    score_columns[1].metric("Einordnung", str(health.get("label", "–")))
+    score_columns[2].metric("Datenabdeckung", format_percent(health.get("coverage"), 0))
+    score_columns[3].metric("Aussagekraft", str(health.get("confidence", "–")))
+    score_columns[4].metric("Größte Position", format_percent(metrics.get("top_position_pct"), 1))
+    score_columns[5].metric("Effektive Positionen", format_number(metrics.get("effective_positions"), 1))
+
+    if score is None:
+        st.warning("Der Portfolio Health Score konnte mangels Daten nicht berechnet werden.")
+        return
+    if score >= 80:
+        st.success("Das Portfolio wirkt nach den gewählten Regeln breit und vergleichsweise robust aufgestellt.")
+    elif score >= 65:
+        st.info("Das Portfolio wirkt insgesamt solide, einzelne Konzentrationen oder Risikofaktoren sollten dennoch geprüft werden.")
+    elif score >= 50:
+        st.warning("Das Portfolio zeigt ein gemischtes Risikoprofil. Die unten genannten Konzentrationen sollten bewusst entschieden sein.")
+    else:
+        st.error("Das Portfolio weist nach den aktuellen Regeln erhöhte Konzentrations- oder Qualitätsrisiken auf.")
+
+    profile_data = pd.DataFrame([
+        {"Profil": name, "Score": value}
+        for name, value in health.get("profiles", {}).items()
+        if value is not None
+    ])
+    left, right = st.columns([1.05, 1])
+    with left:
+        st.markdown("##### Health-Bausteine")
+        components = health.get("components", pd.DataFrame())
+        if not components.empty:
+            st.dataframe(
+                components.style.format({"Punkte": "{:.1f}", "Maximum": "{:.0f}", "Erfüllung": "{:.1f}%"}, na_rep="–"),
+                use_container_width=True,
+                hide_index=True,
+            )
+    with right:
+        st.markdown("##### Gewichtetes Aktienprofil")
+        if not profile_data.empty:
+            profile_chart = alt.Chart(profile_data).mark_bar().encode(
+                x=alt.X("Score:Q", title="Score", scale=alt.Scale(domain=[0, 100])),
+                y=alt.Y("Profil:N", sort="-x", title=None),
+                tooltip=["Profil:N", alt.Tooltip("Score:Q", format=".1f")],
+            ).properties(height=max(220, 36 * len(profile_data)))
+            st.altair_chart(profile_chart, use_container_width=True)
+        else:
+            st.info("Für das gewichtete Profil fehlen noch Score-Daten.")
+
+    strengths = health.get("strengths", [])
+    risks = health.get("risks", [])
+    text_columns = st.columns(2)
+    with text_columns[0]:
+        st.markdown("##### Stärken")
+        if strengths:
+            for item in strengths:
+                st.markdown(f"- ✓ {item}")
+        else:
+            st.caption("Keine eindeutige Stärke aus den verfügbaren Daten abgeleitet.")
+    with text_columns[1]:
+        st.markdown("##### Prüfpunkte")
+        if risks:
+            for item in risks:
+                st.markdown(f"- ⚠ {item}")
+        else:
+            st.caption("Keine auffälligen Prüfpunkte aus den gewählten Regeln.")
+
+    with st.expander("Grenzwerte für Rebalancing-Hinweise", expanded=False):
+        controls = st.columns(4)
+        max_position = controls[0].slider("Max. Einzelposition (%)", 5.0, 40.0, 15.0, 1.0, key="health_max_position")
+        max_sector = controls[1].slider("Max. Sektor (%)", 15.0, 70.0, 30.0, 1.0, key="health_max_sector")
+        max_currency = controls[2].slider("Max. Währung (%)", 30.0, 100.0, 70.0, 1.0, key="health_max_currency")
+        min_safety = controls[3].slider("Min. Safety-Score", 0.0, 80.0, 40.0, 5.0, key="health_min_safety")
+
+    suggestions = build_rebalancing_suggestions(
+        portfolio_view,
+        max_position_pct=float(max_position),
+        max_sector_pct=float(max_sector),
+        max_currency_pct=float(max_currency),
+        min_safety_score=float(min_safety),
+    )
+    st.markdown("##### Rebalancing- und Prüfhinweise")
+    if suggestions.empty:
+        st.success("Unter den gewählten Grenzwerten wurde kein konkreter Rebalancing-Hinweis ausgelöst.")
+    else:
+        display = suggestions.copy()
+        display["Richtwert EUR"] = display["Richtwert EUR"].map(lambda value: format_eur(value, 0) if safe_float(value) is not None else "–")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.caption(
+            "Der Richtwert zeigt nur den rechnerischen Betrag oberhalb des gewählten Grenzwerts. "
+            "Er berücksichtigt weder Steuern noch Gebühren, persönliche Ziele oder die Qualität möglicher Ersatzanlagen."
+        )
+        st.download_button(
+            "Prüfhinweise als CSV herunterladen",
+            data=suggestions.to_csv(index=False).encode("utf-8"),
+            file_name="portfolio_health_hinweise.csv",
+            mime="text/csv",
+            key="download_portfolio_health_suggestions",
+        )
 
 
 def render_portfolio_risk(portfolio_view: pd.DataFrame, histories: dict[str, pd.DataFrame]) -> None:
@@ -7447,6 +7877,9 @@ def render_portfolio(metrics: pd.DataFrame, histories: dict[str, pd.DataFrame]) 
     )
     st.caption("EUR-Werte verwenden aktuelle Yahoo-FX-Kurse. Für steuerliche Werte, Gebühren oder historische FX-Kurse ist diese Ansicht nicht geeignet.")
 
+    st.divider()
+    render_portfolio_health(portfolio_view)
+    st.divider()
     render_portfolio_risk(portfolio_view, all_histories)
 
 
