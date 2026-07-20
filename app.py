@@ -466,6 +466,71 @@ def safe_float(value: Any) -> Optional[float]:
     return result if pd.notna(result) else None
 
 
+def deduplicate_dataframe_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Entfernt doppelte Spalten robust und behält die zuletzt berechnete Variante.
+
+    Profil- und Score-Spalten können bereits als leere Platzhalter im Rohdaten-Frame
+    vorhanden sein. Werden berechnete Spalten anschließend per ``pd.concat`` ergänzt,
+    entstehen identische Spaltennamen. Bei ``row.get(...)`` liefert Pandas dann eine
+    Series statt eines Einzelwerts. Diese Funktion verhindert genau diesen Zustand.
+    """
+    if frame is None:
+        return frame
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame.copy() if isinstance(frame, pd.DataFrame) else frame
+    if not frame.columns.duplicated().any():
+        return frame.copy()
+    return frame.loc[:, ~frame.columns.duplicated(keep="last")].copy()
+
+
+def merge_computed_columns(base: pd.DataFrame, computed: Any) -> pd.DataFrame:
+    """Schreibt berechnete Spalten in einen DataFrame und überschreibt Platzhalter.
+
+    Im Gegensatz zu ``pd.concat(..., axis=1)`` werden vorhandene Spalten mit gleichem
+    Namen ersetzt. Dadurch bleiben alle Spaltennamen eindeutig – auch bei erneuten
+    Streamlit-Reruns, Slideränderungen und separat geladenen Watchlist-Daten.
+    """
+    result = deduplicate_dataframe_columns(base)
+    if computed is None:
+        return result
+    if isinstance(computed, pd.Series):
+        computed = computed.to_frame()
+    if not isinstance(computed, pd.DataFrame) or computed.empty:
+        return result
+    computed = deduplicate_dataframe_columns(computed)
+    for column in computed.columns:
+        result[column] = computed[column].reindex(result.index)
+    return result
+
+
+def display_text(value: Any, fallback: str = "–") -> str:
+    """Bereitet Einzelwerte, Listen und versehentlich gelieferte Series fürs UI auf."""
+    if isinstance(value, pd.Series):
+        parts = []
+        for item in value.tolist():
+            rendered = display_text(item, fallback="")
+            if rendered and rendered not in parts:
+                parts.append(rendered)
+        return " | ".join(parts) if parts else fallback
+    if isinstance(value, (list, tuple, set)):
+        parts = [display_text(item, fallback="") for item in value]
+        parts = [part for part in parts if part]
+        return " | ".join(parts) if parts else fallback
+    if isinstance(value, dict):
+        if not value:
+            return fallback
+        return " | ".join(f"{key}: {display_text(item, fallback='')}" for key, item in value.items())
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    text_value = str(value).strip()
+    return text_value if text_value else fallback
+
+
 def safe_session_date(
     value: Any,
     fallback: Any,
@@ -2012,10 +2077,10 @@ def compute_safety_score(row: pd.Series) -> pd.Series:
 def enrich_with_profile_scores(metrics: pd.DataFrame) -> pd.DataFrame:
     if metrics is None or metrics.empty:
         return metrics
-    result = metrics.copy()
+    result = deduplicate_dataframe_columns(metrics)
     for calculator in (compute_growth_score, compute_momentum_score, compute_safety_score):
         profile = result.apply(calculator, axis=1)
-        result = pd.concat([result, profile], axis=1)
+        result = merge_computed_columns(result, profile)
     return result
 
 
@@ -2028,9 +2093,9 @@ def enrich_with_scores(
 ) -> pd.DataFrame:
     if metrics is None or metrics.empty:
         return empty_metrics_frame()
-    result = metrics.copy()
+    result = deduplicate_dataframe_columns(metrics)
     total_score = result.apply(compute_total_score, axis=1)
-    result = pd.concat([result, total_score], axis=1)
+    result = merge_computed_columns(result, total_score)
     value = result.apply(
         lambda row: compute_value_trigger_and_score(
             row,
@@ -2041,7 +2106,7 @@ def enrich_with_scores(
         ),
         axis=1,
     )
-    result = pd.concat([result, value], axis=1)
+    result = merge_computed_columns(result, value)
     return enrich_with_profile_scores(result)
 
 
@@ -2245,14 +2310,15 @@ def compute_special_situation_score(row: pd.Series, sentiment_info: Optional[dic
 def enrich_with_special_situations(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+    clean_df = deduplicate_dataframe_columns(df)
     sentiment_map = load_recent_sentiment_map(days_back=120)
-    scored = df.apply(
+    scored = clean_df.apply(
         lambda row: compute_special_situation_score(
             row, sentiment_map.get(clean_ticker(row.get("ticker_yahoo")), {})
         ),
         axis=1,
     )
-    return pd.concat([df.copy(), scored], axis=1)
+    return merge_computed_columns(clean_df, scored)
 
 
 # -----------------------------------------------------------------------------
@@ -5979,6 +6045,9 @@ def render_profile_scores(df: pd.DataFrame) -> None:
         st.info("Keine Daten für die aktuelle Filtereinstellung.")
         return
 
+    # Schutz vor doppelten Spaltennamen aus älteren Session-State-Ständen.
+    df = deduplicate_dataframe_columns(df)
+
     with st.expander("So werden die Profile interpretiert", expanded=False):
         explanation = pd.DataFrame([
             {"Profil": "Value", "Frage": "Wie günstig oder ertragsstark wirkt die Aktie?", "Wichtige Daten": "Bewertung, Dividende, Drawdown, Payout, Verschuldung"},
@@ -5991,7 +6060,7 @@ def render_profile_scores(df: pd.DataFrame) -> None:
 
     ticker = company_selectbox("Aktie auswählen", df, key="profile_scores_ticker")
     row = df.loc[df["ticker_yahoo"] == ticker].iloc[0]
-    company_name = str(row.get("name") or ticker)
+    company_name = display_text(row.get("name"), fallback=str(ticker))
     st.markdown(f"### {company_name} ({ticker})")
 
     score_rows = [
@@ -6029,7 +6098,7 @@ def render_profile_scores(df: pd.DataFrame) -> None:
             "Score": safe_float(value),
             "Datenabdeckung": safe_float(coverage),
             "Einordnung": _score_label(value),
-            "Bausteine / Erklärung": str(details or "–"),
+            "Bausteine / Erklärung": display_text(details),
         }
         for label, value, coverage, details in score_rows
     ])
